@@ -1,0 +1,15 @@
+{
+    "feedspeed":6000,
+    "feedspeedhold":3000,
+    "centers":{
+        "plate_one_center":[-84,365],
+        "plate_two_center":[-220,365],
+        "plate_three_center":[-355,365],
+        "plate_four_center":[-84,272],
+        "plate_five_center":[-220,272],
+        "plate_six_center":[-355,272],
+        "plate_seven_center":[-84,178.5],
+        "plate_eight_center":[-220,178.5],
+        "plate_nine_center":[-355,178.5]
+    }
+}
