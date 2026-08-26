@@ -148,6 +148,9 @@ class Deck:
                     f"{lid!r}, which is not in labware.json. Known: "
                     f"{sorted(self.catalogue)}"
                 )
+            # a1_from_slot_edge needs the cell size, which is the slot pitch.
+            if entry.get("slot") is not None and "_slot_pitch" not in entry:
+                entry = {**entry, "_slot_pitch": list(self._raw_slot_pitch(d))}
             p = build_placement(entry, self.catalogue[lid], d)
             if p.name in self.placements:
                 raise DeckError(f"duplicate placement name {p.name!r} in layout")
@@ -371,6 +374,16 @@ class Deck:
             return None
         tip_len = self.z_stage_surface - float(tipped_surface)
         return float(edge) + tip_len
+
+    @staticmethod
+    def _raw_slot_pitch(deck_raw: Dict[str, Any]) -> Tuple[float, float]:
+        """Slot pitch straight from the raw config, for use during __init__."""
+        slots = deck_raw.get("slots", {})
+        xs = sorted({float(v["center"][0]) for v in slots.values()})
+        ys = sorted({float(v["center"][1]) for v in slots.values()})
+        px = ((xs[-1] - xs[0]) / (len(xs) - 1)) if len(xs) > 1 else 0.0
+        py = ((ys[-1] - ys[0]) / (len(ys) - 1)) if len(ys) > 1 else 0.0
+        return (px, py)
 
     def slot_pitch(self) -> Tuple[float, float]:
         """Mean X and Y spacing between adjacent slot centres."""

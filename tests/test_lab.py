@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "protocols"))
 
 from lab import effector as eff_mod
 from lab.deck import Deck
@@ -455,6 +456,154 @@ def test_ejection_passes_the_envelope_checks():
     m.eject_tip()
     check(not m.sim.report.errors,
           f"the ejection should pass every envelope check: {m.sim.report.errors}")
+
+
+# ==========================================================================
+# labware heights and approach order
+# ==========================================================================
+
+def test_holder_heights_convert_to_commanded_z():
+    """A height above the stage, not a stored Z: the Z depends on the tip."""
+    from lab.simulate import Simulator
+    d = Deck.load()
+    sim = Simulator(d, eff_mod.load("p300"))
+    p = d.placement("tubes")
+    check(p.labware.height_mm == 35.0, "the 0.65 mL holder is 35 mm tall")
+
+    bare, _ = sim.labware_top_z(p, tip_fitted=False)
+    tipped, _ = sim.labware_top_z(p, tip_fitted=True)
+    check(bare == 79.75, f"35 mm tall tops out at Z 79.75 bare, got {bare}")
+    check(tipped == 27.5, f"and at Z 27.5 with a tip, got {tipped}")
+    check(d.z_travel < tipped,
+          f"travel {d.z_travel} must clear the holder top {tipped}")
+    check(abs(sim.max_labware_height() - 57.5) < 1e-9,
+          f"max clearable height should be 57.5, got {sim.max_labware_height()}")
+
+
+def test_empty_height_is_flagged_as_incomplete():
+    """35 mm is the EMPTY holder; tubes and caps make it taller."""
+    d = Deck.load()
+    check(d.placement("tubes").labware.height_is_empty_only,
+          "the tube holder should be flagged as empty-height-only")
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    m.aspirate_uL(150.0)
+    m.dispense("tubes", 0, 0)
+    check(any("EMPTY holder" in w for w in m.sim.report.warnings),
+          "a run over the holder should warn that contents are unaccounted for")
+
+
+def test_tube_holder_is_approached_y_first():
+    """Caps make Y motion across the holder difficult, so Y goes first."""
+    d = Deck.load()
+    check(d.placement("tubes").labware.approach_order == "YX",
+          "the 0.65 mL holder should ask for YX")
+
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    m.aspirate_uL(150.0)
+    m.dispense("tubes", row=0, col=0)
+
+    legs = [s for s in m.steps
+            if s.op == "dispense" and s.kind == "move" and s.axes in ("X", "Y")]
+    check([s.axes for s in legs] == ["Y", "X"],
+          f"the approach should be Y then X, got {[s.axes for s in legs]}")
+
+    # The Y leg must happen clear of the holder in X.
+    p = d.placement("tubes")
+    x0, x1, _, _ = p.well_bounds()
+    yleg = [s for s in legs if s.axes == "Y"][0]
+    check(not (x0 <= yleg.frm[0] <= x1),
+          f"the Y leg ran at X {yleg.frm[0]}, inside the holder span "
+          f"[{x0}, {x1}] - the whole point is to be clear of it")
+
+
+def test_every_dispense_approach_is_y_first():
+    import accuracy_test
+    with tempfile.TemporaryDirectory() as td:
+        m, _ = accuracy_test.build(effector_id="p300", name="order_probe",
+                                   outdir=td, plot=False)
+    legs = [s for s in m.steps
+            if s.op == "dispense" and s.kind == "move" and s.axes in ("X", "Y")]
+    orders, cur = [], []
+    for s in legs:
+        cur.append(s.axes)
+        if s.axes == "X" and len(cur) >= 2:
+            orders.append("".join(cur))
+            cur = []
+    check(orders == ["YX"] * 20,
+          f"all 20 approaches should be YX, got {set(orders)}")
+
+
+def test_1p5_holder_anchors_from_the_location_edges():
+    """13 mm down from the top, 14 mm in from the high-X edge."""
+    import json, os, shutil
+    from lab import config as cfgmod
+
+    d = Path(tempfile.mkdtemp())
+    for n in ("deck.json", "labware.json", "layout.json"):
+        shutil.copy(cfgmod.config_path(n), d / n)
+    shutil.copytree(cfgmod.config_path("effectors"), d / "effectors")
+    lay = json.loads((d / "layout.json").read_text())
+    lay["placements"].append({"name": "big_tubes", "labware": "tube_rack_1p5",
+                              "mount": "slot", "slot": 5,
+                              "slot_center": [200.0, 272.0], "rotation": 0})
+    (d / "layout.json").write_text(json.dumps(lay))
+
+    old = os.environ.get("LAB_CONFIG")
+    os.environ["LAB_CONFIG"] = str(d)
+    try:
+        deck = Deck.load()
+        p = deck.placement("big_tubes")
+        cx, cy = deck.slot_center(5)
+        px, py = deck.slot_pitch()
+        check(p.xy(0, 0) == (cx + px / 2 - 14.0, round(cy + py / 2 - 13.0, 4)),
+              f"A1 should be 14 in from the high-X edge and 13 below the top, "
+              f"got {p.xy(0, 0)}")
+        check(p.labware.rows == 3 and p.labware.cols == 7,
+              f"3x7 should fit, got {p.labware.rows}x{p.labware.cols}")
+        check(abs(p.col_x_values()[0] - p.col_x_values()[1]) == 20.0,
+              "columns should be 20 mm apart")
+        check(abs(p.row_y_values()[0] - p.row_y_values()[1]) == 30.0,
+              "rows should be 30 mm apart")
+        x0, x1, y0, y1 = p.well_bounds()
+        check(x0 >= cx - px / 2 and x1 <= cx + px / 2
+              and y0 >= cy - py / 2 and y1 <= cy + py / 2,
+              f"the grid should fit inside its location, got X[{x0}, {x1}] "
+              f"Y[{y0}, {y1}]")
+        check(p.labware.height_mm == 45.0, "the 1.5 mL holder is 45 mm tall")
+        check(p.labware.approach_order == "YX",
+              "the 1.5 mL holder should also ask for YX")
+        check(not deck.slot_seating_report(),
+              f"seating should be clean: {deck.slot_seating_report()}")
+    finally:
+        if old is None:
+            os.environ.pop("LAB_CONFIG", None)
+        else:
+            os.environ["LAB_CONFIG"] = old
+
+
+def test_ejection_variant_is_functionally_identical():
+    """Adding ejection must change nothing before the ejection."""
+    import accuracy_test
+    with tempfile.TemporaryDirectory() as td:
+        plain, _ = accuracy_test.build(effector_id="p300", name="fe_plain",
+                                       outdir=td, plot=False)
+        eject, _ = accuracy_test.build(effector_id="p300", name="fe_eject",
+                                       eject_tip=True, outdir=td, plot=False)
+
+    def working(m):
+        return {(d["x"], d["y"], d["z"], d["target_volume_uL"],
+                 d["aspirate_pos"], d["well"]) for d in m.dispenses}
+
+    check(working(plain) == working(eject),
+          "every dispense should be identical between the two")
+    check(len(eject.steps) > len(plain.steps),
+          "the ejecting version should have extra steps")
+    check(plain.tip_fitted and not eject.tip_fitted,
+          "only the ejecting version should end with the tip off")
 
 
 # ==========================================================================

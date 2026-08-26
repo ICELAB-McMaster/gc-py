@@ -95,6 +95,38 @@ class Labware:
         return self.spec.get("wipe")
 
     @property
+    def height_mm(self) -> Optional[float]:
+        """Physical height above the stage, contents included if known.
+
+        Stored as a height rather than as a commanded Z because a height is
+        both frame-independent and effector-independent: the commanded limit
+        depends on which nosecone is fitted and whether it has a tip on, so it
+        is derived per run instead.
+        """
+        h = self.spec.get("height_with_contents_mm")
+        if h is None:
+            h = self.spec.get("height_mm")
+        return None if h is None else float(h)
+
+    @property
+    def height_is_empty_only(self) -> bool:
+        """True if only the empty height is known, so contents are unaccounted."""
+        return (self.spec.get("height_mm") is not None
+                and self.spec.get("height_with_contents_mm") is None)
+
+    @property
+    def approach_order(self) -> Optional[str]:
+        """Preferred XY axis order when approaching a well here, or None.
+
+        "YX" means reach the Y position first, while still clear in X, then
+        come in along X. The 0.65 mL and 1.5 mL tube holders both need this:
+        their caps make Y motion across the holder difficult, while X motion
+        passes between cap rows.
+        """
+        v = self.spec.get("approach_order")
+        return None if v is None else str(v).upper()
+
+    @property
     def uncalibrated(self) -> List[str]:
         return list(self.spec.get("uncalibrated", []))
 
@@ -292,6 +324,27 @@ def _resolve_origin(
         override = entry.get("a1_from_center") or labware.spec.get("a1_from_center")
         if override:
             return (cx + float(override[0]), cy + float(override[1]))
+
+        # Dimensioned from the LOCATION edges rather than from a measured
+        # machine coordinate. The cell is the slot centre expanded by half the
+        # slot pitch, so the pitch has to be passed in.
+        edge = (entry.get("a1_from_slot_edge")
+                or labware.spec.get("a1_from_slot_edge"))
+        if edge:
+            pitch = entry.get("_slot_pitch")
+            if not pitch:
+                raise ValueError(
+                    f"placement {name!r} uses a1_from_slot_edge but the slot pitch "
+                    f"was not supplied; Deck must pass it in"
+                )
+            hx, hy = float(pitch[0]) / 2.0, float(pitch[1]) / 2.0
+            ax = (cx + hx - float(edge["x_inset"])
+                  if str(edge.get("x_edge", "high")).lower() == "high"
+                  else cx - hx + float(edge["x_inset"]))
+            ay = (cy + hy - float(edge["y_inset"])
+                  if str(edge.get("y_edge", "high")).lower() == "high"
+                  else cy - hy + float(edge["y_inset"]))
+            return (round(ax, 4), round(ay, 4))
 
         if not labware.spec.get("grid_centered_on_footprint"):
             raise ValueError(

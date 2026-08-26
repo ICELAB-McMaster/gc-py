@@ -384,13 +384,9 @@ class Simulator:
         sy0, sy1 = sorted((step.frm[1], step.to[1]))
 
         for name, p in self.deck.placements.items():
-            top = p.labware.z("top")
+            top, why = self.labware_top_z(p, step.tip)
             if top is None:
-                self.warn(
-                    f"ztop:{name}",
-                    f"cannot check traverse clearance over {name} "
-                    f"({p.labware.id}): its z.top rim height is unmeasured",
-                )
+                self.warn(f"ztop:{name}", why)
                 continue
             # Prefer the physical outline: the rim extends past the outermost
             # well centres, so well_bounds alone would miss a traverse that
@@ -410,8 +406,50 @@ class Simulator:
                 self.fail(
                     step,
                     f"the path from {step.frm[:2]} to {step.to[:2]} sweeps over "
-                    f"{name} at Z {z}, which is at or below its rim {top}",
+                    f"{name} at Z {z}, at or below its top {top} "
+                    f"({'tip fitted' if step.tip else 'bare nosecone'})",
                 )
+            if overlaps and p.labware.height_is_empty_only:
+                self.warn(
+                    f"contents:{name}",
+                    f"{name} ({p.labware.id}) height {p.labware.height_mm} mm is the "
+                    f"EMPTY holder. With tubes and caps in it the real height is "
+                    f"greater by an unmeasured amount, and anything taller than "
+                    f"{self.max_labware_height():.1f} mm is struck at travel height "
+                    f"with a tip fitted.",
+                )
+
+    def labware_top_z(self, p, tip_fitted: bool) -> Tuple[Optional[float], str]:
+        """Commanded Z at which the effector would touch this labware's top.
+
+        Derived from the labware's physical height above the stage rather than
+        stored as a Z, because a stored Z is wrong the moment a tip goes on:
+        the same 35 mm holder tops out at commanded Z 79.75 bare and 27.5 with
+        a 300 uL tip. Returns (z, reason_if_unknown).
+        """
+        h = p.labware.height_mm
+        if h is None:
+            return None, (f"cannot check traverse clearance over {p.name} "
+                          f"({p.labware.id}): its height above the stage is "
+                          f"unmeasured")
+        surf = self.deck.z_stage_surface
+        if surf is None:
+            return None, ("cannot convert labware heights to a commanded Z: deck "
+                          "z.stage_surface is unmeasured")
+        z = surf - h
+        if tip_fitted:
+            tl = self.tip_length()
+            if tl is None:
+                return None, (f"cannot check traverse clearance over {p.name} with a "
+                              f"tip fitted: the tip length is unmeasured")
+            z -= tl
+        return round(z, 4), ""
+
+    def max_labware_height(self) -> float:
+        """Tallest anything can be and still clear travel height with a tip."""
+        surf = self.deck.z_stage_surface or 0.0
+        tl = self.tip_length() or 0.0
+        return surf - tl - self.deck.z_travel
 
     def _check_actuator(self, step: Step) -> None:
         pos = step.pos_after

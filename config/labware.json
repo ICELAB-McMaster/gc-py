@@ -3,7 +3,8 @@
   "description": "Slot-independent labware GEOMETRY. Where a piece of labware sits is in layout.json, never here. A rack has the same internal geometry regardless of which slot it occupies.",
   "grid_models": {
     "pitch": "anchor well (row 0, col 0) + pitch + integer direction vectors. Placement supplies the anchor.",
-    "corners": "three measured well centres (origin, along_col, along_row) solved for pitch and rotation. Placement supplies the corners. Use when the real pitch differs from nominal."
+    "corners": "three measured well centres (origin, along_col, along_row) solved for pitch and rotation. Placement supplies the corners. Use when the real pitch differs from nominal.",
+    "a1_from_slot_edge": "For slot-mounted labware whose first position is dimensioned from the LOCATION edges rather than from a measured machine coordinate. Names which edge each inset is taken from and how far in. The location cell is the slot centre expanded by half the slot pitch, so 135.5 x 93.25 mm here."
   },
   "labware": {
     "tube_rack_0p65_5x10": {
@@ -35,7 +36,7 @@
         "work": null,
         "bottom": null,
         "note": "Absolute Z is effector-dependent (a fitted tip hangs below the nosecone), so the working Z lives in effectors/*.json under z_for_labware. These nominal fields stay null until z_stage_surface is measured.",
-        "top_note": "Unmeasured. Note that deck z.slot_edge_with_p300_tip (53.0) is currently the binding traverse constraint - the raised location edges. This rim only matters if the labware stands HIGHER than those edges, i.e. would be hit at a Z below 53 with a tip fitted."
+        "top_note": "Superseded by height_mm: a physical height above the stage is frame- and effector-independent, so the commanded-Z limit is derived per effector instead of stored."
       },
       "footprint": null,
       "wipe": {
@@ -49,7 +50,13 @@
         "wipe.dx",
         "wipe.dz",
         "z.work"
-      ]
+      ],
+      "height_mm": 35.0,
+      "height_note": "Physical height of the EMPTY holder above the stage. With tubes and caps in it the effective height is greater by an unmeasured amount - see height_with_contents_mm.",
+      "height_with_contents_mm": null,
+      "height_with_contents_note": "UNMEASURED. Anything taller than 57.5 mm is struck at travel height with a 300 uL tip fitted (stage 114.75 - tip 52.25 - travel 5.0), so this holder has 22.5 mm of headroom for tubes and caps before travel height stops being safe.",
+      "approach_order": "YX",
+      "approach_order_note": "Y FIRST, then X. The tube caps make Y motion over this holder difficult, so the effector must reach its Y position while still clear of the holder in X, then come in along X. X motion passes between cap rows and is fine; Y motion crosses them. Operator instruction 2026-08-26. lab/machine.py honours this per-labware; the keep-out router can still override it, and says so when it does."
     },
     "tiprack_300_96": {
       "display_name": "300 uL ClipTip rack, 96 position",
@@ -136,6 +143,59 @@
         "top_note": "Unmeasured. Note that deck z.slot_edge_with_p300_tip (53.0) is currently the binding traverse constraint - the raised location edges. This rim only matters if the labware stands HIGHER than those edges, i.e. would be hit at a Z below 53 with a tip fitted."
       },
       "uncalibrated": [
+        "z.work"
+      ]
+    },
+    "tube_rack_1p5": {
+      "display_name": "1.5 mL microcentrifuge tube holder",
+      "type": "tube_rack",
+      "vessel": {
+        "nominal_volume_uL": 1500,
+        "description": "1.5 mL microcentrifuge tube"
+      },
+      "grid": {
+        "model": "pitch",
+        "rows": 3,
+        "cols": 7,
+        "rows_cols_note": "DERIVED, not stated: the operator gave the A1 inset and the pitches but not the counts. 3 rows and 7 columns are what fit inside a 135.5 x 93.25 mm location from A1 at (+53.75, +33.625) off the centre. Column X offsets 53.75, 33.75, 13.75, -6.25, -26.25, -46.25, -66.25; row Y offsets 33.625, 3.625, -26.375. CONFIRM the real counts.",
+        "pitch_x": 20.0,
+        "pitch_y": 30.0,
+        "col_dir": [
+          -1,
+          0
+        ],
+        "row_dir": [
+          0,
+          -1
+        ],
+        "direction_note": "Same sense as the 0.65 mL holder: column index toward LOWER X, row index toward LOWER Y.",
+        "source": "Operator 2026-08-26: columns 20 mm apart, rows 30 mm apart."
+      },
+      "a1_from_slot_edge": {
+        "x_edge": "high",
+        "x_inset": 14.0,
+        "y_edge": "high",
+        "y_inset": 13.0,
+        "note": "Operator: the first slot is 13 mm down from the top of the location and 14 mm in from the very left. 'Down from the top' is unambiguous: toward lower Y. 'The very left' is ASSUMED to be the HIGH-X edge, because column index runs toward lower X on this deck, so A1 sits at the high-X end of its row. If left is actually the low-X edge, set x_edge to \"low\" and the whole grid mirrors. CONFIRM."
+      },
+      "height_mm": 45.0,
+      "height_note": "Empty holder, above the stage. Leaves 12.5 mm of headroom for tubes and caps before travel height (Z 5 with a 300 uL tip) stops clearing it.",
+      "height_with_contents_mm": null,
+      "approach_order": "YX",
+      "approach_order_note": "Y first then X, same as the 0.65 mL holder and for the same reason: caps make Y motion across the holder difficult. Operator instruction 2026-08-26.",
+      "z": {
+        "top": null,
+        "work": null,
+        "bottom": null,
+        "note": "per-effector, see effectors/*.json -> z_for_labware"
+      },
+      "footprint": null,
+      "wipe": null,
+      "uncalibrated": [
+        "grid.rows",
+        "grid.cols",
+        "a1_from_slot_edge.x_edge",
+        "height_with_contents_mm",
         "z.work"
       ]
     }

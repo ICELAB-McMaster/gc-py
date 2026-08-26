@@ -169,25 +169,48 @@ class Machine:
                          feedrate=feedrate, labware=labware)
 
     def goto(self, x: float, y: float, op: str = "goto",
-             feedrate: Optional[int] = None) -> None:
-        """Lift to travel height, then traverse. The only public way to move XY."""
+             feedrate: Optional[int] = None,
+             prefer: Optional[str] = None) -> None:
+        """Lift to travel height, then traverse. The only public way to move XY.
+
+        `prefer` is an axis-order preference, "XY" or "YX". A destination
+        labware can ask for one via its `approach_order`; the keep-out router
+        still overrides it when geometry demands, and says so when it does.
+        """
         self._require_homed("goto()")
         f = feedrate or self.deck.feedrate("travel")
         self._move_z(self.deck.z_travel, f, op)
-        self._route_xy(x, y, f, op)
+        self._route_xy(x, y, f, op, prefer=prefer)
+
+    def goto_placement(self, placement: str, row: int, col: int,
+                       op: str = "goto") -> Tuple[float, float]:
+        """Traverse to a well, honouring that labware's approach order."""
+        p = self.deck.placement(placement)
+        x, y = p.xy(row, col)
+        self.goto(x, y, op=op, prefer=p.labware.approach_order)
+        return (x, y)
 
     def _route_xy(self, x: float, y: float, feedrate: int, op: str,
-                  labware: Optional[str] = None) -> None:
+                  labware: Optional[str] = None,
+                  prefer: Optional[str] = None) -> None:
         """Traverse to XY without ever moving Y inside a keep-out band.
 
         X-first is the default: it is what the tip box requires, and a pure X
         move through a band is harmless because the band only forbids Y motion.
-        But X-first puts the Y move at the TARGET X, and with the ejector at
-        X155 the tube rack columns at X150 and X162 sit inside the band. So
-        when the target X is blocked, do Y first instead; when both ends are
-        blocked, dogleg through the nearest clear X.
+
+        A destination labware can prefer "YX" instead. Both tube holders do:
+        their caps make Y motion across the holder difficult, so the effector
+        has to reach its Y while still clear in X and then come in along X.
+
+        Either way the keep-out rule wins, because it is a hard collision and
+        the preference is an ease-of-motion choice. X-first puts the Y leg at
+        the TARGET X; Y-first puts it at the CURRENT X. Whichever end is clear
+        of every band decides; if both are blocked, dogleg through a clear X.
         """
         cur_x, cur_y = self.g.get_x(), self.g.get_y()
+        prefer = (prefer or "XY").upper()
+        if prefer not in ("XY", "YX"):
+            raise ProtocolError(f"prefer must be 'XY' or 'YX', got {prefer!r}")
 
         if abs(y - cur_y) <= 1e-6:
             self._move_xy(x, y, feedrate, op, labware, order="X")
@@ -196,10 +219,32 @@ class Machine:
         dst_blocked = bool(self.deck.keepouts_hit_by_y_move(x))
         src_blocked = bool(self.deck.keepouts_hit_by_y_move(cur_x))
 
+        # The preferred order first, if the band it would put the Y leg in is clear.
+        if prefer == "YX" and not src_blocked:
+            self._move_xy(x, y, feedrate, op, labware, order="YX")
+            return
+        if prefer == "XY" and not dst_blocked:
+            self._move_xy(x, y, feedrate, op, labware, order="XY")
+            return
+
         if not dst_blocked:
+            self.sim.warn(
+                f"order_override:{op}",
+                f"{op}: {labware or 'this move'} prefers {prefer} but the current X "
+                f"{cur_x} is inside a keep-out band, so the Y leg was moved to the "
+                f"target X {x} instead.",
+            )
             self._move_xy(x, y, feedrate, op, labware, order="XY")
             return
         if not src_blocked:
+            if prefer == "YX":
+                self._move_xy(x, y, feedrate, op, labware, order="YX")
+                return
+            self.sim.warn(
+                f"order_override:{op}",
+                f"{op}: prefers XY but the target X {x} is inside a keep-out band, "
+                f"so the Y leg was done first at X {cur_x}.",
+            )
             self._move_xy(x, y, feedrate, op, labware, order="YX")
             return
 
@@ -352,7 +397,7 @@ class Machine:
         x, y = p.xy(row, col)
         press_feed = eff.feedrate("tip_press") or self.deck.feedrate("tip_press")
 
-        self.goto(x, y, op="get_tip")
+        self.goto(x, y, op="get_tip", prefer=p.labware.approach_order)
         self.wait()
         self._move_z(eff.z_for(lid, "approach") if self._has_z(lid, "approach")
                      else self.deck.z_travel,
@@ -654,7 +699,7 @@ class Machine:
                 f"labware.json. Add one, or pass wall_wipe=False."
             )
 
-        self.goto(x, y, op="dispense")
+        self.goto(x, y, op="dispense", prefer=p.labware.approach_order)
         self._move_z(eff.z_for(lid, "work"), f, "dispense", labware=lid)
         self.wait()
         self.actuator(eff.blowout_pos, settle=eff.settle_s, op="dispense")

@@ -240,9 +240,11 @@ def test_4_traverse_clearance_uses_the_swept_segment():
     """A rim above travel height must stop a traverse that sweeps over it."""
     import copy
     lw = copy.deepcopy(cfgmod.load_labware().data)
-    # A rim at Z 3 is ABOVE the travel height of 5 (+Z is down), so anything
-    # traversing over this rack at Z 5 would hit it.
-    lw["labware"]["tube_rack_0p65_5x10"]["z"]["top"] = 3.0
+    # Heights convert to a commanded Z as stage_surface - height - tip_length,
+    # so 114.75 - 60 - 52.25 = 2.5. That is ABOVE the travel height of 5
+    # (+Z is down), so anything traversing over this rack at Z 5 hits it.
+    # Anything over 57.5 mm does; 60 mm is the smallest round number that does.
+    lw["labware"]["tube_rack_0p65_5x10"]["height_with_contents_mm"] = 60.0
 
     with tempfile.TemporaryDirectory() as td:
         d = Path(td)
