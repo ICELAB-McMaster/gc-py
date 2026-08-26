@@ -137,7 +137,8 @@
       "rehome_after": true,
       "rehome_note": "The strip force can skip steps on an open-loop machine, so commanded position is untrustworthy afterward. G28 is mandatory, not optional.",
       "validated": false,
-      "validated_note": "NEVER RUN ON HARDWARE UNVALIDATED. No existing gcode file in this repo contains an ejection sequence; this routine has no working reference. Dry-run it, then step through manually at reduced feedrate."
+      "validated_note": "NEVER RUN ON HARDWARE UNVALIDATED. No existing gcode file in this repo contains an ejection sequence; this routine has no working reference. Dry-run it, then step through manually at reduced feedrate.",
+      "frame_note": "X 155 was measured AFTER the +70 X limit change, so it is already in the current frame and needs no correction. Operator-confirmed 2026-08-26."
     }
   },
   "keepouts": [
@@ -148,7 +149,7 @@
         148.0,
         162.0
       ],
-      "x_range_note": "Derived as the ejector lane X 155 +/- 7.0. The 14 mm width is carried over from the previously documented band [78, 92] centred on X 85. UNVERIFIED at the new location - measure the mechanism width at X155 and correct x_range if it differs. x_range is the single source of truth; there is no separate half_width to keep in step with it.",
+      "x_range_note": "Derived as the ejector lane X 155 +/- 7.0, current frame (the lane was measured after the +70 X limit change). The 14 mm width is carried over from the previously documented band centred on X 85 and is still UNVERIFIED at this location - measure the mechanism width and correct x_range if it differs. x_range is the single source of truth.",
       "forbids": "y_motion",
       "safe_when_z_below": 60.0,
       "safe_when_z_below_note": "Stated for the 300 uL effector with NO TIP. With a tip fitted the effector reaches lower and the safe Z shrinks. tip_length is unmeasured, so any TIPPED Y-traverse through this band is treated as an error.",
@@ -169,7 +170,7 @@
     "note": "section names must match printer.cfg exactly"
   },
   "uncalibrated": [
-    "keepouts.tip_ejector.x_range (width unverified at X155)"
+    "keepouts.tip_ejector.x_range (width unverified; lane X 155 itself is confirmed and post-shift)"
   ],
   "coordinate_frame": {
     "x_shift_applied": 70.0,
@@ -191,6 +192,8 @@
       "all Z heights",
       "the tip rack corners - measured after the change",
       "the tip ejector lane X 155 - operator states this as current"
-    ]
+    ],
+    "why_it_went_unnoticed": "The tube column pitch is 12.0 mm and the frame error was 70.0 mm = 6 columns minus 2.0 mm. A shifted well therefore lands 2.0 mm from a REAL well centre, well inside a ~8 mm tube. Running pre-shift gcode today would have dispensed into actual tubes six columns from the intended ones - no crash, no visible sign, and since row = volume and column = replicate, every volume would have landed in the wrong replicate set while the balance readings still looked plausible. Verify frames with tools/check_alignment.py, not by eye.",
+    "verification": "tools/check_alignment.py --shift 70 on the three committed pre-shift gcode files resolves every working position onto the current deck. The single exception is the old tip station (218, 309) -> (288, 309), which is slot 4 where the PREVIOUS tip rack sat and where nothing is loaded now."
   }
 }

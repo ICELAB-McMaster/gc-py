@@ -75,7 +75,6 @@
   "open_questions": [
     "Which tiprack corner is A1 - the three measured corners fix the grid but not the labelling.",
     "Which X edge of the tiprack is the post-pickup exit (toward X 18 or X 118).",
-    "z_stage_surface has never been measured, so tip-aware absolute Z limits cannot be checked.",
-    "Was the ejector lane X 155 measured before or after the X limit grew by 70? Everything else pre-dating the change needed +70. If 155 is a pre-shift number the lane is really at 225 and the keep-out band moves with it."
+    "z_stage_surface has never been measured, so tip-aware absolute Z limits cannot be checked."
   ]
 }
