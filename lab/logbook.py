@@ -96,6 +96,8 @@ def build_manifest(machine: "Machine", report: Report) -> Dict[str, Any]:
             ],
         },
         "open_questions": deck.open_questions,
+        "near_slots": deck.near_slots(),
+        "slot_seating": deck.slot_seating_report(),
         "toggles": machine.toggles,
         "notes": machine.notes,
         "uncalibrated": machine.uncalibrated(),

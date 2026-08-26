@@ -439,13 +439,19 @@ class Machine:
         return "low_x", lo_col
 
     def _exit_tip_box(self, p: Placement, row: int, col: int, edge: str) -> None:
+        # One column pitch beyond the outermost well centre. That clears every
+        # tip POSITION (the nearest is a full pitch away) without demanding the
+        # rack's physical outline be known, which it is not. This move is not
+        # redundant with the next goto: it guarantees the effector is out of the
+        # box before _route_xy makes any decision that could put Y first.
         xs = p.col_x_values()
+        pitch = abs(p.col_vec[0]) or 9.0
         if edge == "low_x":
             crossed = [(row, c) for c in range(len(xs)) if xs[c] < xs[col]]
-            target_x = min(xs) - abs(p.col_vec[0] or 9.0)
+            target_x = min(xs) - pitch
         else:
             crossed = [(row, c) for c in range(len(xs)) if xs[c] > xs[col]]
-            target_x = max(xs) + abs(p.col_vec[0] or 9.0)
+            target_x = max(xs) + pitch
 
         frm = self.xyz()
         step = Step(i=self._n, op="get_tip", kind="note", frm=frm, to=frm,

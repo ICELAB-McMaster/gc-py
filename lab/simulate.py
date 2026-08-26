@@ -392,6 +392,8 @@ class Simulator:
             self.report.warnings.append(
                 "the run ends with a tip still fitted and never ejects it"
             )
+        for line in self.deck.slot_seating_report():
+            self.report.warnings.append("slot seating: " + line)
         for line in self.deck.overlap_report():
             if line.startswith("OVERLAP"):
                 self.report.errors.append(line)

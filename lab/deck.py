@@ -280,6 +280,54 @@ class Deck:
                 )
             seen[p.slot] = p.name
 
+    def slot_seating_report(self) -> List[str]:
+        """Does each slot-mounted labware actually sit in the slot it claims?
+
+        A slot label is a claim about physical seating, and a claim nothing
+        checks is one that can be wrong for months. Compares the resolved well
+        bounds against the slot cell and reports the offset. Placements mounted
+        `fixed` or at a `station` are exempt: they carry `near_slot` as a human
+        reference, not a seating claim.
+        """
+        out: List[str] = []
+        hw, hh = self.slot_pitch()
+        for p in self.placements.values():
+            if p.slot is None or p.mount != "slot":
+                continue
+            centre = self.slots.get(str(p.slot))
+            if centre is None:
+                continue
+            gx, gy = p.grid_center()
+            dx, dy = gx - centre[0], gy - centre[1]
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist <= max(hw, hh) / 2.0:
+                continue
+            disputed = " (flagged disputed in the layout)" if p.spec.get(
+                "slot_disputed") else ""
+            out.append(
+                f"{p.name} claims slot {p.slot} at {list(centre)} but its grid "
+                f"centre is ({gx}, {gy}) - offset ({dx:+.1f}, {dy:+.1f}), "
+                f"{dist:.1f} mm, more than half a slot pitch away{disputed}. "
+                f"Either the slot number or the slot frame is wrong."
+            )
+        return out
+
+    def slot_pitch(self) -> Tuple[float, float]:
+        """Mean X and Y spacing between adjacent slot centres."""
+        xs = sorted({c[0] for c in self.slots.values()})
+        ys = sorted({c[1] for c in self.slots.values()})
+        px = ((xs[-1] - xs[0]) / (len(xs) - 1)) if len(xs) > 1 else 0.0
+        py = ((ys[-1] - ys[0]) / (len(ys) - 1)) if len(ys) > 1 else 0.0
+        return (px, py)
+
+    def near_slots(self) -> Dict[str, int]:
+        """Placements that carry a `near_slot` reference rather than a seating."""
+        return {
+            p.name: p.spec["near_slot"]
+            for p in self.placements.values()
+            if p.spec.get("near_slot") is not None
+        }
+
     def overlap_report(self) -> List[str]:
         """Pairwise footprint overlap between placements.
 

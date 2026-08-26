@@ -3,54 +3,75 @@
   "id": "accuracy_bench_2026_08",
   "description": "What is physically loaded on the deck right now. This is the per-run file - edit it, do not edit deck.json or labware.json.",
   "deck": "sdl_klipper_deck",
-
   "placements": [
     {
       "name": "tubes",
       "labware": "tube_rack_0p65_5x10",
       "mount": "fixed",
       "mount_note": "NOT slot-mounted. The grid spans X 78-186, Y 151-223, so its centre (132.0, 187.0) sits BETWEEN slot 8 (200, 178.5) and slot 9 (65, 178.5) - 68 mm from one and 67 mm from the other. It straddles the slot boundary and cannot be assigned to either. Treated as a fixed station with an explicit anchor.",
-      "anchor_xy": [186.0, 223.0],
+      "anchor_xy": [
+        186.0,
+        223.0
+      ],
       "anchor_note": "machine coords of well (row 0, col 0). Column index advances toward -X at 12.0 mm; row index advances toward -Y at 18.0 mm.",
       "rotation": 0,
-      "extent_note": "cols 0..9 -> X 186,174,162,150,138,126,114,102,90,78 ; rows 0..4 -> Y 223,205,187,169,151"
+      "extent_note": "cols 0..9 -> X 186,174,162,150,138,126,114,102,90,78 ; rows 0..4 -> Y 223,205,187,169,151",
+      "near_slot": 8,
+      "near_slot_note": "Operator refers to this as position 8. Recorded as a REFERENCE, not a seating claim: this is a bespoke non-SBS fixture whose grid centre (132.0, 187.0) lands 0.25 mm from the slot 8/9 cell seam, so it is seated in neither. Position comes from anchor_xy, not from the slot."
     },
     {
       "name": "tips",
       "labware": "tiprack_300_96",
       "mount": "slot",
-      "slot": 3,
-      "slot_center": [65.0, 365.0],
+      "slot": 4,
       "rotation": 0,
       "corners": {
         "note": "Three measured WELL CENTRES, not the box outline - the 100 x 63.7 mm span is far smaller than an SBS footprint. The grid is solved from these so real pitch and any rack rotation fall out of the measurement.",
-        "origin":     [18.0,  399.20],
-        "along_col":  [118.0, 399.20],
-        "along_row":  [18.0,  335.50],
+        "origin": [
+          18.0,
+          399.2
+        ],
+        "along_col": [
+          118.0,
+          399.2
+        ],
+        "along_row": [
+          18.0,
+          335.5
+        ],
         "origin_label": "top right",
         "along_col_label": "top left",
         "along_row_label": "bottom right",
         "solved": {
           "col_pitch": 9.090909090909092,
           "row_pitch": 9.1,
-          "grid_center": [68.0, 367.35],
+          "grid_center": [
+            68.0,
+            367.35
+          ],
           "note": "col_pitch = 100.0/11, row_pitch = 63.7/7. Assuming the nominal 9.00 would accumulate ~1.0 mm of X error by column 12 - enough to miss a tip. Solved centre X 68.0 vs slot 3 centre X 65.0 is a 3.0 mm slot offset, which is what confirmed the x' = 420 + x frame."
         }
       },
-      "stale_note": "The old TIP_X, TIP_Y = 218, 309 station in examples/300ulaccuracyprecision.py points nowhere near this box (X 18-118, Y 335.5-399.2). It is stale and is not carried forward."
+      "stale_note": "The old TIP_X, TIP_Y = 218, 309 station in examples/300ulaccuracyprecision.py points nowhere near this box (X 18-118, Y 335.5-399.2). It is stale and is not carried forward.",
+      "slot_disputed": true,
+      "slot_note": "Operator states stage location 4. The measured corners put this rack's grid centre at (68.0, 367.35), which is 3.0 mm from slot 3 (65.0, 365.0) and 284 mm from slot 4 (336.0, 272.0) under the x'=420+x frame. Two independent arguments say 4 is unreachable rather than merely offset: (a) this rack's Y puts it in the TOP row, and slots 4-6 are the middle row - exactly one 93 mm row pitch out; (b) the rack sits at a grid CORNER, and across 40 enumerated numbering conventions (row/column-major, snake, spiral, all 8 orientations) slot 4 is never a corner - only 1, 3, 7 and 9 can be. The one convention that would vindicate 4 is an anti-diagonal scan. UNRESOLVED - see open_questions. Positioning does NOT depend on this: the origin comes from the measured corners."
     },
     {
       "name": "water",
       "labware": "reservoir_water",
       "mount": "station",
       "station": "water",
-      "rotation": 0
+      "rotation": 0,
+      "near_slot": 9,
+      "near_slot_note": "Operator thinks position 9, stated with low confidence. Recorded as a REFERENCE only. The dip point X 0 is exactly the envelope minimum, i.e. a trough at the deck edge rather than a plate centre; it does sit inside slot 9's cell, 2.75 mm from its low-X edge."
     }
   ],
-
   "open_questions": [
+    "Is the tip rack in stage location 3 or 4? Its measured grid centre is 3.0 mm from slot 3 and 284 mm from slot 4. Jog to X 65 Y 365 Z 5 and read the label at the position the rack actually occupies - that settles both this and the x'=420+x frame in one move.",
+    "Is the x'=420+x slot frame right at all? parameters.json's 9 centres have NEVER been executed: stagetourjson.gcode emits them verbatim as X-84/X-220/X-355 plus Z-20, and all 9 are outside the 0-420 X envelope, so Klipper would have rejected the first move. Jog to the centre of any EMPTY labelled position and record X: ~200 or ~336 confirms x'=420+x.",
+    "Is the 0.65 mL tube holder seated in a stage position, or on its own bracket? If it is a custom fixture then 'position 8' is a colloquial pointer and its 68 mm offset from the slot centre stops being a discrepancy.",
     "Which tiprack corner is A1 - the three corners fix the grid but not the labelling.",
-    "Which X edge of the tiprack is the post-pickup exit (toward X 18 or toward X 118). Determines the column consumption order.",
+    "Which X edge of the tiprack is the post-pickup exit (toward X 18 or toward X 118).",
     "z_stage_surface has never been measured, so tip-aware absolute Z limits cannot be checked."
   ]
 }
