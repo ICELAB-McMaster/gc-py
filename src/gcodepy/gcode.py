@@ -1,6 +1,25 @@
-from typing import Callable, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
+import io
 import math
+import os
 from . import util
+
+
+def fmt(v: float, decimals: int = 4) -> str:
+    """Format a coordinate for emission.
+
+    Plain str() of a float leaks up to 17 significant digits, which is how
+    ``G0 F1500 X125.99999999999999`` ended up in a generated file. Fixed
+    decimals with the trailing zeros stripped keeps lines short and readable
+    without inventing precision the machine does not have.
+    """
+    if v is None:
+        raise ValueError("cannot format a None coordinate")
+    s = f"{float(v):.{decimals}f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
 
 # TODO:
 # minimize feedrate output
@@ -8,9 +27,17 @@ from . import util
 # travel func
 # catch more invalid inputs
 class Gcode:
+    """Gcode writer.
+
+    Pass a filename to write straight to disk, exactly as before. Pass
+    ``filename=None`` to buffer everything in memory instead: nothing touches
+    the filesystem until :meth:`dump` is called. That is what lets a caller
+    validate a whole program and refuse to write it if a check fails.
+    """
+
     def __init__(
         self,
-        filename: str,
+        filename: Optional[str] = None,
         layer_height: float = 0.2,
         line_width: float = 0.4,
         filament_width: float = 1.75,
@@ -20,7 +47,8 @@ class Gcode:
         ] = util.calculate_extrusion_length,
     ) -> None:
         self.filename = filename
-        self.file = open(filename, "w")
+        self.buffered = filename is None
+        self.file = io.StringIO() if self.buffered else open(filename, "w")
         self.layer_height = layer_height
         self.line_width = line_width
         self.filament_width = filament_width
@@ -29,8 +57,58 @@ class Gcode:
         self.pos = [None] * 3
         self.e = None
 
+    # ---- output ----------------------------------------------------------
+
+    def raw(self, line: str):
+        """Emit one verbatim line. Use this instead of ``.file.write``.
+
+        Going through a method rather than the file handle keeps every emitted
+        line countable and interceptable, which raw handle writes are not.
+        """
+        if not line.endswith("\n"):
+            line += "\n"
+        self.file.write(line)
+
+    def getvalue(self) -> str:
+        """The gcode written so far. Buffered instances only."""
+        if not self.buffered:
+            raise RuntimeError(
+                "getvalue() needs a buffered Gcode - construct it with "
+                "filename=None"
+            )
+        return self.file.getvalue()
+
+    def line_count(self) -> int:
+        return self.getvalue().count("\n")
+
+    def dump(self, path: str) -> str:
+        """Write the buffer to disk. Buffered instances only."""
+        text = self.getvalue()
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # Default text mode, matching what the unbuffered path has always done:
+        # on Windows that means CRLF, which is what every existing .gcode in
+        # this repo uses. Klipper accepts either, but consistency keeps diffs
+        # against the previously generated files readable.
+        with open(path, "w") as fh:
+            fh.write(text)
+        self.filename = path
+        return path
+
     def close(self):
+        if self.buffered:
+            return  # keep the buffer readable; dump() is what persists it
         self.file.close()
+
+    # ---- position guards -------------------------------------------------
+
+    def _require_position(self, what: str):
+        if any(p is None for p in self.pos):
+            raise RuntimeError(
+                f"{what} needs a known position, but the machine has not been "
+                f"homed yet (pos={self.pos}). Call home() first."
+            )
 
     def home(self, Axis: str ="ALL"):
         axis = Axis.upper()
@@ -114,16 +192,25 @@ class Gcode:
         self.file.write(out + "\n")
 
     def travel(self, delta: Tuple[float, float, float], feedrate: int = 2400):
-        self.pos[0] += delta[0]
-        self.pos[1] += delta[1]
-        self.pos[2] += delta[2]
+        self._require_position("travel()")
+        # Round after accumulating: travel() is relative but emits the absolute
+        # result, so without this the drift is physically followed, not cosmetic.
+        self.pos[0] = round(self.pos[0] + delta[0], 6)
+        self.pos[1] = round(self.pos[1] + delta[1], 6)
+        self.pos[2] = round(self.pos[2] + delta[2], 6)
         out = f"G0 F{feedrate}"
+        moved = False
         if delta[0] != 0.0:
-            out += f" X{self.pos[0]}"
+            out += f" X{fmt(self.pos[0])}"
+            moved = True
         if delta[1] != 0.0:
-            out += f" Y{self.pos[1]}"
+            out += f" Y{fmt(self.pos[1])}"
+            moved = True
         if delta[2] != 0.0:
-            out += f" Z{self.pos[2]}"
+            out += f" Z{fmt(self.pos[2])}"
+            moved = True
+        if not moved:
+            return  # an all-zero delta would emit a bare G0 with no axis word
         self.file.write(out + "\n")
 
     def travel_arc(
@@ -134,7 +221,9 @@ class Gcode:
         clockwise: bool = True,
         feedrate: int = 2400,
     ):
-        self.draw_arc(0.0, i, j, delta, clockwise, feedrate)
+        # draw_arc's signature is (i, j, delta, e, clockwise, feedrate). Passing
+        # e first shifted every argument by one and made this raise on any input.
+        self.draw_arc(i, j, delta, 0.0, clockwise, feedrate)
 
     def travel_arc_r(
         self,
@@ -143,17 +232,73 @@ class Gcode:
         clockwise: bool = True,
         feedrate: int = 2400,
     ):
-        self.draw_arc_r(0.0, r, delta, clockwise, feedrate)
+        # Same argument-order slip as travel_arc: draw_arc_r is
+        # (r, delta, e, clockwise, feedrate), so e must come third, not first.
+        self.draw_arc_r(r, delta, 0.0, clockwise, feedrate)
 
     def travel_absolute(
         self, location: Tuple[float, float, float], feedrate: int = 2400
     ):
+        if any(v is None for v in location):
+            raise ValueError(
+                f"travel_absolute got a None coordinate: {location}. This usually "
+                f"means an axis was never homed, and it would otherwise emit a "
+                f"literal 'XNone' into the gcode."
+            )
         self.pos[0] = location[0]
         self.pos[1] = location[1]
         self.pos[2] = location[2]
         self.file.write(
-            f"G0 F{feedrate} X{self.pos[0]} Y{self.pos[1]} Z{self.pos[2]}\n"
+            f"G0 F{feedrate} X{fmt(self.pos[0])} Y{fmt(self.pos[1])} "
+            f"Z{fmt(self.pos[2])}\n"
         )
+
+    # ---- absolute motion helpers ----------------------------------------
+    #
+    # travel() is relative and omits any axis whose delta is zero;
+    # travel_absolute() always writes all three. These two wrap that
+    # asymmetry so a caller can think purely in absolute coordinates and
+    # still get a single-axis move out.
+
+    def move_z_absolute(self, z: float, feedrate: int = 2400, tol: float = 1e-6):
+        """Go to an absolute Z, emitting nothing if already there."""
+        self._require_position("move_z_absolute()")
+        dz = round(z - self.pos[2], 6)
+        if abs(dz) > tol:
+            self.travel((0, 0, dz), feedrate=feedrate)
+
+    def move_xy_absolute(
+        self,
+        x: float,
+        y: float,
+        feedrate: int = 2400,
+        order: str = "XY",
+        tol: float = 1e-6,
+    ):
+        """Go to an absolute XY one axis at a time, never diagonally.
+
+        ``order`` is "XY" (X first) or "YX". X-first is what the tip rack
+        requires, so callers that care should not vary it.
+        """
+        self._require_position("move_xy_absolute()")
+        order = order.upper()
+        if order not in ("XY", "YX"):
+            raise ValueError(f"order must be 'XY' or 'YX', got {order!r}")
+
+        def do_x():
+            if abs(x - self.pos[0]) > tol:
+                self.travel_absolute((x, self.pos[1], self.pos[2]), feedrate=feedrate)
+
+        def do_y():
+            if abs(y - self.pos[1]) > tol:
+                self.travel_absolute((self.pos[0], y, self.pos[2]), feedrate=feedrate)
+
+        if order == "XY":
+            do_x()
+            do_y()
+        else:
+            do_y()
+            do_x()
 
     def draw(
         self, delta: Tuple[float, float, float], e: float = None, feedrate: int = 2400
