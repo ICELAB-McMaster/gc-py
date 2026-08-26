@@ -13,8 +13,9 @@ script is then just the procedure.
 python protocols/accuracy_test.py --effector p300 --outdir out
 ```
 
-See [docs/LAB.md](docs/LAB.md) for the layout, the API, and the rules the
-library enforces.
+See [docs/LAB.md](docs/LAB.md) for the layout and the rules the library
+enforces, and [docs/API.md](docs/API.md) for a reference to every function -
+what it does, what it raises, and what mistake it exists to prevent.
 
 **+Z is DOWN** on this machine: `Z=0` is home at the top, and a larger commanded
 Z is physically lower.

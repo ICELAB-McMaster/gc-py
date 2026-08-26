@@ -1,5 +1,7 @@
 # The `lab` layer
 
+> Function-by-function reference: [API.md](API.md).
+
 Everything the pipetting robot knows about itself lives in `config/`. Everything
 it knows how to *do* lives in `lab/`. A protocol script is then just the
 procedure, with no coordinates and no millimetres in it.
