@@ -150,6 +150,17 @@ class Simulator:
         surf = self.deck.z_stage_surface
         if surf is None:
             missing.append("deck z.stage_surface")
+        else:
+            ref = self.deck.raw["z"].get("stage_surface_reference")
+            if ref and ref != self.effector.id:
+                self.warn(
+                    f"stage_ref:{self.effector.id}",
+                    f"deck z.stage_surface {surf} was measured with the {ref} bare "
+                    f"nosecone, but this run uses {self.effector.id}. A different "
+                    f"pipette body sits at a different height, so every absolute Z "
+                    f"limit below is borrowed rather than measured for this "
+                    f"effector. Measure {self.effector.id}'s own stage contact.",
+                )
 
         tl = None
         if tip_fitted:
@@ -200,18 +211,37 @@ class Simulator:
         if bad:
             self.fail(step, "outside the machine envelope: " + "; ".join(bad))
 
-        limit, missing = self.effective_z_limit(step.tip)
-        if limit is None:
-            # Keyed on tip state: the tipped case can be unresolvable while the
-            # bare case is fine, and that must not be swallowed as a duplicate.
+        # The stage surface only exists over the slot area. Off it there is
+        # nothing to hit at that depth, which is what makes the ejector's
+        # Z 145 legal - it hangs past the front of the stage.
+        on_stage = self.deck.point_on_stage(x, y)
+        limit, missing = (self.effective_z_limit(step.tip) if on_stage
+                          else (None, []))
+        if not on_stage and step.to[2] > (self.deck.z_stage_surface or 1e9):
             self.warn(
-                f"z_limit:{'tipped' if step.tip else 'bare'}",
-                f"cannot check absolute crash depth for "
-                f"{'TIPPED' if step.tip else 'bare'} moves: "
-                f"{' and '.join(missing)} unmeasured. The tip-aware Z envelope "
-                f"is unknown, so only the kinematic limit and per-labware Z were "
-                f"checked.",
+                "off_stage_depth",
+                f"{step.op} commands Z {step.to[2]}, past the stage surface "
+                f"{self.deck.z_stage_surface}, at ({x}, {y}) which is OFF the "
+                f"stage region {self.deck.stage_region()}. That is only safe if "
+                f"nothing is under the effector there - true for the ejector, "
+                f"which hangs past the front edge.",
             )
+
+        self._check_raised_edges(step)
+
+        if limit is None:
+            if on_stage:
+                # Keyed on tip state: the tipped case can be unresolvable while
+                # the bare case is fine, and that must not be swallowed as a
+                # duplicate.
+                self.warn(
+                    f"z_limit:{'tipped' if step.tip else 'bare'}",
+                    f"cannot check absolute crash depth for "
+                    f"{'TIPPED' if step.tip else 'bare'} moves: "
+                    f"{' and '.join(missing)} unmeasured. The tip-aware Z "
+                    f"envelope is unknown, so only the kinematic limit and "
+                    f"per-labware Z were checked.",
+                )
         elif z > limit + 1e-6:
             self.fail(
                 step,
@@ -254,6 +284,66 @@ class Simulator:
                     f"cannot check well-bottom crash for {step.labware}: its "
                     f"z.bottom is unmeasured",
                 )
+
+    def _check_raised_edges(self, step: Step) -> None:
+        """The edges of each stage location are raised. Don't clip them.
+
+        The limit applies to motion that CROSSES a location boundary. Motion
+        staying inside one location is not over an edge, which is what keeps
+        the wall wipe legal: it works at tube depth, but never leaves the cell
+        the tube sits in.
+        """
+        assert step.frm is not None and step.to is not None
+        if not step.moves_xy:
+            return
+        edge_bare = self.deck.z_slot_edge_bare
+        if edge_bare is None:
+            self.warn(
+                "slot_edge",
+                "cannot check the raised location edges: deck z "
+                "slot_edge_with_p300_tip / stage_surface_with_p300_tip are "
+                "unmeasured",
+            )
+            return
+
+        # A move whose swept path never touches the stage cannot clip a stage
+        # edge. This is what makes the ejector legal: it works at Y 80-89,
+        # clear of the front of the stage, at a depth no stage feature reaches.
+        region = self.deck.stage_region()
+        if region is not None:
+            sx0, sx1 = sorted((step.frm[0], step.to[0]))
+            sy0, sy1 = sorted((step.frm[1], step.to[1]))
+            if sx1 < region[0] or sx0 > region[1] or sy1 < region[2] or sy0 > region[3]:
+                return
+
+        cell_from = self.deck.slot_cell(step.frm[0], step.frm[1])
+        cell_to = self.deck.slot_cell(step.to[0], step.to[1])
+        if cell_from is not None and cell_from == cell_to:
+            return  # stayed inside one location; no edge was crossed
+
+        limit = edge_bare
+        if step.tip:
+            tl = self.tip_length()
+            if tl is None:
+                self.warn(
+                    "slot_edge_tip",
+                    "cannot check the raised location edges for TIPPED moves: "
+                    "the tip length is unmeasured",
+                )
+                return
+            limit -= tl
+
+        z = max(step.frm[2], step.to[2])
+        if z > limit + 1e-6:
+            self.fail(
+                step,
+                f"crossing a stage location boundary "
+                f"({cell_from or 'off-stage'} -> {cell_to or 'off-stage'}) at "
+                f"Z {z}, below the raised-edge limit {limit} "
+                f"({'tip fitted' if step.tip else 'bare nosecone'}). The edges of "
+                f"each location are raised; the effector would strike an edge "
+                f"piece on the way over.",
+            )
 
     def _check_keepout(self, step: Step, k: KeepOut, z: float) -> None:
         # The exemption is carried on the individual step, not inferred from

@@ -34,7 +34,8 @@
         "top": null,
         "work": null,
         "bottom": null,
-        "note": "Absolute Z is effector-dependent (a fitted tip hangs below the nosecone), so the working Z lives in effectors/*.json under z_for_labware. These nominal fields stay null until z_stage_surface is measured."
+        "note": "Absolute Z is effector-dependent (a fitted tip hangs below the nosecone), so the working Z lives in effectors/*.json under z_for_labware. These nominal fields stay null until z_stage_surface is measured.",
+        "top_note": "Unmeasured. Note that deck z.slot_edge_with_p300_tip (53.0) is currently the binding traverse constraint - the raised location edges. This rim only matters if the labware stands HIGHER than those edges, i.e. would be hit at a Z below 53 with a tip fitted."
       },
       "footprint": null,
       "wipe": {
@@ -63,8 +64,8 @@
       },
       "tip": {
         "nominal_volume_uL": 300,
-        "length": null,
-        "length_note": "UNMEASURED. Nosecone reference to tip orifice. Required for the tip-aware Z envelope and for checking traverse clearance with a tip fitted."
+        "length": 52.25,
+        "length_note": "DERIVED, not measured directly: deck z.stage_surface 114.75 (bare p300 nosecone on the stage) minus z.stage_surface_with_p300_tip 62.5 (same stage, tip fitted). Nosecone reference to tip orifice."
       },
       "consume_order": {
         "policy": "column_nearest_exit_first",
@@ -78,7 +79,6 @@
         "note": "per-effector, see effectors/*.json -> z_for_labware"
       },
       "uncalibrated": [
-        "tip.length",
         "grid.a1_corner",
         "consume_order.exit_edge"
       ]
@@ -110,7 +110,8 @@
       "z": {
         "top": null,
         "work": null,
-        "bottom": null
+        "bottom": null,
+        "top_note": "Unmeasured. Note that deck z.slot_edge_with_p300_tip (53.0) is currently the binding traverse constraint - the raised location edges. This rim only matters if the labware stands HIGHER than those edges, i.e. would be hit at a Z below 53 with a tip fitted."
       },
       "note": "Not used by any current protocol. Included as a standard definition.",
       "uncalibrated": [
@@ -131,7 +132,8 @@
         "top": null,
         "work": null,
         "bottom": null,
-        "note": "submerge depth is per-effector"
+        "note": "submerge depth is per-effector",
+        "top_note": "Unmeasured. Note that deck z.slot_edge_with_p300_tip (53.0) is currently the binding traverse constraint - the raised location edges. This rim only matters if the labware stands HIGHER than those edges, i.e. would be hit at a Z below 53 with a tip fitted."
       },
       "uncalibrated": [
         "z.work"

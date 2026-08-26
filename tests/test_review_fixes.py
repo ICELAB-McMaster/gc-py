@@ -89,7 +89,9 @@ def test_1b_exemption_cannot_be_spoofed_by_op_name():
     m.startup()
     m.get_tip()
     m.goto(155.0, 300.0, op="eject_tip")
-    m._move_z(65.0, 600, "eject_tip")
+    # 61: past the band's safe-Z of 60, still clear of the tipped stage limit
+    # of 62.5, so only the keep-out rule can fire.
+    m._move_z(61.0, 600, "eject_tip")
     raises(SimulationError,
            lambda: m._move_xy(155.0, 250.0, 6000, "eject_tip", order="Y"),
            "an op named eject_tip should not be exempt without the step flag")
@@ -142,29 +144,90 @@ def test_2c_consumption_works_inward_from_the_exit_edge():
 #    wrong field.
 # --------------------------------------------------------------------------
 
+def _config_without(*paths):
+    """Temp LAB_CONFIG copy with the given deck z keys set to null."""
+    import copy, os, shutil, tempfile
+    d = Path(tempfile.mkdtemp())
+    for name in ("deck.json", "labware.json", "layout.json"):
+        shutil.copy(cfgmod.config_path(name), d / name)
+    shutil.copytree(cfgmod.config_path("effectors"), d / "effectors")
+    deck = json.loads((d / "deck.json").read_text())
+    for key in paths:
+        deck["z"][key] = None
+    (d / "deck.json").write_text(json.dumps(deck))
+    lw = json.loads((d / "labware.json").read_text())
+    lw["labware"]["tiprack_300_96"]["tip"]["length"] = None
+    (d / "labware.json").write_text(json.dumps(lw))
+    return d
+
+
 def test_3_tipped_z_limit_gap_is_reported_separately():
+    """With the measurements REMOVED, bare and tipped must warn separately.
+
+    The defect was that measuring z.stage_surface alone switched the check on
+    for bare moves and left it off for the deeper tipped ones, under a single
+    deduped warning that named the wrong field.
+    """
+    import os
+    d = _config_without("stage_surface_with_p300_tip")
+    old = os.environ.get("LAB_CONFIG")
+    os.environ["LAB_CONFIG"] = str(d)
+    try:
+        m = _machine()
+        m.startup()
+        m.get_tip()
+        m.aspirate_uL(150.0)
+        m.dispense("tubes", 0, 0)
+        ws = m.sim.report.warnings
+        tipped = [w for w in ws if "TIPPED" in w]
+        check(tipped, "the tipped Z-limit gap should be reported on its own")
+        check(any("tip.length" in w for w in tipped),
+              f"the tipped warning should name tip.length; got {tipped}")
+    finally:
+        if old is None:
+            os.environ.pop("LAB_CONFIG", None)
+        else:
+            os.environ["LAB_CONFIG"] = old
+
+
+def test_3b_limit_returns_what_is_missing():
+    import os
+    d = _config_without("stage_surface")
+    old = os.environ.get("LAB_CONFIG")
+    os.environ["LAB_CONFIG"] = str(d)
+    try:
+        m = _machine()
+        limit, missing = m.sim.effective_z_limit(tip_fitted=False)
+        check(limit is None and missing == ["deck z.stage_surface"],
+              f"bare case should report only the surface; got {missing}")
+        limit, missing = m.sim.effective_z_limit(tip_fitted=True)
+        check(limit is None and len(missing) == 2,
+              f"tipped case should report both missing fields; got {missing}")
+    finally:
+        if old is None:
+            os.environ.pop("LAB_CONFIG", None)
+        else:
+            os.environ["LAB_CONFIG"] = old
+
+
+def test_3c_limits_are_now_actually_enforced():
+    """With everything measured, both limits resolve and no gap is reported."""
     m = _machine()
+    bare, missing_bare = m.sim.effective_z_limit(tip_fitted=False)
+    tipped, missing_tip = m.sim.effective_z_limit(tip_fitted=True)
+    check(bare == 114.75 and not missing_bare,
+          f"bare limit should be 114.75, got {bare} missing {missing_bare}")
+    check(tipped == 62.5 and not missing_tip,
+          f"tipped limit should be 62.5, got {tipped} missing {missing_tip}")
+    check(m.sim.tip_length() == 52.25,
+          f"tip length should be 52.25, got {m.sim.tip_length()}")
+
     m.startup()
     m.get_tip()
     m.aspirate_uL(150.0)
     m.dispense("tubes", 0, 0)
-    ws = m.sim.report.warnings
-    tipped = [w for w in ws if "TIPPED" in w]
-    bare = [w for w in ws if "bare moves" in w]
-    check(tipped, "the tipped Z-limit gap should be reported")
-    check(bare, "the bare Z-limit gap should be reported")
-    check(any("tip.length" in w for w in tipped),
-          f"the tipped warning should name tip.length; got {tipped}")
-
-
-def test_3b_limit_returns_what_is_missing():
-    m = _machine()
-    limit, missing = m.sim.effective_z_limit(tip_fitted=False)
-    check(limit is None and missing == ["deck z.stage_surface"],
-          f"bare case should report only the surface; got {missing}")
-    limit, missing = m.sim.effective_z_limit(tip_fitted=True)
-    check(limit is None and len(missing) == 2,
-          f"tipped case should report both missing fields; got {missing}")
+    gaps = [w for w in m.sim.report.warnings if "cannot check absolute crash" in w]
+    check(not gaps, f"no Z-envelope gap should remain: {gaps}")
 
 
 # --------------------------------------------------------------------------

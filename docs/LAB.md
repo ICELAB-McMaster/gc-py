@@ -142,23 +142,65 @@ X descends, so the first of the three is highest X.
 Currently loaded: tip rack in **slot 3**, 0.65 mL tube holder in **slot 8**,
 water in **slot 9**.
 
-## What is still unmeasured
+## The Z envelope, measured 2026-08-26
 
-Every absolute-Z crash check is currently inert. A clean run reports this; the
-manifest records it. Before trusting generated gcode on hardware:
+Three measurements, and the whole absolute-Z model follows from them:
+
+| measured | value |
+|---|---|
+| bare p300 nosecone contacts the main stage | Z **114.75** |
+| same stage, 300 uL tip fitted | Z **62.5** |
+| traverse limit over a location corner, tip fitted | Z **53.0** |
+
+Everything else is derived, so there is one source of truth per number:
+
+* **tip length = 114.75 - 62.5 = 52.25 mm.** That is what
+  `labware.json` `tiprack_300_96.tip.length` holds.
+* **raised edges, bare reference = 53.0 + 52.25 = 105.25.** The edges stand
+  62.5 - 53.0 = **9.5 mm** above the stage floor.
+
+Where each limit applies:
+
+| move | Z | tip | clearance |
+|---|---|---|---|
+| travel | 5.0 | yes | **48.0 mm** below the edge limit |
+| water submerge | 40.0 | yes | 22.5 mm above the stage floor |
+| tube dispense | 45.0 | yes | 17.5 mm above the stage floor |
+| tip approach / pick | 47.0 / 59.0 | no | 67.8 / 55.8 mm above the stage |
+| ejector descend / strip | 145.0 / 137.0 | yes | off-stage, see below |
+
+`z_travel = 5.0` is now **verified rather than assumed** - it clears the raised
+edges by 48 mm with the longest tip fitted.
+
+Two subtleties the simulator handles:
+
+**The stage surface only exists over the stage.** `Deck.stage_region()` derives
+it from the slot centres expanded by half the slot pitch - X[-2.75, 403.75],
+Y[131.88, 411.62]. The ejector works at Y 80-89, clear of the front edge, which
+is the only reason its Z 145 is reachable at all. A test asserts that; if the
+ejector ever moved onto the stage, Z 145 would be a 30 mm dig into it.
+
+**The edge limit applies to crossing a boundary, not to depth as such.** Motion
+staying inside one location is not over an edge, which is what keeps the wall
+wipe legal: it works at Z 45 and 41 inside a tube but never leaves slot 8.
+
+**The 114.75 was measured with the p300 nosecone.** A different pipette body
+sits at a different height, so it does not transfer - the simulator warns when
+the loaded effector is not the reference one, and p125's own stage contact is
+still unmeasured.
+
+## What is still unmeasured
 
 | field | why it matters |
 |---|---|
-| `deck.z.stage_surface` | with `tip.length`, the whole tip-aware Z envelope |
-| `tiprack_300_96.tip.length` | how far a fitted tip extends below the nosecone |
-| each labware `z.top` | traverse clearance — the crash mode that costs a tip |
+| each labware `z.top` | only matters if a rack stands HIGHER than the raised edges - the 53.0 edge limit is currently the binding traverse constraint |
 | each labware `z.bottom` | stops a dispense driving into the vessel |
 | each labware `footprint` | pairwise overlap, and rim-clipping on a traverse |
-| `p300.z_for_labware.tube_rack_0p65_5x10.work` | the Z it descends to 20× a run |
+| `p300.z_for_labware.tube_rack_0p65_5x10.work` | Z 45 was never tuned as a dispense depth; it is safe, not necessarily right |
 | `tiprack_300_96.consume_order.exit_edge` | which way the effector leaves the box |
-| `tiprack_300_96.grid.a1_corner` | which corner is A1 — well names in the manifest |
-| `keepouts.tip_ejector.x_range` | the band width at X155 is carried over from X85 |
-| whether X155 is pre- or post-shift | if pre-shift the lane is really at X 225 |
+| `tiprack_300_96.grid.a1_corner` | which corner is A1 - well names in the manifest |
+| `keepouts.tip_ejector.x_range` | the +/-7 mm band half-width is carried over from the old X 85 mechanism |
+| `p125.z_reference.stage_surface` | p125 borrows the p300 reference; its own is unknown |
 
 The tip ejection routine has never been run on hardware, and `deck.json` says
 so (`stations.tip_eject.validated: false`). It is off by default in the

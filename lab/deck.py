@@ -312,6 +312,66 @@ class Deck:
             )
         return out
 
+    # ---- the stage surface, and where it exists -------------------------
+
+    def stage_region(self) -> Optional[Tuple[float, float, float, float]]:
+        """(x_min, x_max, y_min, y_max) over which the stage surface exists.
+
+        Derived from the slot centres expanded by half the slot pitch rather
+        than stored, so it cannot drift out of step with the slot table. Off
+        this region there is no stage, which is what makes the ejector's Z 145
+        reachable: it hangs past the front edge.
+        """
+        if not self.slots:
+            return None
+        px, py = self.slot_pitch()
+        xs = [c[0] for c in self.slots.values()]
+        ys = [c[1] for c in self.slots.values()]
+        return (min(xs) - px / 2.0, max(xs) + px / 2.0,
+                min(ys) - py / 2.0, max(ys) + py / 2.0)
+
+    def point_on_stage(self, x: float, y: float) -> bool:
+        r = self.stage_region()
+        if r is None:
+            return False
+        return r[0] <= x <= r[1] and r[2] <= y <= r[3]
+
+    def slot_cell(self, x: float, y: float) -> Optional[str]:
+        """Which stage location contains this point, or None if off-stage.
+
+        Used to tell a traverse that crosses a location boundary — and so
+        passes over a raised edge — from motion staying inside one location,
+        which does not.
+        """
+        if not self.point_on_stage(x, y):
+            return None
+        px, py = self.slot_pitch()
+        best: Optional[Tuple[float, str]] = None
+        for key, (cx, cy) in self.slots.items():
+            if abs(x - cx) <= px / 2.0 and abs(y - cy) <= py / 2.0:
+                d = (x - cx) ** 2 + (y - cy) ** 2
+                if best is None or d < best[0]:
+                    best = (d, key)
+        return None if best is None else best[1]
+
+    @property
+    def z_slot_edge_bare(self) -> Optional[float]:
+        """Bare-nosecone Z at which the effector would strike a raised edge.
+
+        Stored as a with-tip measurement because that is how it was taken; the
+        bare equivalent is that plus the tip length, so one measurement covers
+        both cases.
+        """
+        z = self.raw["z"]
+        edge = z.get("slot_edge_with_p300_tip")
+        if edge is None:
+            return None
+        tipped_surface = z.get("stage_surface_with_p300_tip")
+        if tipped_surface is None or self.z_stage_surface is None:
+            return None
+        tip_len = self.z_stage_surface - float(tipped_surface)
+        return float(edge) + tip_len
+
     def slot_pitch(self) -> Tuple[float, float]:
         """Mean X and Y spacing between adjacent slot centres."""
         xs = sorted({c[0] for c in self.slots.values()})

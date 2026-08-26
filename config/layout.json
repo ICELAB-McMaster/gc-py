@@ -75,6 +75,6 @@
   "open_questions": [
     "Which tiprack corner is A1 - the three measured corners fix the grid but not the labelling.",
     "Which X edge of the tiprack is the post-pickup exit (toward X 18 or X 118).",
-    "z_stage_surface has never been measured, so tip-aware absolute Z limits cannot be checked."
+    "Do any of the loaded racks stand HIGHER than the raised location edges? The edge limit (Z 53 with a 300 uL tip) is currently the binding traverse constraint, but no labware z.top has been measured, so a rack taller than the edges would not be caught."
   ]
 }

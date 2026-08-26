@@ -296,13 +296,15 @@ def test_keepout_blocks_low_y_move():
     m.get_tip()
     # Park inside the band, drop below the safe Z, then try to move Y.
     m.goto(155.0, 300.0)
-    m._move_z(65.0, 600, "unit_test")
+    # 61 is past the band's safe-Z of 60 but still clear of the tipped stage
+    # limit of 62.5, so this isolates the keep-out rule.
+    m._move_z(61.0, 600, "unit_test")
 
     def bad_y():
         m._move_xy(155.0, 250.0, 6000, "unit_test", order="Y")
 
     raises(SimulationError, bad_y,
-           "a Y move at X155 with Z 65 should be blocked by the keep-out band")
+           "a Y move at X155 with Z 61 should be blocked by the keep-out band")
 
 
 def test_xy_traverse_must_be_at_travel_height():
@@ -361,6 +363,98 @@ def test_band_routing_avoids_y_motion_in_band():
     check(not offenders,
           f"{len(offenders)} Y move(s) happened inside the keep-out band: "
           f"{[(s.op, s.frm) for s in offenders[:3]]}")
+
+
+# ==========================================================================
+# the Z envelope, measured 2026-08-26
+# ==========================================================================
+
+def test_stage_surface_and_tip_length():
+    """114.75 bare, 62.5 with a tip, so the tip is 52.25 mm long."""
+    d = Deck.load()
+    check(d.z_stage_surface == 114.75, f"bare stage should be 114.75")
+    check(d.catalogue["tiprack_300_96"].spec["tip"]["length"] == 52.25,
+          "tip length should be 52.25, derived from 114.75 - 62.5")
+    check(d.z_slot_edge_bare == 105.25,
+          f"raised edge bare-ref should be 105.25, got {d.z_slot_edge_bare}")
+
+
+def test_travel_height_is_now_verified_not_assumed():
+    """z_travel 5.0 clears the raised edges with the longest tip fitted."""
+    d = Deck.load()
+    tip = d.catalogue["tiprack_300_96"].spec["tip"]["length"]
+    edge_tipped = d.z_slot_edge_bare - tip
+    check(edge_tipped == 53.0, f"tipped edge limit should be 53.0, got {edge_tipped}")
+    check(d.z_travel < edge_tipped,
+          f"travel {d.z_travel} must be above the tipped edge limit {edge_tipped}")
+    check(edge_tipped - d.z_travel >= 40.0,
+          f"only {edge_tipped - d.z_travel} mm of edge clearance at travel height")
+
+
+def test_tipped_stage_crash_is_blocked():
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    m.goto(202.0, 187.0)          # over the tube rack, on the stage
+    raises(SimulationError, lambda: m._move_z(63.0, 600, "unit_test"),
+           "Z 63 with a tip is past the 62.5 stage floor and should be blocked")
+
+
+def test_bare_stage_crash_is_blocked():
+    m = _machine("p125")          # p125 takes no tip
+    m.startup()
+    m.goto(202.0, 187.0)
+    raises(SimulationError, lambda: m._move_z(116.0, 600, "unit_test"),
+           "Z 116 bare is past the 114.75 stage floor and should be blocked")
+
+
+def test_raised_edge_blocks_a_low_traverse_across_locations():
+    """Crossing a location boundary below Z 53 with a tip clips an edge."""
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    m.goto(202.0, 187.0)          # slot 8
+    m._move_z(58.0, 600, "unit_test")   # legal: above the 62.5 floor
+
+    def cross():
+        m._move_xy(70.0, 187.0, 6000, "unit_test", order="X")  # slot 8 -> 9
+
+    raises(SimulationError, cross,
+           "a tipped traverse from slot 8 to slot 9 at Z 58 should clip an edge")
+
+
+def test_wall_wipe_inside_one_location_is_still_allowed():
+    """The wipe works at tube depth but never leaves the cell, so it is fine."""
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    m.aspirate_uL(150.0)
+    m.dispense("tubes", row=0, col=0)   # includes the wall wipe at Z 45 and 41
+    wipes = [s for s in m.steps if s.op == "wall_wipe" and s.kind == "move"]
+    check(wipes, "the dispense should have emitted wipe moves")
+    cells = {m.deck.slot_cell(s.to[0], s.to[1]) for s in wipes}
+    check(cells == {"8"}, f"the wipe should stay inside slot 8, touched {cells}")
+
+
+def test_ejector_is_off_the_stage():
+    """Z 145 is only reachable because the ejector hangs past the stage."""
+    d = Deck.load()
+    st = d.station("tip_eject").spec
+    x = float(st["lane_x"])
+    for key in ("approach_y", "engage_y", "retract_y"):
+        y = float(st[key])
+        check(not d.point_on_stage(x, y),
+              f"ejector {key} ({x}, {y}) must be off the stage for Z "
+              f"{st['z_below_hook']} to be safe")
+
+
+def test_ejection_passes_the_envelope_checks():
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    m.eject_tip()
+    check(not m.sim.report.errors,
+          f"the ejection should pass every envelope check: {m.sim.report.errors}")
 
 
 # ==========================================================================

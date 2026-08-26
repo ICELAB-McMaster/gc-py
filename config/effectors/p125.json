@@ -3,9 +3,7 @@
   "id": "p125",
   "kind": "pipette",
   "display_name": "125 uL air-displacement pipette",
-
   "nominal_uL": 125.0,
-
   "actuator": {
     "blowout_pos": 31.0,
     "blowout_note": "plunger bottomed = full dispense + blow-out",
@@ -20,13 +18,15 @@
     "settle_s": 1.0,
     "decimals": 3
   },
-
   "calibration": {
     "model": "linear_mm_per_uL",
     "slope": 0.1274,
     "intercept": 0.049,
     "equation": "d_mm = 0.1274 * V_uL + 0.049",
-    "window_uL": [10.0, 140.0],
+    "window_uL": [
+      10.0,
+      140.0
+    ],
     "method": "gravimetric",
     "supersedes": [
       "the comment curve 0.12698*V + 0.0837 in examples/125accuracyprecision.py",
@@ -34,16 +34,15 @@
     ],
     "note": "The 10% test point shifts by ~1.8% of its target volume versus the old table, which matters for that ISO point."
   },
-
   "tips": {
     "required": false,
     "labware": null,
     "eject_supported": false,
     "note": "The old 125 script performs NO tip pickup and NO prewet. Whether that is intentional (bare nosecone / permanently fitted tip) or an omission is UNRESOLVED and it changes every Z below."
   },
-
-  "prewet": { "enabled": false },
-
+  "prewet": {
+    "enabled": false
+  },
   "z_for_labware": {
     "reservoir_water": {
       "work": 50.0,
@@ -56,18 +55,20 @@
       "note": "DERIVED: Z=5 then travel((0,0,15)) -> Z=20."
     }
   },
-
   "z_conflict": {
     "description": "UNRESOLVED. p125 water Z=50 is 10 mm LOWER than p300's 40, but p125 tube Z=20 is 25 mm HIGHER than p300's 45. A constant tip-length offset would shift BOTH by the same amount and in the same direction. These two cannot both be right for the same reservoir and the same rack.",
     "likely_cause": "The 15 mm tube descent was inherited from examples/PipetteCurve.py rather than measured.",
     "action": "Measure both against the same reference before running p125 through the new pipeline."
   },
-
   "feedrates": {},
-
   "uncalibrated": [
     "z_for_labware.reservoir_water.work",
     "z_for_labware.tube_rack_0p65_5x10.work",
-    "tips.required"
-  ]
+    "tips.required",
+    "z_reference.stage_surface"
+  ],
+  "z_reference": {
+    "stage_surface": null,
+    "note": "UNMEASURED for this effector. deck z.stage_surface 114.75 was taken with the p300 bare nosecone; a different pipette body sits at a different height, so p125's own stage-contact Z is unknown and its absolute Z limits are unverified. Its working Z values (water 50, tube 20) pass against the p300 reference, but that is not the same as being checked."
+  }
 }

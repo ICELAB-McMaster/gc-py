@@ -36,9 +36,16 @@
   "z": {
     "home": 0.0,
     "travel": 5.0,
-    "travel_note": "chosen empirically, not from a clearance model. simulate.py verifies it against loaded labware z_top with the fitted tip length.",
-    "stage_surface": null,
-    "stage_surface_note": "UNMEASURED. Z at which a BARE nosecone contacts the stage. Required to derive tip-aware Z limits. Until measured, the simulator falls back to per-labware absolute Z and cannot check absolute crash depth."
+    "travel_note": "5.0. Now verified rather than assumed: with a 300 uL tip fitted this clears the raised location edges by 48.0 mm and the stage floor by 57.5 mm.",
+    "stage_surface": 114.75,
+    "stage_surface_note": "Z at which a BARE p300 nosecone contacts the main stage. Measured 2026-08-26. This is the bare-nosecone reference every other Z limit is derived from.",
+    "stage_surface_with_p300_tip": 62.5,
+    "stage_surface_with_p300_tip_note": "Same stage, with a 300 uL tip fitted. Measured 2026-08-26. The difference 114.75 - 62.5 = 52.25 mm IS the tip length, and that is where labware.json tiprack_300_96.tip.length comes from - it is derived, not independently guessed.",
+    "slot_edge_with_p300_tip": 53.0,
+    "slot_edge_note": "The edges of each stage location are raised. With a 300 uL tip fitted, Z must be 53.0 or LOWER (i.e. physically higher) whenever the effector moves across a location corner, or the tip strikes an edge piece. Measured 2026-08-26. Bare-nosecone equivalent is 53.0 + 52.25 = 105.25, so the edges stand 62.5 - 53.0 = 9.5 mm above the stage floor. This limit applies to motion that CROSSES a location boundary; motion staying inside one location (the wall wipe, which works inside a tube) is not over an edge.",
+    "stage_region_note": "The stage surface only exists over the slot area, derived in code as the slot centres expanded by half the slot pitch. Off-stage the surface limit does not apply, which is what makes the ejector's Z 145 reachable - it hangs past the front of the stage. Deck.point_on_stage() is the test; the simulator asserts the ejector really is off-stage rather than taking it on trust.",
+    "stage_surface_reference": "p300",
+    "stage_surface_reference_note": "Which effector's BARE nosecone the 114.75 was measured with. A different pipette body sits at a different height, so this reference does not transfer automatically. The simulator warns when the loaded effector is not this one."
   },
   "slot_frame": {
     "x_offset": 420.0,
