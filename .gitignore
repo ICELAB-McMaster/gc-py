@@ -2,3 +2,8 @@
 /dist/
 *.egg-info*
 .env/
+__pycache__/
+/out/
+*.manifest.json
+*.balance.csv
+*.toolpath.png
