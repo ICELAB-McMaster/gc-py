@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "id": "accuracy_bench_2026_08",
+  "description": "What is physically loaded on the deck right now. This is the per-run file - edit it, do not edit deck.json or labware.json.",
+  "deck": "sdl_klipper_deck",
+
+  "placements": [
+    {
+      "name": "tubes",
+      "labware": "tube_rack_0p65_5x10",
+      "mount": "fixed",
+      "mount_note": "NOT slot-mounted. The grid spans X 78-186, Y 151-223, so its centre (132.0, 187.0) sits BETWEEN slot 8 (200, 178.5) and slot 9 (65, 178.5) - 68 mm from one and 67 mm from the other. It straddles the slot boundary and cannot be assigned to either. Treated as a fixed station with an explicit anchor.",
+      "anchor_xy": [186.0, 223.0],
+      "anchor_note": "machine coords of well (row 0, col 0). Column index advances toward -X at 12.0 mm; row index advances toward -Y at 18.0 mm.",
+      "rotation": 0,
+      "extent_note": "cols 0..9 -> X 186,174,162,150,138,126,114,102,90,78 ; rows 0..4 -> Y 223,205,187,169,151"
+    },
+    {
+      "name": "tips",
+      "labware": "tiprack_300_96",
+      "mount": "slot",
+      "slot": 3,
+      "slot_center": [65.0, 365.0],
+      "rotation": 0,
+      "corners": {
+        "note": "Three measured WELL CENTRES, not the box outline - the 100 x 63.7 mm span is far smaller than an SBS footprint. The grid is solved from these so real pitch and any rack rotation fall out of the measurement.",
+        "origin":     [18.0,  399.20],
+        "along_col":  [118.0, 399.20],
+        "along_row":  [18.0,  335.50],
+        "origin_label": "top right",
+        "along_col_label": "top left",
+        "along_row_label": "bottom right",
+        "solved": {
+          "col_pitch": 9.090909090909092,
+          "row_pitch": 9.1,
+          "grid_center": [68.0, 367.35],
+          "note": "col_pitch = 100.0/11, row_pitch = 63.7/7. Assuming the nominal 9.00 would accumulate ~1.0 mm of X error by column 12 - enough to miss a tip. Solved centre X 68.0 vs slot 3 centre X 65.0 is a 3.0 mm slot offset, which is what confirmed the x' = 420 + x frame."
+        }
+      },
+      "stale_note": "The old TIP_X, TIP_Y = 218, 309 station in examples/300ulaccuracyprecision.py points nowhere near this box (X 18-118, Y 335.5-399.2). It is stale and is not carried forward."
+    },
+    {
+      "name": "water",
+      "labware": "reservoir_water",
+      "mount": "station",
+      "station": "water",
+      "rotation": 0
+    }
+  ],
+
+  "open_questions": [
+    "Which tiprack corner is A1 - the three corners fix the grid but not the labelling.",
+    "Which X edge of the tiprack is the post-pickup exit (toward X 18 or toward X 118). Determines the column consumption order.",
+    "z_stage_surface has never been measured, so tip-aware absolute Z limits cannot be checked."
+  ]
+}

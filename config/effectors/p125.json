@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "id": "p125",
+  "kind": "pipette",
+  "display_name": "125 uL air-displacement pipette",
+
+  "nominal_uL": 125.0,
+
+  "actuator": {
+    "blowout_pos": 31.0,
+    "blowout_note": "plunger bottomed = full dispense + blow-out",
+    "air_gap": 6.0,
+    "gap_pos": 25.0,
+    "gap_pos_note": "= blowout_pos - air_gap",
+    "post_asp_backoff": 1.0,
+    "post_asp_backoff_note": "TRAIL_GAP in the old script",
+    "stroke_margin": 1.0,
+    "stroke_margin_note": "The old 125 script defined no margin and only asserted POS >= 0. Set to 1.0 to match p300. This TIGHTENS the check; it cannot loosen it.",
+    "pos_min": 0.0,
+    "settle_s": 1.0,
+    "decimals": 3
+  },
+
+  "calibration": {
+    "model": "linear_mm_per_uL",
+    "slope": 0.1274,
+    "intercept": 0.049,
+    "equation": "d_mm = 0.1274 * V_uL + 0.049",
+    "window_uL": [10.0, 140.0],
+    "method": "gravimetric",
+    "supersedes": [
+      "the comment curve 0.12698*V + 0.0837 in examples/125accuracyprecision.py",
+      "the hardcoded table [1.671, 8.020, 11.988, 15.956]"
+    ],
+    "note": "The 10% test point shifts by ~1.8% of its target volume versus the old table, which matters for that ISO point."
+  },
+
+  "tips": {
+    "required": false,
+    "labware": null,
+    "eject_supported": false,
+    "note": "The old 125 script performs NO tip pickup and NO prewet. Whether that is intentional (bare nosecone / permanently fitted tip) or an omission is UNRESOLVED and it changes every Z below."
+  },
+
+  "prewet": { "enabled": false },
+
+  "z_for_labware": {
+    "reservoir_water": {
+      "work": 50.0,
+      "uncalibrated": true,
+      "note": "DERIVED, not stated. The old script uses relative moves: travel((0,0,5)) at start -> Z=5, then travel((0,0,45)) -> Z=50."
+    },
+    "tube_rack_0p65_5x10": {
+      "work": 20.0,
+      "uncalibrated": true,
+      "note": "DERIVED: Z=5 then travel((0,0,15)) -> Z=20."
+    }
+  },
+
+  "z_conflict": {
+    "description": "UNRESOLVED. p125 water Z=50 is 10 mm LOWER than p300's 40, but p125 tube Z=20 is 25 mm HIGHER than p300's 45. A constant tip-length offset would shift BOTH by the same amount and in the same direction. These two cannot both be right for the same reservoir and the same rack.",
+    "likely_cause": "The 15 mm tube descent was inherited from examples/PipetteCurve.py rather than measured.",
+    "action": "Measure both against the same reference before running p125 through the new pipeline."
+  },
+
+  "feedrates": {},
+
+  "uncalibrated": [
+    "z_for_labware.reservoir_water.work",
+    "z_for_labware.tube_rack_0p65_5x10.work",
+    "tips.required"
+  ]
+}

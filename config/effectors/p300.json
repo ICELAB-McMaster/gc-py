@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "id": "p300",
+  "kind": "pipette",
+  "display_name": "300 uL air-displacement pipette",
+
+  "nominal_uL": 300.0,
+
+  "actuator": {
+    "blowout_pos": 30.0,
+    "blowout_note": "plunger bottomed = full dispense + blow-out",
+    "air_gap": 5.0,
+    "gap_pos": 25.0,
+    "gap_pos_note": "= blowout_pos - air_gap. Armed IN AIR before descending.",
+    "post_asp_backoff": 1.0,
+    "post_asp_backoff_note": "extra retract in air after leaving the water, anti-drip",
+    "stroke_margin": 1.0,
+    "stroke_margin_note": "keep POS at least this far off the POS=0 hard stop",
+    "pos_min": 0.0,
+    "settle_s": 1.0,
+    "decimals": 3
+  },
+
+  "calibration": {
+    "model": "linear_mm_per_uL",
+    "slope": 0.0533,
+    "intercept": 0.122,
+    "equation": "d_mm = 0.0533 * V_uL + 0.122",
+    "window_uL": [8.0, 320.0],
+    "method": "gravimetric / density",
+    "temperature_C": 23.0,
+    "water_density_g_per_mL": 0.997538,
+    "z_factor_uL_per_mg": 1.0032,
+    "pressure_kPa": 101.3,
+    "supersedes": [
+      "the comment curve 0.05338*V + 0.1218 in examples/300ulaccuracyprecision.py",
+      "the hardcoded table [1.722, 8.123, 12.123, 16.123]"
+    ],
+    "note": "Store coefficients ONLY. Displacements are computed at runtime. No mm value is ever typed into a protocol script."
+  },
+
+  "tips": {
+    "required": true,
+    "labware": "tiprack_300_96",
+    "eject_supported": true
+  },
+
+  "prewet": {
+    "enabled": true,
+    "cycles": 3,
+    "min_cycles": 3,
+    "displacement_mm": 20.0,
+    "asp_pos": 10.0,
+    "asp_pos_note": "= blowout_pos - displacement_mm, measured from BOTTOMED, not from gap_pos"
+  },
+
+  "z_for_labware": {
+    "reservoir_water": { "work": 40.0, "note": "tip submerged" },
+    "tube_rack_0p65_5x10": { "work": 45.0, "uncalibrated": true, "note": "was marked <-- TUNE in the source and was never tuned" },
+    "tiprack_300_96": {
+      "approach": 47.0,
+      "pick": 59.0,
+      "note": "pick=59.0 comes from the direct rack measurement and supersedes the old Z_TIP_PICK=57.5 in examples/300ulaccuracyprecision.py. Confirm 57.5 was not a different tip type.",
+      "superseded": 57.5
+    }
+  },
+
+  "feedrates": { "tip_press": 600 },
+
+  "uncalibrated": [
+    "z_for_labware.tube_rack_0p65_5x10.work"
+  ]
+}

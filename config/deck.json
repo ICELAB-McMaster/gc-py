@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "id": "sdl_klipper_deck",
+  "description": "Klipper pipetting robot deck. Machine envelope, slot centres, fixed stations and keep-out zones.",
+
+  "conventions": {
+    "units": "mm",
+    "z_positive_direction": "down",
+    "z_note": "Z=0 is home/top. LARGER Z is LOWER. A move from Z145 to Z137 is 8 mm UP.",
+    "xy_order": "X first, then Y. Never diagonal. Enforced by the library."
+  },
+
+  "axes": {
+    "x": { "min": 0.0, "max": 420.0, "home": 420.0, "note": "homes at 420 and counts down toward 0" },
+    "y": { "min": 0.0, "max": 580.0, "home": 0.0 },
+    "z": { "min": 0.0, "max": 270.0, "home": 0.0, "note": "kinematic limit only; the real limit is effector-dependent, see simulate.py" }
+  },
+
+  "feedrates": {
+    "travel": 6000,
+    "hold": 3000,
+    "tip_press": 600,
+    "wipe": 1500
+  },
+
+  "z": {
+    "home": 0.0,
+    "travel": 5.0,
+    "travel_note": "chosen empirically, not from a clearance model. simulate.py verifies it against loaded labware z_top with the fitted tip length.",
+    "stage_surface": null,
+    "stage_surface_note": "UNMEASURED. Z at which a BARE nosecone contacts the stage. Required to derive tip-aware Z limits. Until measured, the simulator falls back to per-labware absolute Z and cannot check absolute crash depth."
+  },
+
+  "slot_frame": {
+    "x_offset": 420.0,
+    "note": "The legacy examples/parameters.json stored slot X as negative (-84/-220/-355). Machine X = 420 + stored. Resolved against the measured tip-rack grid centre X 68.0 vs 420+(-355)=65.0, a 3.0 mm slot offset. The negate interpretation would put slot 3 at X 355, which is 287 mm away and impossible."
+  },
+
+  "slot_order_note": "Row-major, both axes descending. Slot 1 = highest X and highest Y; slot 9 = lowest of both.",
+
+  "slots": {
+    "1": { "center": [336.0, 365.0] },
+    "2": { "center": [200.0, 365.0] },
+    "3": { "center": [65.0, 365.0] },
+    "4": { "center": [336.0, 272.0] },
+    "5": { "center": [200.0, 272.0] },
+    "6": { "center": [65.0, 272.0] },
+    "7": { "center": [336.0, 178.5] },
+    "8": { "center": [200.0, 178.5] },
+    "9": { "center": [65.0, 178.5] }
+  },
+  "slot_pitch_note": "X pitch is 136/135 and Y pitch is 93.0/93.5 - irregular by ~1 mm. Per-slot centres are stored rather than derived from a pitch so the irregularity survives. Unverified whether it is a real measured frame or transcription drift.",
+
+  "stations": {
+    "water": {
+      "xy": [0.0, 175.0],
+      "description": "open water reservoir",
+      "z_note": "submerge depth is per-effector, see effectors/*.json -> z_for_labware.reservoir_water.work"
+    },
+    "park": {
+      "xy": [350.0, 0.0],
+      "z": 0.0,
+      "description": "end-of-run park position"
+    },
+    "tip_eject": {
+      "xy": [155.0, 89.0],
+      "description": "tip ejector lane. Operator-confirmed 2026-08-25: the working lane is X 155 (supersedes an earlier X 85 note).",
+      "lane_x": 155.0,
+      "approach_y": 83.0,
+      "engage_y": 88.0,
+      "retract_y": 80.0,
+      "z_below_hook": 145.0,
+      "z_strip": 137.0,
+      "strip_note": "Z145 -> Z137 is an 8 mm UPWARD stroke because +Z is down. That is the strip.",
+      "rehome_after": true,
+      "rehome_note": "The strip force can skip steps on an open-loop machine, so commanded position is untrustworthy afterward. G28 is mandatory, not optional.",
+      "validated": false,
+      "validated_note": "NEVER RUN ON HARDWARE UNVALIDATED. No existing gcode file in this repo contains an ejection sequence; this routine has no working reference. Dry-run it, then step through manually at reduced feedrate."
+    }
+  },
+
+  "keepouts": [
+    {
+      "id": "tip_ejector",
+      "description": "Y-axis motion inside this X band collides with the ejector mechanism unless the effector is ABOVE Z 60 (i.e. commanded Z < 60).",
+      "x_range": [148.0, 162.0],
+      "x_range_note": "Derived as the ejector lane X 155 +/- 7.0. The 14 mm width is carried over from the previously documented band [78, 92] centred on X 85. UNVERIFIED at the new location - measure the mechanism width at X155 and correct half_width if it differs.",
+      "half_width": 7.0,
+      "forbids": "y_motion",
+      "safe_when_z_below": 60.0,
+      "safe_when_z_below_note": "Stated for the 300 uL effector with NO TIP. With a tip fitted the effector reaches lower and the safe Z shrinks. tip_length is unmeasured, so any TIPPED Y-traverse through this band is treated as an error.",
+      "whitelist": ["eject_tip"]
+    }
+  ],
+
+  "klipper_macros": {
+    "actuator_move": "ACTUATOR_MOVE POS=",
+    "home_actuator": "HOME_ACTUATOR",
+    "log_temps": "LOG_TEMPS TAG=",
+    "note": "These must exist in printer.cfg."
+  },
+
+  "temperature_sensors": {
+    "actuator": "temperature_sensor actuator",
+    "chamber": "temperature_sensor chamber",
+    "note": "section names must match printer.cfg exactly"
+  }
+}

@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "description": "Slot-independent labware GEOMETRY. Where a piece of labware sits is in layout.json, never here. A rack has the same internal geometry regardless of which slot it occupies.",
+
+  "grid_models": {
+    "pitch": "anchor well (row 0, col 0) + pitch + integer direction vectors. Placement supplies the anchor.",
+    "corners": "three measured well centres (origin, along_col, along_row) solved for pitch and rotation. Placement supplies the corners. Use when the real pitch differs from nominal."
+  },
+
+  "labware": {
+
+    "tube_rack_0p65_5x10": {
+      "display_name": "0.65 mL microcentrifuge tube holder (user-fabricated)",
+      "type": "tube_rack",
+      "vessel": {
+        "nominal_volume_uL": 650,
+        "description": "0.65 mL microcentrifuge tube"
+      },
+      "grid": {
+        "model": "pitch",
+        "rows": 5,
+        "cols": 10,
+        "pitch_x": 12.0,
+        "pitch_y": 18.0,
+        "col_dir": [-1, 0],
+        "row_dir": [0, -1],
+        "direction_note": "Increasing COLUMN index moves toward LOWER X. Increasing ROW index moves toward LOWER Y. This is the OPPOSITE column sense from tiprack_300_96 - do not hardcode one convention globally.",
+        "source": "X_PITCH=12 / Y_PITCH=18 / ROWS=5 / COLS=10 in examples/300ulaccuracyprecision.py, examples/125accuracyprecision.py and examples/PipetteCurve15.py; independently cross-checked against the hardcoded Xlist=range(78,187,12), Ylist=range(223,150,-18) in examples/PipetteCurve.py and against the emitted coordinates in 300ulPipetteAccuracy.gcode. Pitch confirmed by operator 2026-08-25."
+      },
+      "well_naming": {
+        "scheme": "row_letter_col_number",
+        "note": "row 0 = A. Used for the run manifest so balance readings join on tube ID."
+      },
+      "z": {
+        "top": null,
+        "work": null,
+        "bottom": null,
+        "note": "Absolute Z is effector-dependent (a fitted tip hangs below the nosecone), so the working Z lives in effectors/*.json under z_for_labware. These nominal fields stay null until z_stage_surface is measured."
+      },
+      "footprint": null,
+      "wipe": {
+        "dx": 3.2,
+        "dz": 4.0,
+        "feed": 1500,
+        "description": "Wall wipe: step sideways to contact the inner wall, drag the droplet UP (-Z), then pull back off the wall. dx must be less than the tube inner radius.",
+        "uncalibrated": true
+      },
+      "uncalibrated": ["wipe.dx", "wipe.dz", "z.work"]
+    },
+
+    "tiprack_300_96": {
+      "display_name": "300 uL ClipTip rack, 96 position",
+      "type": "tiprack",
+      "grid": {
+        "model": "corners",
+        "rows": 8,
+        "cols": 12,
+        "direction_note": "Solved from the three measured corners in layout.json. Increasing COLUMN index moves toward HIGHER X; increasing ROW index moves toward LOWER Y. Real pitch is ~9.09 x ~9.10, NOT the nominal 9.00 - assuming 9.00 accumulates ~1.0 mm by column 12, enough to miss a tip.",
+        "a1_corner": "unconfirmed",
+        "a1_corner_note": "The three corners define the grid unambiguously, but which corner is A1 does NOT follow from them. Confirm before trusting well names in the manifest."
+      },
+      "tip": {
+        "nominal_volume_uL": 300,
+        "length": null,
+        "length_note": "UNMEASURED. Nosecone reference to tip orifice. Required for the tip-aware Z envelope and for checking traverse clearance with a tip fitted."
+      },
+      "consume_order": {
+        "policy": "column_nearest_exit_first",
+        "exit_edge": "unconfirmed",
+        "exit_edge_note": "After pickup the effector CANNOT pass over occupied tip positions - it shears the tip off. The first move after pickup must be in X. The X exit crosses every position between the picked column and the box edge, so columns must be consumed starting nearest the exit edge. The box spans X 18-118; whether the exit is toward X 18 or X 118 is UNCONFIRMED."
+      },
+      "z": { "approach": null, "pick": null, "note": "per-effector, see effectors/*.json -> z_for_labware" },
+      "uncalibrated": ["tip.length", "grid.a1_corner", "consume_order.exit_edge"]
+    },
+
+    "sbs_96_wellplate": {
+      "display_name": "Standard SBS 96-well plate",
+      "type": "wellplate",
+      "grid": {
+        "model": "pitch",
+        "rows": 8,
+        "cols": 12,
+        "pitch_x": 9.0,
+        "pitch_y": 9.0,
+        "col_dir": [1, 0],
+        "row_dir": [0, -1]
+      },
+      "footprint": [127.76, 85.48],
+      "grid_centered_on_footprint": true,
+      "grid_centered_note": "14.38 + 11*9/2 = 63.88 = 127.76/2 and 11.24 + 7*9/2 = 42.74 = 85.48/2, so A1-from-centre is derivable from the grid span. Placement may still override with a1_from_center.",
+      "z": { "top": null, "work": null, "bottom": null },
+      "note": "Not used by any current protocol. Included as a standard definition.",
+      "uncalibrated": ["z.top", "z.work", "z.bottom"]
+    },
+
+    "reservoir_water": {
+      "display_name": "Open water reservoir",
+      "type": "reservoir",
+      "grid": { "model": "single", "rows": 1, "cols": 1 },
+      "z": { "top": null, "work": null, "bottom": null, "note": "submerge depth is per-effector" },
+      "uncalibrated": ["z.work"]
+    }
+  }
+}

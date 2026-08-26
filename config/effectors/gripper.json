@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "gripper",
+  "kind": "gripper",
+  "display_name": "Plate gripper (planned - NOT BUILT)",
+
+  "status": "placeholder",
+  "status_note": "Reserved so the effector loader, the deck resolver and the simulator already dispatch on kind. Every numeric field below is a placeholder and MUST be measured before this file is used to generate motion. lab.effector refuses to load a placeholder unless allow_placeholder=True.",
+
+  "actuator": {
+    "open_pos": null,
+    "closed_pos": null,
+    "grip_pos": null,
+    "pos_min": 0.0,
+    "pos_max": null,
+    "stroke_margin": null,
+    "decimals": 3,
+    "note": "If the gripper is driven by the same ACTUATOR_MOVE macro, these are POS values on that axis. If it gets its own macro, add a macro_name field here and the loader will use it instead."
+  },
+
+  "grip": {
+    "approach_clearance_mm": null,
+    "jaw_span_open_mm": null,
+    "jaw_span_closed_mm": null,
+    "settle_s": null
+  },
+
+  "tips": { "required": false, "labware": null, "eject_supported": false },
+
+  "z_for_labware": {},
+
+  "carries_labware": true,
+  "carries_labware_note": "Unlike a pipette the gripper changes the deck LAYOUT at runtime: picking a plate empties a slot and fills the effector. lab.layout tracks this so the simulator can catch a move into a slot the gripper just emptied, or a place into an occupied one.",
+
+  "feedrates": {},
+
+  "uncalibrated": ["ALL"]
+}
