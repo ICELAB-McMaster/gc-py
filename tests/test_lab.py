@@ -59,19 +59,22 @@ def test_tube_rack_layout():
           f"tube rack should be 5x10, got {p.labware.rows}x{p.labware.cols}")
     check(p.labware.grid["pitch_x"] == 12.0, "tube rack X pitch should be 12.0")
     check(p.labware.grid["pitch_y"] == 18.0, "tube rack Y pitch should be 18.0")
-    check(p.xy(0, 0) == (186.0, 223.0), f"A1 should be (186, 223), got {p.xy(0,0)}")
+    # X is in the CURRENT frame. The old scripts' X 186 predates the X travel
+    # limit growing by 70 mm; see deck.json coordinate_frame.
+    check(p.xy(0, 0) == (256.0, 223.0), f"A1 should be (256, 223), got {p.xy(0,0)}")
 
     # Column index advances toward LOWER X; row index toward LOWER Y.
-    expect_x = [186.0, 174.0, 162.0, 150.0, 138.0, 126.0, 114.0, 102.0, 90.0, 78.0]
+    expect_x = [256.0, 244.0, 232.0, 220.0, 208.0, 196.0, 184.0, 172.0, 160.0, 148.0]
     expect_y = [223.0, 205.0, 187.0, 169.0, 151.0]
     check(p.col_x_values() == expect_x, f"tube col X wrong: {p.col_x_values()}")
     check(p.row_y_values() == expect_y, f"tube row Y wrong: {p.row_y_values()}")
-    check(p.grid_center() == (132.0, 187.0),
-          f"tube grid centre should be (132, 187), got {p.grid_center()}")
+    check(p.grid_center() == (202.0, 187.0),
+          f"tube grid centre should be (202, 187), got {p.grid_center()}")
 
-    # The 20 positions the accuracy protocol actually visits, straight out of
-    # 300ulPipetteAccuracy.gcode.
-    check(p.xy(3, 4) == (138.0, 169.0), "last accuracy tube should be (138, 169)")
+    # The pre-shift positions, +70, are what the old gcode visited.
+    check(p.xy(3, 4) == (208.0, 169.0), "last accuracy tube should be (208, 169)")
+    check(p.xy(0, 0)[0] - 70.0 == 186.0,
+          "the pre-shift anchor should still be recoverable as X 186")
 
 
 def test_tiprack_corner_solve():
@@ -102,14 +105,21 @@ def test_out_of_range_well():
     raises(IndexError, lambda: p.xy(0, 10), "col 10 of a 10-col rack should raise")
 
 
-def test_keepout_covers_tube_columns():
-    """The X155 ejector band sits over tube columns 2 and 3."""
+def test_keepout_misses_the_tubes_in_use():
+    """In the corrected frame the ejector band clears every tube the test visits.
+
+    Before the +70 correction the band appeared to cover columns 2 and 3, which
+    the accuracy protocol uses. It actually covers 8 and 9, which nothing uses.
+    """
     d = Deck.load()
     p = d.placement("tubes")
     band = next(k for k in d.keepouts if k.id == "tip_ejector")
     inside = [c for c in range(p.labware.cols) if band.contains_x(p.xy(0, c)[0])]
-    check(inside == [2, 3],
-          f"tube columns inside the X155 band should be [2, 3], got {inside}")
+    check(inside == [8, 9],
+          f"tube columns inside the X155 band should be [8, 9], got {inside}")
+    used = [c for c in inside if c <= 4]
+    check(not used,
+          f"the accuracy test uses columns 0-4; these are in the band: {used}")
 
 
 # ==========================================================================
@@ -257,6 +267,28 @@ def test_p125_rejects_tip_ops():
 # simulator
 # ==========================================================================
 
+def test_slots_are_seated_correctly():
+    """Every slot-mounted labware sits in the slot the operator named."""
+    d = Deck.load()
+    bad = d.slot_seating_report()
+    check(not bad, "slot seating problems: " + "; ".join(bad))
+    check(d.placement("tips").slot == 3, "the tip rack is in slot 3")
+    check(d.placement("tubes").slot == 8, "the tube holder is in slot 8")
+    check(d.near_slots().get("water") == 9, "water sits at slot 9")
+
+
+def test_front_row_is_high_y():
+    """Slots 1-3 are the front row (largest Y); 7-9 the back (smallest)."""
+    d = Deck.load()
+    front = [d.slot_center(n)[1] for n in (1, 2, 3)]
+    mid = [d.slot_center(n)[1] for n in (4, 5, 6)]
+    back = [d.slot_center(n)[1] for n in (7, 8, 9)]
+    check(len(set(front)) == 1 and len(set(mid)) == 1 and len(set(back)) == 1,
+          "each row should share one Y")
+    check(front[0] > mid[0] > back[0],
+          f"front Y {front[0]} should exceed mid {mid[0]} should exceed back {back[0]}")
+
+
 def test_keepout_blocks_low_y_move():
     """A Y move inside the band below Z 60 must fail."""
     m = _machine()
@@ -375,7 +407,7 @@ def test_full_protocol_and_manifest():
         text = gpath.read_text()
         check("ACTUATOR_MOVE POS=23.279" in text,
               "the 30 uL aspirate POS should appear in the gcode")
-        check("X186" in text and "Y223" in text, "tube A1 should appear in the gcode")
+        check("X256" in text and "Y223" in text, "tube A1 should appear in the gcode")
 
         man = json.loads(Path(result["manifest"]).read_text())
         check(len(man["provenance"]["config_sha256"]) == 4,

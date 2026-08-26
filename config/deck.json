@@ -42,9 +42,9 @@
   },
   "slot_frame": {
     "x_offset": 420.0,
-    "note": "The legacy examples/parameters.json stored slot X as negative (-84/-220/-355). Machine X = 420 + stored. Resolved against the measured tip-rack grid centre X 68.0 vs 420+(-355)=65.0, a 3.0 mm slot offset. The negate interpretation would put slot 3 at X 355, which is 287 mm away and impossible."
+    "note": "Machine X = 420 + stored. parameters.json stored slot X as negative (-84/-220/-355). Confirmed by three labware landing on the slots the operator names, once the +70 frame shift is applied to the pre-shift coordinates - see coordinate_frame."
   },
-  "slot_order_note": "Row-major, both axes descending. Slot 1 = highest X and highest Y; slot 9 = lowest of both.",
+  "slot_order_note": "Row-major. Slots 1-3 are the FRONT row (largest Y, 365), 4-6 the middle row (272), 7-9 the BACK row (smallest Y, 178.5). Within each row X descends: the first of the three is highest X. Operator-confirmed 2026-08-26.",
   "slots": {
     "1": {
       "center": [
@@ -105,19 +105,21 @@
   "stations": {
     "water": {
       "xy": [
-        0.0,
+        70.0,
         175.0
       ],
       "description": "open water reservoir",
-      "z_note": "submerge depth is per-effector, see effectors/*.json -> z_for_labware.reservoir_water.work"
+      "z_note": "submerge depth is per-effector, see effectors/*.json -> z_for_labware.reservoir_water.work",
+      "frame_note": "was X 0 in the pre-shift frame; +70 applied"
     },
     "park": {
       "xy": [
-        350.0,
+        420.0,
         0.0
       ],
       "z": 0.0,
-      "description": "end-of-run park position"
+      "description": "end-of-run park position",
+      "frame_note": "was X 350 in the pre-shift frame; +70 applied. 420 is X home, which is what this station always meant."
     },
     "tip_eject": {
       "xy": [
@@ -168,5 +170,27 @@
   },
   "uncalibrated": [
     "keepouts.tip_ejector.x_range (width unverified at X155)"
-  ]
+  ],
+  "coordinate_frame": {
+    "x_shift_applied": 70.0,
+    "description": "The X travel limit was increased by 70 mm. The machine homes at max X, so the same physical endstop is now called 420 where it used to be 350, and every physical point gained 70 in X. Coordinates written before that change are 70 mm too low in the current frame and have been corrected here.",
+    "evidence": [
+      "tube rack grid centre 132 + 70 = 202 vs slot 8 at 200 (2.0 mm)",
+      "water dip point 0 + 70 = 70 vs slot 9 at 65 (5.0 mm)",
+      "park 350 + 70 = 420 = X home exactly; park at X350 in a 0-350 machine WAS 'go to X home', which only makes sense if 350 was the old maximum",
+      "the tube rack unshifted (X 78-186) straddles the slot 8/9 cell seam at 132.25 and is seated in neither; shifted (X 148-256) it fits entirely inside slot 8, which is where the operator says it is",
+      "the tip rack measured at X 68 after the change matches slot 3 at 65 with no shift, confirming the measurement is already in the current frame"
+    ],
+    "corrected": [
+      "deck.stations.water.xy X 0 -> 70",
+      "deck.stations.park.xy X 350 -> 420",
+      "layout tubes anchor_xy X 186 -> 256"
+    ],
+    "unaffected": [
+      "all Y coordinates - only the X limit changed",
+      "all Z heights",
+      "the tip rack corners - measured after the change",
+      "the tip ejector lane X 155 - operator states this as current"
+    ]
+  }
 }

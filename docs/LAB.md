@@ -98,6 +98,50 @@ than staying quiet. The bare and tipped Z envelopes warn separately, because
 measuring only `z_stage_surface` would switch the check on for bare moves while
 leaving it off for the deeper, more dangerous tipped ones.
 
+## The X frame: everything pre-dating the limit change is +70
+
+The X travel limit was increased by 70 mm. The machine homes at max X, so the
+same physical endstop is now called 420 where it used to be 350 - and every
+physical point gained 70 in X. Coordinates written before that change are 70 mm
+too low today.
+
+`config/deck.json` records this under `coordinate_frame`, with the corrections
+applied. What moved:
+
+| | pre-shift | current |
+|---|---|---|
+| tube rack anchor (well A1) | X 186 | **X 256** |
+| water dip point | X 0 | **X 70** |
+| park | X 350 | **X 420** (= X home) |
+
+Four independent checks agree, which is why this is treated as settled rather
+than as a guess:
+
+* tube rack centre 132 + 70 = 202 against slot 8 at 200 - 2.0 mm
+* water 0 + 70 = 70 against slot 9 at 65 - 5.0 mm
+* park 350 + 70 = 420 is exactly X home; park at X 350 in a 0-350 machine
+  always meant "go home in X"
+* unshifted, the tube rack (X 78-186) straddles the slot 8/9 cell seam and is
+  seated in neither. Shifted (X 148-256) it fits entirely inside slot 8.
+
+Not affected: every Y coordinate, every Z height, and the tip rack corners -
+those were measured after the change. `Deck.slot_seating_report()` is the check
+that keeps this honest: a slot-mounted labware whose grid centre sits more than
+half a slot pitch from its slot centre is reported on every run.
+
+**The generated gcode is not comparable to anything produced before this
+correction.** Old files are in the old frame; diff with
+`tools/compare_gcode.py` and expect a uniform +70 in X.
+
+## Slot numbering
+
+Row-major, three rows of three. **Slots 1-3 are the front row** (largest Y,
+365), 4-6 the middle (272), **7-9 the back** (smallest Y, 178.5). Within a row
+X descends, so the first of the three is highest X.
+
+Currently loaded: tip rack in **slot 3**, 0.65 mL tube holder in **slot 8**,
+water in **slot 9**.
+
 ## What is still unmeasured
 
 Every absolute-Z crash check is currently inert. A clean run reports this; the
@@ -114,6 +158,7 @@ manifest records it. Before trusting generated gcode on hardware:
 | `tiprack_300_96.consume_order.exit_edge` | which way the effector leaves the box |
 | `tiprack_300_96.grid.a1_corner` | which corner is A1 — well names in the manifest |
 | `keepouts.tip_ejector.x_range` | the band width at X155 is carried over from X85 |
+| whether X155 is pre- or post-shift | if pre-shift the lane is really at X 225 |
 
 The tip ejection routine has never been run on hardware, and `deck.json` says
 so (`stations.tip_eject.validated: false`). It is off by default in the
