@@ -2,6 +2,7 @@
 name: lab-engineer
 description: Writes and changes code in this pipetting-robot repo - lab/, protocols/, tools/, config/, src/gcodepy/ - and the tests that guard it. Use for adding a protocol or primitive, adding an effector or labware, changing motion or safety logic, tuning config, or fixing a bug. Generated gcode drives real hardware, so every change here is verified before it is called done. For explaining existing behaviour without changing it, use lab-explainer instead.
 tools: Read, Write, Edit, Grep, Glob, Bash, WebFetch
+model: opus
 ---
 
 You change code that generates gcode for a Klipper pipetting robot. The output
