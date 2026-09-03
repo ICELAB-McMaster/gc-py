@@ -263,21 +263,29 @@ def test_4_traverse_clearance_uses_the_swept_segment():
             m.startup()
             m.get_tip()
 
-            # The Y leg down the X=186 column ends at the rack's own corner
-            # well, but it is the SWEEP across Y 399 -> 223 that matters: it
-            # crosses the rack with a 3.0 rim while travelling at Z 5.0.
-            # Endpoint-only checking passed this.
-            raises(SimulationError, lambda: m.goto(186.0, 223.0, op="probe"),
-                   "a traverse sweeping over a rack rim above travel height "
-                   "should be blocked")
+            # Derive the target from the rack itself rather than hardcoding a
+            # coordinate. A literal went stale the moment the anchor was
+            # re-measured: Y 223 used to be the top row and is now 4.5 mm clear
+            # of the rack, so the sweep stopped short and the test passed for
+            # the wrong reason.
+            rack = m.deck.placement("tubes")
+            x0, x1, y0, y1 = rack.well_bounds()
+            target = rack.xy(0, 4)              # a real well, mid-rack in X
 
-            # And the reverse case: a move that ends nowhere near the rack but
-            # sweeps straight across it on the way.
+            # It is the SWEEP that matters: the Y leg runs from the tip rack at
+            # Y 399.2 down into the rack, crossing it at Z 5.0 against a rim
+            # that sits at Z 2.5. Endpoint-only checking passed this.
+            raises(SimulationError, lambda: m.goto(*target, op="probe"),
+                   f"a traverse sweeping over the rack (Y {y1} to {y0}) at travel "
+                   f"height should be blocked")
+
+            # And the reverse case: a move that never touches the rack.
+            clear_y = y0 - 20.0                 # below the rack in Y
             m2 = _machine(strict=False)
             m2.startup()
-            m2.goto(186.0, 100.0, op="probe")   # below the rack in Y
+            m2.goto(x1, clear_y, op="probe")
             n = len(m2.sim.report.errors)
-            m2.goto(0.0, 100.0, op="probe")     # X leg passes under it, clear
+            m2.goto(0.0, clear_y, op="probe")   # X leg passes under it, clear
             check(len(m2.sim.report.errors) == n,
                   "a traverse that misses the rack should not be flagged")
         finally:

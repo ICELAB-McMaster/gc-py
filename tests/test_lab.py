@@ -60,22 +60,26 @@ def test_tube_rack_layout():
           f"tube rack should be 5x10, got {p.labware.rows}x{p.labware.cols}")
     check(p.labware.grid["pitch_x"] == 12.0, "tube rack X pitch should be 12.0")
     check(p.labware.grid["pitch_y"] == 18.0, "tube rack Y pitch should be 18.0")
-    # X is in the CURRENT frame. The old scripts' X 186 predates the X travel
-    # limit growing by 70 mm; see deck.json coordinate_frame.
-    check(p.xy(0, 0) == (256.0, 223.0), f"A1 should be (256, 223), got {p.xy(0,0)}")
+    # A1 is the DIRECTLY MEASURED well centre (operator, 2026-08-27). It
+    # supersedes (256.0, 223.0), which was the old scripts' X 186 with the +70
+    # frame correction applied - a shifted estimate, never a measurement.
+    check(p.xy(0, 0) == (256.6, 218.5), f"A1 should be (256.6, 218.5), got {p.xy(0,0)}")
 
     # Column index advances toward LOWER X; row index toward LOWER Y.
-    expect_x = [256.0, 244.0, 232.0, 220.0, 208.0, 196.0, 184.0, 172.0, 160.0, 148.0]
-    expect_y = [223.0, 205.0, 187.0, 169.0, 151.0]
+    expect_x = [256.6, 244.6, 232.6, 220.6, 208.6, 196.6, 184.6, 172.6, 160.6, 148.6]
+    expect_y = [218.5, 200.5, 182.5, 164.5, 146.5]
     check(p.col_x_values() == expect_x, f"tube col X wrong: {p.col_x_values()}")
     check(p.row_y_values() == expect_y, f"tube row Y wrong: {p.row_y_values()}")
-    check(p.grid_center() == (202.0, 187.0),
-          f"tube grid centre should be (202, 187), got {p.grid_center()}")
+    check(p.grid_center() == (202.6, 182.5),
+          f"tube grid centre should be (202.6, 182.5), got {p.grid_center()}")
+    check(p.xy(3, 4) == (208.6, 164.5), "last accuracy tube should be (208.6, 164.5)")
 
-    # The pre-shift positions, +70, are what the old gcode visited.
-    check(p.xy(3, 4) == (208.0, 169.0), "last accuracy tube should be (208, 169)")
-    check(p.xy(0, 0)[0] - 70.0 == 186.0,
-          "the pre-shift anchor should still be recoverable as X 186")
+    # The measured anchor seats the rack better in slot 8 than the shifted
+    # estimate did: 4.8 mm from the slot centre against the estimate's 8.7.
+    cx, cy = p.grid_center()
+    sx, sy = d.slot_center(8)
+    off = ((cx - sx) ** 2 + (cy - sy) ** 2) ** 0.5
+    check(off < 5.0, f"tube grid centre should sit within 5 mm of slot 8, got {off:.2f}")
 
 
 def test_tiprack_corner_solve():
@@ -650,7 +654,8 @@ def test_full_protocol_and_manifest():
         text = gpath.read_text()
         check("ACTUATOR_MOVE POS=23.279" in text,
               "the 30 uL aspirate POS should appear in the gcode")
-        check("X256" in text and "Y223" in text, "tube A1 should appear in the gcode")
+        check("X256.6" in text and "Y218.5" in text,
+              "tube A1 should appear in the gcode")
 
         man = json.loads(Path(result["manifest"]).read_text())
         check(len(man["provenance"]["config_sha256"]) == 4,

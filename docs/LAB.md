@@ -112,7 +112,7 @@ applied. What moved:
 
 | | pre-shift | current |
 |---|---|---|
-| tube rack anchor (well A1) | X 186 | **X 256** |
+| tube rack anchor (well A1) | X 186 | **X 256** [1] |
 | water dip point | X 0 | **X 70** |
 | park | X 350 | **X 420** (= X home) |
 
@@ -125,6 +125,11 @@ than as a guess:
   always meant "go home in X"
 * unshifted, the tube rack (X 78-186) straddles the slot 8/9 cell seam and is
   seated in neither. Shifted (X 148-256) it fits entirely inside slot 8.
+
+[1] The tube anchor has since been **measured directly** as (256.6, 218.5) and
+that is what `layout.json` carries. The extra (+0.6, -4.5) is measurement
+correcting an estimate; the frame shift is still exactly 70. The measured anchor
+seats the rack 4.8 mm from slot 8's centre, against the estimate's 8.7 mm.
 
 Not affected: every Y coordinate, every Z height, and the tip rack corners -
 those were measured after the change. `Deck.slot_seating_report()` is the check
