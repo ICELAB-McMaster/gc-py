@@ -183,7 +183,7 @@
     "x_shift_applied": 70.0,
     "description": "The X travel limit was increased by 70 mm. The machine homes at max X, so the same physical endstop is now called 420 where it used to be 350, and every physical point gained 70 in X. Coordinates written before that change are 70 mm too low in the current frame and have been corrected here.",
     "evidence": [
-      "tube rack grid centre 132 + 70 = 202 vs slot 8 at 200 (2.0 mm)",
+      "tube rack grid centre 132 + 70 = 202 vs slot 8 at 200 (2.0 mm) - the estimate that established the shift; direct measurement later put the grid centre at 202.6, 4.8 mm from the slot centre, which is a better seating and corroborates the shift rather than revising it",
       "water dip point 0 + 70 = 70 vs slot 9 at 65 (5.0 mm)",
       "park 350 + 70 = 420 = X home exactly; park at X350 in a 0-350 machine WAS 'go to X home', which only makes sense if 350 was the old maximum",
       "the tube rack unshifted (X 78-186) straddles the slot 8/9 cell seam at 132.25 and is seated in neither; shifted (X 148-256) it fits entirely inside slot 8, which is where the operator says it is",
@@ -192,7 +192,7 @@
     "corrected": [
       "deck.stations.water.xy X 0 -> 70",
       "deck.stations.park.xy X 350 -> 420",
-      "layout tubes anchor_xy X 186 -> 256"
+      "layout tubes anchor_xy X 186 -> 256 (later superseded by direct measurement, see superseded_by_measurement)"
     ],
     "unaffected": [
       "all Y coordinates - only the X limit changed",
@@ -201,6 +201,7 @@
       "the tip ejector lane X 155 - operator states this as current"
     ],
     "why_it_went_unnoticed": "The tube column pitch is 12.0 mm and the frame error was 70.0 mm = 6 columns minus 2.0 mm. A shifted well therefore lands 2.0 mm from a REAL well centre, well inside a ~8 mm tube. Running pre-shift gcode today would have dispensed into actual tubes six columns from the intended ones - no crash, no visible sign, and since row = volume and column = replicate, every volume would have landed in the wrong replicate set while the balance readings still looked plausible. Verify frames with tools/check_alignment.py, not by eye.",
-    "verification": "tools/check_alignment.py --shift 70 on the three committed pre-shift gcode files resolves every working position onto the current deck. The single exception is the old tip station (218, 309) -> (288, 309), which is slot 4 where the PREVIOUS tip rack sat and where nothing is loaded now."
+    "verification": "tools/check_alignment.py --shift 70 on the three committed pre-shift gcode files resolves every working position onto the current deck. The single exception is the old tip station (218, 309) -> (288, 309), which is slot 4 where the PREVIOUS tip rack sat and where nothing is loaded now.",
+    "superseded_by_measurement": "The tube rack anchor is no longer a shifted old value. The operator measured the centre of well A1 directly on 2026-08-27 as (256.6, 218.5), so layout.json now carries that. Relative to the old script constant (186, 223) the total delta is (+70.6, -4.5), but the FRAME SHIFT IS STILL EXACTLY 70 - the extra (+0.6, -4.5) is measurement correcting an estimate, not a different frame. Do not infer a 70.6 mm shift from the anchor."
   }
 }

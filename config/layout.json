@@ -8,14 +8,14 @@
       "name": "tubes",
       "labware": "tube_rack_0p65_5x10",
       "mount": "slot",
-      "mount_note": "Seated in slot 8, as the operator states. Grid spans X 148-256, Y 151-223, entirely inside slot 8's cell [132.25, 267.75] x [131.75, 225.25]. Grid centre (202, 187) is 8.7 mm from the slot centre. anchor_xy still supplies the origin; the slot is what the seating check validates it against.",
+      "mount_note": "Seated in slot 8, as the operator states. Grid spans X 148.6-256.6, Y 146.5-218.5, entirely inside slot 8's cell [132.25, 267.75] x [131.875, 225.25]. Grid centre (202.6, 182.5) is 4.8 mm from the slot centre (200, 178.5) - the measured anchor seats the rack better than the shifted estimate did, which was 8.7 mm out. anchor_xy supplies the origin; the slot is what the seating check validates it against.",
       "anchor_xy": [
-        256.0,
-        223.0
+        256.6,
+        218.5
       ],
-      "anchor_note": "machine coords of well (row 0, col 0), current frame. The old scripts had X 186, written before the X limit grew by 70; +70 applied. Column index advances toward -X at 12.0 mm, row index toward -Y at 18.0 mm.",
+      "anchor_note": "Machine coords of the CENTRE of well (row 0, col 0), measured directly by the operator 2026-08-27. This supersedes the previous (256.0, 223.0), which was the old scripts' X 186, Y 223 with the +70 frame correction applied - a shifted estimate, never a measurement. The residual (+0.6, -4.5) is the difference between that estimate and the real well centre; it is NOT part of the frame shift, which remains exactly 70 in X. Column index advances toward -X at 12.0 mm, row index toward -Y at 18.0 mm.",
       "rotation": 0,
-      "extent_note": "cols 0..9 -> X 256,244,232,220,208,196,184,172,160,148 ; rows 0..4 -> Y 223,205,187,169,151",
+      "extent_note": "cols 0..9 -> X 256.6,244.6,232.6,220.6,208.6,196.6,184.6,172.6,160.6,148.6 ; rows 0..4 -> Y 218.5,200.5,182.5,164.5,146.5",
       "slot": 8,
       "slot_center": [
         200.0,
