@@ -542,51 +542,58 @@ def test_every_dispense_approach_is_y_first():
 
 
 def test_1p5_holder_anchors_from_the_location_edges():
-    """13 mm down from the top, 14 mm in from the high-X edge."""
-    import json, os, shutil
-    from lab import config as cfgmod
+    """A1 resolves from the location edges to the MEASURED (252.50, 305.50).
 
-    d = Path(tempfile.mkdtemp())
-    for n in ("deck.json", "labware.json", "layout.json"):
-        shutil.copy(cfgmod.config_path(n), d / n)
-    shutil.copytree(cfgmod.config_path("effectors"), d / "effectors")
-    lay = json.loads((d / "layout.json").read_text())
-    lay["placements"].append({"name": "big_tubes", "labware": "tube_rack_1p5",
-                              "mount": "slot", "slot": 5,
-                              "slot_center": [200.0, 272.0], "rotation": 0})
-    (d / "layout.json").write_text(json.dumps(lay))
+    Tests the shipped layout rather than an injected copy: the holder is really
+    in slot 5 now, so the real config is what should be asserted.
+    """
+    d = Deck.load()
+    p = d.placement("big_tubes")
+    cx, cy = d.slot_center(5)
+    px, py = d.slot_pitch()
 
-    old = os.environ.get("LAB_CONFIG")
-    os.environ["LAB_CONFIG"] = str(d)
-    try:
-        deck = Deck.load()
-        p = deck.placement("big_tubes")
-        cx, cy = deck.slot_center(5)
-        px, py = deck.slot_pitch()
-        check(p.xy(0, 0) == (cx + px / 2 - 14.0, round(cy + py / 2 - 13.0, 4)),
-              f"A1 should be 14 in from the high-X edge and 13 below the top, "
-              f"got {p.xy(0, 0)}")
-        check(p.labware.rows == 3 and p.labware.cols == 7,
-              f"3x7 should fit, got {p.labware.rows}x{p.labware.cols}")
-        check(abs(p.col_x_values()[0] - p.col_x_values()[1]) == 20.0,
-              "columns should be 20 mm apart")
-        check(abs(p.row_y_values()[0] - p.row_y_values()[1]) == 30.0,
-              "rows should be 30 mm apart")
-        x0, x1, y0, y1 = p.well_bounds()
-        check(x0 >= cx - px / 2 and x1 <= cx + px / 2
-              and y0 >= cy - py / 2 and y1 <= cy + py / 2,
-              f"the grid should fit inside its location, got X[{x0}, {x1}] "
-              f"Y[{y0}, {y1}]")
-        check(p.labware.height_mm == 45.0, "the 1.5 mL holder is 45 mm tall")
-        check(p.labware.approach_order == "YX",
-              "the 1.5 mL holder should also ask for YX")
-        check(not deck.slot_seating_report(),
-              f"seating should be clean: {deck.slot_seating_report()}")
-    finally:
-        if old is None:
-            os.environ.pop("LAB_CONFIG", None)
-        else:
-            os.environ["LAB_CONFIG"] = old
+    check(p.slot == 5, f"the 1.5 mL holder should be in slot 5, got {p.slot}")
+    check(p.xy(0, 0) == (252.5, 305.5),
+          f"A1 should be the measured (252.5, 305.5), got {p.xy(0, 0)}")
+
+    # The insets were calibrated FROM that measurement, so they must reproduce
+    # it against slot 5's cell rather than the other way round.
+    edge = p.labware.spec["a1_from_slot_edge"]
+    check(edge["x_inset"] == 15.25 and edge["y_inset"] == 13.125,
+          f"insets should be the calibrated 15.25 / 13.125, got "
+          f"{edge['x_inset']} / {edge['y_inset']}")
+    check(p.xy(0, 0) == (round(cx + px / 2 - edge["x_inset"], 4),
+                         round(cy + py / 2 - edge["y_inset"], 4)),
+          "A1 should equal the cell edges minus the stored insets")
+
+    check(p.labware.rows == 3 and p.labware.cols == 6,
+          f"should be 3x6, got {p.labware.rows}x{p.labware.cols}")
+    check(abs(p.col_x_values()[0] - p.col_x_values()[1]) == 20.0,
+          "columns should be 20 mm apart")
+    check(abs(p.row_y_values()[0] - p.row_y_values()[1]) == 30.0,
+          "rows should be 30 mm apart")
+
+    # Well CENTRES inside the location.
+    x0, x1, y0, y1 = p.well_bounds()
+    check(x0 >= cx - px / 2 and x1 <= cx + px / 2
+          and y0 >= cy - py / 2 and y1 <= cy + py / 2,
+          f"the grid should fit inside its location, got X[{x0}, {x1}] "
+          f"Y[{y0}, {y1}]")
+
+    # And the TUBES too, which is what ruled out a 7th column: it would sit
+    # 0.25 mm inside the low-X edge, so an 11 mm tube would overhang slot 6
+    # by 5.25 mm.
+    tube_d = 11.0
+    overhang = [(c, x) for c, x in enumerate(p.col_x_values())
+                if x - tube_d / 2 < cx - px / 2]
+    check(not overhang,
+          f"no column's tube may overhang the location; these do: {overhang}")
+
+    check(p.labware.height_mm == 45.0, "the 1.5 mL holder is 45 mm tall")
+    check(p.labware.approach_order == "YX",
+          "the 1.5 mL holder should also ask for YX")
+    check(not d.slot_seating_report(),
+          f"seating should be clean: {d.slot_seating_report()}")
 
 
 def test_ejection_variant_is_functionally_identical():
