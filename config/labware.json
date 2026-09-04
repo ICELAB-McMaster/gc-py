@@ -156,8 +156,8 @@
       "grid": {
         "model": "pitch",
         "rows": 3,
-        "cols": 7,
-        "rows_cols_note": "DERIVED, not stated: the operator gave the A1 inset and the pitches but not the counts. 3 rows and 7 columns are what fit inside a 135.5 x 93.25 mm location from A1 at (+53.75, +33.625) off the centre. Column X offsets 53.75, 33.75, 13.75, -6.25, -26.25, -46.25, -66.25; row Y offsets 33.625, 3.625, -26.375. CONFIRM the real counts.",
+        "cols": 6,
+        "rows_cols_note": "INFERRED, not stated - CONFIRM. The operator gave the A1 position and the pitches but not the counts. From the calibrated A1 at (252.50, 305.50) in slot 5: a 7th column would sit at X 132.50, which is 0.25 mm inside the location's low-X edge (132.25), so an ~11 mm tube there would overhang into slot 6 by 5.25 mm. 6 columns leaves the last one 20.25 mm inside the edge, which is physically sensible. 3 rows fit with 20.12 mm to spare at the bottom. 6 is chosen as the FAIL-SAFE: if the holder really has 7, asking for column 6 raises a clear IndexError, whereas the reverse mistake would drive a tip into empty space over the slot boundary. Column X: 252.5, 232.5, 212.5, 192.5, 172.5, 152.5. Row Y: 305.5, 275.5, 245.5.",
         "pitch_x": 20.0,
         "pitch_y": 30.0,
         "col_dir": [
@@ -173,10 +173,11 @@
       },
       "a1_from_slot_edge": {
         "x_edge": "high",
-        "x_inset": 14.0,
+        "x_inset": 15.25,
         "y_edge": "high",
-        "y_inset": 13.0,
-        "note": "Operator: the first slot is 13 mm down from the top of the location and 14 mm in from the very left. 'Down from the top' is unambiguous: toward lower Y. 'The very left' is ASSUMED to be the HIGH-X edge, because column index runs toward lower X on this deck, so A1 sits at the high-X end of its row. If left is actually the low-X edge, set x_edge to \"low\" and the whole grid mirrors. CONFIRM."
+        "y_inset": 13.125,
+        "note": "CALIBRATED from a direct measurement, not from the verbal description. The operator measured A1 of this holder in slot 5 as (252.50, 305.50) on 2026-08-27; against slot 5's cell (centre 200, 272 expanded by half the slot pitch 135.5 x 93.25) that is 15.25 mm in from the high-X edge and 13.125 mm down from the top edge. The original description was '13 mm down from the top and 14 mm in from the very left', which predicted (253.75, 305.625) - right to 0.125 mm in Y and 1.25 mm out in X. That measurement also CONFIRMS 'the very left' means the HIGH-X edge: the low-X reading would have put A1 at X 146.25, 106 mm away.",
+        "caveat": "These insets were calibrated in SLOT 5. The slot X pitch is irregular (136 between slots 1-2 and 135 between 2-3, mean 135.5), so a cell derived from the mean pitch is up to 0.5 mm out in other slots. Re-measure A1 if this holder is moved rather than trusting the model to transfer exactly."
       },
       "height_mm": 45.0,
       "height_note": "Empty holder, above the stage. Leaves 12.5 mm of headroom for tubes and caps before travel height (Z 5 with a 300 uL tip) stops clearing it.",
@@ -194,7 +195,6 @@
       "uncalibrated": [
         "grid.rows",
         "grid.cols",
-        "a1_from_slot_edge.x_edge",
         "height_with_contents_mm",
         "z.work"
       ]

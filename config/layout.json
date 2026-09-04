@@ -70,6 +70,18 @@
       "rotation": 0,
       "near_slot": 9,
       "near_slot_note": "Sits in slot 9 (65, 178.5). Kept as a station rather than slot-mounted because the stored coordinate is a DIP POINT, not the trough's centre: (70, 175) is 5.0 mm in X and 3.5 mm in Y from the slot centre."
+    },
+    {
+      "name": "big_tubes",
+      "labware": "tube_rack_1p5",
+      "mount": "slot",
+      "slot": 5,
+      "slot_center": [
+        200.0,
+        272.0
+      ],
+      "rotation": 0,
+      "anchor_note": "A1 is NOT stored here. It resolves from the labware's a1_from_slot_edge insets against slot 5's cell, which gives the measured (252.50, 305.50). Keeping the model rather than pinning anchor_xy means moving this holder to another slot is a one-line change - but see the caveat on those insets about the irregular slot pitch."
     }
   ],
   "open_questions": [
