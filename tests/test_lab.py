@@ -676,11 +676,39 @@ class _WithConfig:
         return False
 
 
-def test_plates_resolve_in_slots_1_and_2():
-    """A1 comes from the slot centre and the grid span, not a stored anchor."""
+def test_plate_column_direction_runs_toward_low_x():
+    """A1 is at the HIGH-X end. Getting this backwards moves every well 99 mm.
+
+    col_dir was [1, 0] until 2026-09-08, which put A1 at the low-X end and so
+    placed the whole grid one full column span from where it actually is. The
+    operator's measurement of plate1's A1 (387, 399) against the predicted
+    (286.5, 396.5) is what exposed it - a 100.5 mm error, of which 99 mm is
+    exactly the 11 x 9 mm span.
+    """
     d = Deck.load()
-    for name, slot, a1 in (("plate1", 1, (286.5, 396.5)),
-                           ("plate2", 2, (150.5, 396.5))):
+    p = d.placement("plate1")
+    check(p.col_vec[0] < 0,
+          f"increasing column index must move toward LOWER X, got "
+          f"col_vec {p.col_vec}")
+    check(p.row_vec[1] < 0,
+          f"increasing row index must move toward LOWER Y, got "
+          f"row_vec {p.row_vec}")
+    xs = p.col_x_values()
+    check(xs[0] > xs[-1], f"A1's column must be the highest X, got {xs}")
+    check(abs((xs[0] - xs[-1]) - 99.0) < 1e-9,
+          f"the column span should be 11 x 9 = 99 mm, got {xs[0] - xs[-1]}")
+
+    # The tiprack deliberately runs the other way, from its own corner solve.
+    check(d.placement("tips").col_vec[0] > 0,
+          "the tiprack's column sense is measured and runs toward HIGHER X; "
+          "the two conventions must not be unified")
+
+
+def test_plates_resolve_in_slots_1_and_2():
+    """plate1's A1 is measured; plate2's is inferred from the same offset."""
+    d = Deck.load()
+    for name, slot, a1 in (("plate1", 1, (387.0, 399.0)),
+                           ("plate2", 2, (251.0, 399.0))):
         p = d.placement(name)
         check(p.slot == slot, f"{name} should be in slot {slot}, got {p.slot}")
         check(p.xy(0, 0) == a1, f"{name} A1 should be {a1}, got {p.xy(0, 0)}")
@@ -692,13 +720,27 @@ def test_plates_resolve_in_slots_1_and_2():
         check(x0 >= cx - px / 2 and x1 <= cx + px / 2
               and y0 >= cy - py / 2 and y1 <= cy + py / 2,
               f"{name} should fit its cell, got X[{x0}, {x1}] Y[{y0}, {y1}]")
-    # The two wells centrifuge_test uses must clear the ejector band.
+
+    # The stored offset must reproduce the MEASUREMENT it was derived from,
+    # not the other way round.
+    off = d.catalogue["sbs_96_wellplate"].spec["a1_from_center"]
+    cx, cy = d.slot_center(1)
+    check((cx + off[0], cy + off[1]) == (387.0, 399.0),
+          f"a1_from_center {off} against slot 1 must give the measured "
+          f"(387, 399), got {(cx + off[0], cy + off[1])}")
+
+    # The two wells centrifuge_test uses must clear the ejector band. Note the
+    # band now covers plate2's HIGH column indices, not the low ones.
     band = next(k for k in d.keepouts if k.id == "tip_ejector")
     for name in ("plate1", "plate2"):
         for well in ((3, 5), (4, 6)):
             x = d.placement(name).xy(*well)[0]
             check(not band.contains_x(x),
                   f"{name} well {well} at X {x} is inside the keep-out band")
+    inband = [c for c in range(12)
+              if band.contains_x(d.placement("plate2").xy(0, c)[0])]
+    check(inband == [10, 11],
+          f"plate2's banded columns should be [10, 11], got {inband}")
 
 
 def test_a_null_commanded_depth_refuses_rather_than_guessing():
