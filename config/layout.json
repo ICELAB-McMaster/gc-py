@@ -75,7 +75,7 @@
         365.0
       ],
       "rotation": 0,
-      "anchor_note": "A1 is NOT stored. sbs_96_wellplate declares grid_centered_on_footprint, so lab/labware.py derives A1 from the slot centre and the grid span: A1 = centre + (-49.5, +31.5) for a 12x8 grid on 9.0 mm pitch. That puts A1 at (286.5, 396.5) in slot 1 and (150.5, 396.5) in slot 2, and both grids sit entirely inside their location cells."
+      "anchor_note": "A1 comes from the labware's a1_from_center offset (+51, +34) against slot 1's centre (336, 365), giving (387, 399) - exactly the value the operator measured on 2026-09-08. That measurement is what the offset was derived from."
     },
     {
       "name": "plate2",
@@ -87,14 +87,15 @@
         365.0
       ],
       "rotation": 0,
-      "anchor_note": "A1 is NOT stored. sbs_96_wellplate declares grid_centered_on_footprint, so lab/labware.py derives A1 from the slot centre and the grid span: A1 = centre + (-49.5, +31.5) for a 12x8 grid on 9.0 mm pitch. That puts A1 at (286.5, 396.5) in slot 1 and (150.5, 396.5) in slot 2, and both grids sit entirely inside their location cells.",
-      "keepout_note": "Columns 0 and 1 of this plate (X 150.5 and 159.5) fall inside the tip-ejector keep-out band X[148, 162]. They are not used by protocols/centrifuge_test.py, which targets columns 5 and 6 (X 195.5 and 204.5). Any protocol that does use them must have its routing checked - Machine._route_xy will refuse a tipped Y move there rather than risk the mechanism."
+      "anchor_note": "A1 is INFERRED, not measured: the same a1_from_center offset (+51, +34) against slot 2's centre (200, 365) gives (251, 399). The offset was measured on plate1 in slot 1 and is assumed to be a property of how this plate seats in a location rather than of the location itself. Verify by jogging to (251, 399) before trusting it.",
+      "keepout_note": "Columns 10 and 11 of this plate (X 161 and 152) fall inside the tip-ejector keep-out band X[148, 162]. NOTE these are the HIGH column indices, not the low ones - the column sense runs toward lower X. protocols/centrifuge_test.py targets columns 5 and 6 (X 206 and 197), which are clear. Any protocol using columns 10-11 needs its routing checked."
     }
   ],
   "open_questions": [
     "Which tiprack corner is A1 - the three measured corners fix the grid but not the labelling.",
     "Which X edge of the tiprack is the post-pickup exit (toward X 18 or X 118).",
     "Do any of the loaded racks or plates stand HIGHER than the raised location edges? The edge limit (Z 53 with a 300 uL tip) is the binding traverse constraint, but sbs_96_wellplate has no height_mm so it cannot be checked.",
-    "The BOTTOM Z in the 1.5 mL tube is still unmeasured, so the well-floor crash check there only warns. The plate's floor (60.8) and both dispense depths are measured."
+    "The BOTTOM Z in the 1.5 mL tube is still unmeasured, so the well-floor crash check there only warns. Both dispense depths and the plate floor are measured.",
+    "plate2's A1 is INFERRED at (251, 399) from the offset measured on plate1. Jog to it and confirm before running anything that matters."
   ]
 }

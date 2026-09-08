@@ -100,13 +100,14 @@
         "pitch_x": 9.0,
         "pitch_y": 9.0,
         "col_dir": [
-          1,
+          -1,
           0
         ],
         "row_dir": [
           0,
           -1
-        ]
+        ],
+        "direction_note": "Increasing COLUMN index moves toward LOWER X; increasing ROW index toward LOWER Y. So A1 sits at the HIGH-X, HIGH-Y corner. This is the same sense as both tube holders, and the OPPOSITE of tiprack_300_96, whose direction comes from its own three-corner solve - do not carry one convention across the whole deck. Corrected 2026-09-08: col_dir was [1, 0], which put A1 at the low-X end and so placed every well one full 99 mm column span away from where it actually is."
       },
       "footprint": [
         127.76,
@@ -126,7 +127,13 @@
       "height_mm": null,
       "height_note": "UNMEASURED. Physical height of the plate above the stage. Without it Simulator.labware_top_z cannot convert to a commanded Z, so traverse clearance over the plates reports 'cannot check' rather than passing. Anything taller than 57.5 mm is struck at travel height with a 300 uL tip.",
       "height_with_contents_mm": null,
-      "approach_order_note": "Deliberately unset, so the default X-first applies. A plate has no caps, so the Y-first rule the tube holders need does not apply here."
+      "approach_order_note": "Deliberately unset, so the default X-first applies. A plate has no caps, so the Y-first rule the tube holders need does not apply here.",
+      "a1_from_center": [
+        51.0,
+        34.0
+      ],
+      "a1_from_center_note": "Offset of well A1 from the slot centre, DERIVED from a direct measurement: the operator measured plate1's A1 in slot 1 as (387, 399) on 2026-09-08, and slot 1's centre is (336, 365). This overrides the grid_centered_on_footprint derivation, which gave (+49.5, +31.5) - so the plate sits (+1.5, +2.5) off a perfectly centred grid, presumably how it seats against the location's retaining features. Applied to EVERY placement of this labware, since that fit should not depend on which location it is in. Only plate1 is measured; plate2 is inferred and worth verifying.",
+      "grid_centered_on_footprint_note": "Left true for reference - the SBS grid genuinely is centred on the 127.76 x 85.48 mm footprint - but a1_from_center now takes precedence, because the plate is not perfectly centred in its location."
     },
     "reservoir_water": {
       "display_name": "Open water reservoir",
