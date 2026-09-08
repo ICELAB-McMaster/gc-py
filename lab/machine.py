@@ -285,10 +285,13 @@ class Machine:
 
     def goto_well(self, placement: str, row: int, col: int,
                   op: str = "goto") -> Tuple[float, float]:
-        p = self.deck.placement(placement)
-        x, y = p.xy(row, col)
-        self.goto(x, y, op=op)
-        return (x, y)
+        """Alias for goto_placement.
+
+        It used to be a near-duplicate that omitted the labware's
+        approach_order, so it silently ignored the Y-first rule both tube
+        holders need. Two ways to reach a well is one too many.
+        """
+        return self.goto_placement(placement, row, col, op=op)
 
     # ---- actuator --------------------------------------------------------
 
@@ -627,12 +630,8 @@ class Machine:
             f"library cannot know what is there"
         )
 
-    def aspirate_uL(self, volume_uL: float, station: str = "water") -> float:
-        """One independent aspiration. Volume in microlitres, always.
-
-        Arms the air gap in air, descends, draws, withdraws, then backs off in
-        air to pull the drop up. Returns the plunger POS used.
-        """
+    def _require_empty_tip(self, what: str) -> "Pipette":
+        """Shared preconditions for anything that draws liquid."""
         eff = self._pipette()
         if eff.needs_tip and not self.tip_fitted:
             raise ProtocolError(
@@ -640,9 +639,24 @@ class Machine:
             )
         if self.fluid_uL > 1e-9:
             raise ProtocolError(
-                f"already holding {self.fluid_uL} uL. Every tube gets its own "
-                f"independent aspiration; dispense before aspirating again."
+                f"{what} while already holding {self.fluid_uL} uL. Every "
+                f"destination gets its own independent aspiration; dispense "
+                f"before drawing again."
             )
+        return eff
+
+    def _aspirate_at(self, x: float, y: float, labware_id: str, volume_uL: float,
+                     op: str = "aspirate", prefer: Optional[str] = None,
+                     z_key: str = "work") -> float:
+        """The aspiration sequence itself, shared by every public form.
+
+        Every ordering guarantee lives here, which is why the station and well
+        forms delegate rather than each repeating it: the air gap is armed in
+        air BEFORE descending, the whole stroke is validated before a single
+        line is emitted, and the anti-drip backoff happens only after the tip
+        is clear of the liquid.
+        """
+        eff = self._pipette()
 
         # Validate the WHOLE stroke, including the backoff, before a single
         # line is emitted. Discovering at the backoff that the plunger has run
@@ -651,20 +665,20 @@ class Machine:
         d = eff.displacement_mm(volume_uL)      # raises if outside the window
         asp = eff.aspirate_pos(volume_uL)
         backoff = eff.backoff_pos(volume_uL)
-        lid = self._station_labware(station)
+        z = eff.z_for(labware_id, z_key)        # raises if never measured
         f = self.deck.feedrate("travel")
 
         self._last_aspirate = None              # never let a stale one survive
-        self.goto_station(station, op="aspirate")
+        self.goto(x, y, op=op, prefer=prefer)
         self.wait()
-        self.actuator(eff.gap_pos, settle=eff.settle_s, op="aspirate")  # gap armed in air
-        self._move_z(eff.z_for(lid, "work"), f, "aspirate", labware=lid)
+        self.actuator(eff.gap_pos, settle=eff.settle_s, op=op)  # gap armed in air
+        self._move_z(z, f, op, labware=labware_id)
         self.wait()
-        self.actuator(asp, settle=eff.settle_s, op="aspirate")          # draw, settle
+        self.actuator(asp, settle=eff.settle_s, op=op)          # draw, settle
         self.fluid_uL = volume_uL
-        self._move_z(self.deck.z_travel, f, "aspirate", labware=lid)
+        self._move_z(self.deck.z_travel, f, op, labware=labware_id)
         if eff.post_asp_backoff:
-            self.actuator(backoff, op="aspirate")                       # anti-drip
+            self.actuator(backoff, op=op)                       # anti-drip
         self.wait()
 
         self._last_aspirate = {
@@ -672,8 +686,73 @@ class Machine:
             "displacement_mm": d,
             "aspirate_pos": asp,
             "backoff_pos": backoff,
+            "source": labware_id,
         }
         return asp
+
+    def aspirate_uL(self, volume_uL: float, station: str = "water") -> float:
+        """One independent aspiration from a STATION. Microlitres, always.
+
+        Arms the air gap in air, descends, draws, withdraws, then backs off in
+        air to pull the drop up. Returns the plunger POS used.
+        """
+        self._require_empty_tip("aspirate_uL()")
+        lid = self._station_labware(station)
+        st = self.deck.station(station)
+        return self._aspirate_at(st.xy[0], st.xy[1], lid, volume_uL, op="aspirate")
+
+    def aspirate_from(self, placement: str, row: int, col: int,
+                      volume_uL: float) -> float:
+        """One independent aspiration from a WELL. Microlitres, always.
+
+        The station form cannot do this: it reverse-maps a station name to
+        labware, and a slot-mounted rack has no station. Returns the plunger
+        POS used.
+        """
+        self._require_empty_tip("aspirate_from()")
+        p = self.deck.placement(placement)
+        x, y = p.xy(row, col)                   # raises if out of range
+        return self._aspirate_at(x, y, p.labware.id, volume_uL, op="aspirate",
+                                 prefer=p.labware.approach_order)
+
+    def mix(self, placement: str, row: int, col: int, cycles: int,
+            volume_uL: float, z_key: str = "bottom") -> None:
+        """Homogenise a well by cycling the plunger at its BOTTOM.
+
+        Descends deeper than a dispense would - `z_key` defaults to "bottom" -
+        so the stroke actually turns the contents over instead of stirring the
+        surface. Starts and ends bottomed, so the tip holds no liquid between
+        cycles and never carries any away.
+        """
+        eff = self._require_empty_tip("mix()")
+        if cycles < 1:
+            raise ProtocolError(f"mix needs at least 1 cycle, got {cycles}")
+
+        # Validate the stroke before emitting. The plunger draws UP from
+        # blowout, so the top of the stroke is the position to check.
+        d = eff.displacement_mm(volume_uL)      # raises if outside the window
+        top = round(eff.blowout_pos - d, eff.decimals)
+        eff.check_pos(top, what=f"mixing {volume_uL} uL")
+
+        p = self.deck.placement(placement)
+        lid = p.labware.id
+        x, y = p.xy(row, col)
+        z = eff.z_for(lid, z_key)               # raises if never measured
+        f = self.deck.feedrate("travel")
+
+        self.goto(x, y, op="mix", prefer=p.labware.approach_order)
+        self.wait()
+        self.actuator(eff.blowout_pos, settle=0.5, op="mix")  # bottomed, in air
+        self._move_z(z, f, "mix", labware=lid)
+        self.wait()
+        for _ in range(cycles):
+            self.actuator(top, settle=eff.settle_s, op="mix")            # draw up
+            self.actuator(eff.blowout_pos, settle=eff.settle_s, op="mix")  # push back
+        self._move_z(self.deck.z_travel, f, "mix", labware=lid)
+        self.wait()
+
+        self.toggles["mix_cycles"] = cycles
+        self.toggles["mix_volume_uL"] = volume_uL
 
     def dispense(self, placement: str, row: int, col: int,
                  wall_wipe: Optional[bool] = None) -> Dict[str, Any]:
