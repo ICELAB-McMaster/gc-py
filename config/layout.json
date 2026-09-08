@@ -1,27 +1,9 @@
 {
   "schema_version": 1,
-  "id": "accuracy_bench_2026_08",
-  "description": "What is physically loaded on the deck right now. This is the per-run file - edit it, do not edit deck.json or labware.json.",
+  "id": "centrifuge_bench_2026_09",
+  "description": "What is physically loaded on the deck right now. This is the per-run file - edit it, do not edit deck.json or labware.json. Currently set up for protocols/centrifuge_test.py: 1.5 mL bracket in slot 5, tips in slot 3, a 96-well plate in each of slots 1 and 2, water at slot 9. The 0.65 mL holder that protocols/accuracy_test.py uses is OFF the deck, so that protocol will refuse until it is put back and re-added here.",
   "deck": "sdl_klipper_deck",
   "placements": [
-    {
-      "name": "tubes",
-      "labware": "tube_rack_0p65_5x10",
-      "mount": "slot",
-      "mount_note": "Seated in slot 8, as the operator states. Grid spans X 148.6-256.6, Y 146.5-218.5, entirely inside slot 8's cell [132.25, 267.75] x [131.875, 225.25]. Grid centre (202.6, 182.5) is 4.8 mm from the slot centre (200, 178.5) - the measured anchor seats the rack better than the shifted estimate did, which was 8.7 mm out. anchor_xy supplies the origin; the slot is what the seating check validates it against.",
-      "anchor_xy": [
-        256.6,
-        218.5
-      ],
-      "anchor_note": "Machine coords of the CENTRE of well (row 0, col 0), measured directly by the operator 2026-08-27. This supersedes the previous (256.0, 223.0), which was the old scripts' X 186, Y 223 with the +70 frame correction applied - a shifted estimate, never a measurement. The residual (+0.6, -4.5) is the difference between that estimate and the real well centre; it is NOT part of the frame shift, which remains exactly 70 in X. Column index advances toward -X at 12.0 mm, row index toward -Y at 18.0 mm.",
-      "rotation": 0,
-      "extent_note": "cols 0..9 -> X 256.6,244.6,232.6,220.6,208.6,196.6,184.6,172.6,160.6,148.6 ; rows 0..4 -> Y 218.5,200.5,182.5,164.5,146.5",
-      "slot": 8,
-      "slot_center": [
-        200.0,
-        178.5
-      ]
-    },
     {
       "name": "tips",
       "labware": "tiprack_300_96",
@@ -82,11 +64,37 @@
       ],
       "rotation": 0,
       "anchor_note": "A1 is NOT stored here. It resolves from the labware's a1_from_slot_edge insets against slot 5's cell, which gives the measured (252.50, 305.50). Keeping the model rather than pinning anchor_xy means moving this holder to another slot is a one-line change - but see the caveat on those insets about the irregular slot pitch."
+    },
+    {
+      "name": "plate1",
+      "labware": "sbs_96_wellplate",
+      "mount": "slot",
+      "slot": 1,
+      "slot_center": [
+        336.0,
+        365.0
+      ],
+      "rotation": 0,
+      "anchor_note": "A1 is NOT stored. sbs_96_wellplate declares grid_centered_on_footprint, so lab/labware.py derives A1 from the slot centre and the grid span: A1 = centre + (-49.5, +31.5) for a 12x8 grid on 9.0 mm pitch. That puts A1 at (286.5, 396.5) in slot 1 and (150.5, 396.5) in slot 2, and both grids sit entirely inside their location cells."
+    },
+    {
+      "name": "plate2",
+      "labware": "sbs_96_wellplate",
+      "mount": "slot",
+      "slot": 2,
+      "slot_center": [
+        200.0,
+        365.0
+      ],
+      "rotation": 0,
+      "anchor_note": "A1 is NOT stored. sbs_96_wellplate declares grid_centered_on_footprint, so lab/labware.py derives A1 from the slot centre and the grid span: A1 = centre + (-49.5, +31.5) for a 12x8 grid on 9.0 mm pitch. That puts A1 at (286.5, 396.5) in slot 1 and (150.5, 396.5) in slot 2, and both grids sit entirely inside their location cells.",
+      "keepout_note": "Columns 0 and 1 of this plate (X 150.5 and 159.5) fall inside the tip-ejector keep-out band X[148, 162]. They are not used by protocols/centrifuge_test.py, which targets columns 5 and 6 (X 195.5 and 204.5). Any protocol that does use them must have its routing checked - Machine._route_xy will refuse a tipped Y move there rather than risk the mechanism."
     }
   ],
   "open_questions": [
     "Which tiprack corner is A1 - the three measured corners fix the grid but not the labelling.",
     "Which X edge of the tiprack is the post-pickup exit (toward X 18 or X 118).",
-    "Do any of the loaded racks stand HIGHER than the raised location edges? The edge limit (Z 53 with a 300 uL tip) is currently the binding traverse constraint, but no labware z.top has been measured, so a rack taller than the edges would not be caught."
+    "Dispense Z for sbs_96_wellplate and for tube_rack_1p5, plus the BOTTOM Z in the 1.5 mL tube that protocols/centrifuge_test.py mixes at. All three are null in config/effectors/p300.json, so that protocol refuses to generate.",
+    "Do any of the loaded racks or plates stand HIGHER than the raised location edges? The edge limit (Z 53 with a 300 uL tip) is the binding traverse constraint, but sbs_96_wellplate has no height_mm so it cannot be checked."
   ]
 }

@@ -3,9 +3,7 @@
   "id": "p300",
   "kind": "pipette",
   "display_name": "300 uL air-displacement pipette",
-
   "nominal_uL": 300.0,
-
   "actuator": {
     "blowout_pos": 30.0,
     "blowout_note": "plunger bottomed = full dispense + blow-out",
@@ -20,13 +18,15 @@
     "settle_s": 1.0,
     "decimals": 3
   },
-
   "calibration": {
     "model": "linear_mm_per_uL",
     "slope": 0.0533,
     "intercept": 0.122,
     "equation": "d_mm = 0.0533 * V_uL + 0.122",
-    "window_uL": [8.0, 320.0],
+    "window_uL": [
+      8.0,
+      320.0
+    ],
     "method": "gravimetric / density",
     "temperature_C": 23.0,
     "water_density_g_per_mL": 0.997538,
@@ -38,13 +38,11 @@
     ],
     "note": "Store coefficients ONLY. Displacements are computed at runtime. No mm value is ever typed into a protocol script."
   },
-
   "tips": {
     "required": true,
     "labware": "tiprack_300_96",
     "eject_supported": true
   },
-
   "prewet": {
     "enabled": true,
     "cycles": 3,
@@ -53,21 +51,41 @@
     "asp_pos": 10.0,
     "asp_pos_note": "= blowout_pos - displacement_mm, measured from BOTTOMED, not from gap_pos"
   },
-
   "z_for_labware": {
-    "reservoir_water": { "work": 40.0, "note": "tip submerged" },
-    "tube_rack_0p65_5x10": { "work": 45.0, "uncalibrated": true, "note": "was marked <-- TUNE in the source and was never tuned" },
+    "reservoir_water": {
+      "work": 40.0,
+      "note": "tip submerged"
+    },
+    "tube_rack_0p65_5x10": {
+      "work": 45.0,
+      "uncalibrated": true,
+      "note": "was marked <-- TUNE in the source and was never tuned"
+    },
     "tiprack_300_96": {
       "approach": 47.0,
       "pick": 59.0,
       "note": "pick=59.0 comes from the direct rack measurement and supersedes the old Z_TIP_PICK=57.5 in examples/300ulaccuracyprecision.py. Confirm 57.5 was not a different tip type.",
       "superseded": 57.5
+    },
+    "sbs_96_wellplate": {
+      "work": null,
+      "uncalibrated": true,
+      "note": "UNMEASURED. Commanded Z to dispense into a 96-well plate well with a 300 uL tip fitted. Effector.z_for raises an EffectorError naming this field while it is null, which is what makes protocols/centrifuge_test.py refuse to generate rather than invent a depth."
+    },
+    "tube_rack_1p5": {
+      "work": null,
+      "bottom": null,
+      "uncalibrated": true,
+      "note": "UNMEASURED, both. 'work' is the dispense depth in a 1.5 mL tube; 'bottom' is the deeper position Machine.mix cycles at, so that a mix turns the contents over instead of stirring the surface. bottom must be deeper (numerically LARGER, since +Z is down) than work."
     }
   },
-
-  "feedrates": { "tip_press": 600 },
-
+  "feedrates": {
+    "tip_press": 600
+  },
   "uncalibrated": [
-    "z_for_labware.tube_rack_0p65_5x10.work"
+    "z_for_labware.tube_rack_0p65_5x10.work",
+    "z_for_labware.sbs_96_wellplate.work",
+    "z_for_labware.tube_rack_1p5.work",
+    "z_for_labware.tube_rack_1p5.bottom"
   ]
 }

@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "id": "test_fixture_all_labware",
+  "description": "FIXTURE FOR THE TEST SUITE. Not a real bench. Every piece of labware the library knows about is placed here at once, so tests exercise behaviour without depending on what happens to be on the deck today. layout.json is the per-run file the operator edits; a rack coming off the bench must not break the test suite. Pass layout=\"layout_test.json\" to Deck.load, Machine or a protocol's build() to use this.",
+  "deck": "sdl_klipper_deck",
+  "placements": [
+    {
+      "name": "tubes",
+      "labware": "tube_rack_0p65_5x10",
+      "mount": "slot",
+      "slot": 8,
+      "slot_center": [200.0, 178.5],
+      "anchor_xy": [256.6, 218.5],
+      "anchor_note": "The measured A1 centre, same value config/layout.json carries when this holder is on the bench. Kept in step with it deliberately: the geometry tests assert these coordinates.",
+      "rotation": 0
+    },
+    {
+      "name": "big_tubes",
+      "labware": "tube_rack_1p5",
+      "mount": "slot",
+      "slot": 5,
+      "slot_center": [200.0, 272.0],
+      "anchor_note": "A1 resolves from the labware's a1_from_slot_edge insets against slot 5's cell, giving the measured (252.50, 305.50).",
+      "rotation": 0
+    },
+    {
+      "name": "tips",
+      "labware": "tiprack_300_96",
+      "mount": "slot",
+      "slot": 3,
+      "slot_center": [65.0, 365.0],
+      "rotation": 0,
+      "corners": {
+        "note": "Three measured WELL CENTRES, same as the live layout.",
+        "origin": [18.0, 399.2],
+        "along_col": [118.0, 399.2],
+        "along_row": [18.0, 335.5],
+        "origin_label": "top right",
+        "along_col_label": "top left",
+        "along_row_label": "bottom right",
+        "solved": {
+          "col_pitch": 9.090909090909092,
+          "row_pitch": 9.1,
+          "grid_center": [68.0, 367.35]
+        }
+      }
+    },
+    {
+      "name": "plate1",
+      "labware": "sbs_96_wellplate",
+      "mount": "slot",
+      "slot": 1,
+      "slot_center": [336.0, 365.0],
+      "rotation": 0
+    },
+    {
+      "name": "plate2",
+      "labware": "sbs_96_wellplate",
+      "mount": "slot",
+      "slot": 2,
+      "slot_center": [200.0, 365.0],
+      "rotation": 0
+    },
+    {
+      "name": "water",
+      "labware": "reservoir_water",
+      "mount": "station",
+      "station": "water",
+      "near_slot": 9,
+      "rotation": 0
+    }
+  ],
+  "open_questions": [
+    "None recorded here on purpose. This is a test fixture, so the operator-facing open questions live in config/layout.json and are asserted there. Adding them here would double every warning count the tests check."
+  ]
+}

@@ -122,10 +122,15 @@
       },
       "note": "Not used by any current protocol. Included as a standard definition.",
       "uncalibrated": [
-        "z.top",
+        "height_mm",
         "z.work",
-        "z.bottom"
-      ]
+        "z.bottom",
+        "z.top"
+      ],
+      "height_mm": null,
+      "height_note": "UNMEASURED. Physical height of the plate above the stage. Without it Simulator.labware_top_z cannot convert to a commanded Z, so traverse clearance over the plates reports 'cannot check' rather than passing. Anything taller than 57.5 mm is struck at travel height with a 300 uL tip.",
+      "height_with_contents_mm": null,
+      "approach_order_note": "Deliberately unset, so the default X-first applies. A plate has no caps, so the Y-first rule the tube holders need does not apply here."
     },
     "reservoir_water": {
       "display_name": "Open water reservoir",
