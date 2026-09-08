@@ -269,20 +269,25 @@ class Simulator:
         if step.moves_xy and step.op not in _LOW_XY_OK:
             self._check_traverse_clearance(step)
 
-        # A dispense must not drive into the bottom of the vessel.
+        # A dispense must not drive into the bottom of the vessel. The limit
+        # comes from the EFFECTOR table, not from labware.json: the commanded Z
+        # at which a tip touches a well bottom depends on the tip, so the same
+        # plate bottoms out at a different number bare than with a 300 uL tip
+        # fitted. Same reasoning as `work`.
         if step.labware:
-            lw = self.deck.catalogue.get(step.labware)
-            bottom = lw.z("bottom") if lw else None
+            bottom = self._effector_z(step.labware, "bottom")
             if bottom is not None and z > bottom + 1e-6:
                 self.fail(
                     step,
-                    f"Z {z} is past the {step.labware} well bottom {bottom}",
+                    f"Z {z} is past the {step.labware} well bottom {bottom} "
+                    f"for {self.effector.id}",
                 )
-            elif lw is not None and bottom is None:
+            elif step.labware in self.deck.catalogue and bottom is None:
                 self.warn(
                     f"bottom:{step.labware}",
-                    f"cannot check well-bottom crash for {step.labware}: its "
-                    f"z.bottom is unmeasured",
+                    f"cannot check well-bottom crash for {step.labware}: "
+                    f"{self.effector.id} has no measured 'bottom' Z for it in "
+                    f"config/effectors/{self.effector.id}.json",
                 )
 
     def _check_raised_edges(self, step: Step) -> None:
@@ -418,6 +423,19 @@ class Simulator:
                     f"{self.max_labware_height():.1f} mm is struck at travel height "
                     f"with a tip fitted.",
                 )
+
+    def _effector_z(self, labware_id: str, key: str) -> Optional[float]:
+        """A per-effector Z for this labware, or None if it is not recorded.
+
+        Unlike Effector.z_for this never raises: a missing value here becomes a
+        `cannot check` warning rather than stopping the run, because a crash
+        LIMIT being unknown is different from a commanded depth being unknown.
+        """
+        entry = self.effector.spec.get("z_for_labware", {}).get(labware_id)
+        if not entry:
+            return None
+        v = entry.get(key)
+        return None if v is None else float(v)
 
     def labware_top_z(self, p, tip_fitted: bool) -> Tuple[Optional[float], str]:
         """Commanded Z at which the effector would touch this labware's top.

@@ -716,13 +716,18 @@ class Machine:
                                  prefer=p.labware.approach_order)
 
     def mix(self, placement: str, row: int, col: int, cycles: int,
-            volume_uL: float, z_key: str = "bottom") -> None:
-        """Homogenise a well by cycling the plunger at its BOTTOM.
+            volume_uL: float, z_key: str = "mix") -> None:
+        """Homogenise a well by cycling the plunger deep in it.
 
-        Descends deeper than a dispense would - `z_key` defaults to "bottom" -
-        so the stroke actually turns the contents over instead of stirring the
-        surface. Starts and ends bottomed, so the tip holds no liquid between
-        cycles and never carries any away.
+        `z_key` defaults to "mix", a per-effector depth that sits BELOW the
+        dispense depth (`work`) and ABOVE the well bottom (`bottom`), so the
+        stroke turns the contents over without driving the tip into the floor
+        of the vessel. Those are three separate numbers on purpose: "bottom" is
+        a crash limit the machine must never reach, so it is the wrong thing to
+        aim at.
+
+        Starts and ends bottomed on the PLUNGER, so the tip holds no liquid
+        between cycles and never carries any away.
         """
         eff = self._require_empty_tip("mix()")
         if cycles < 1:
