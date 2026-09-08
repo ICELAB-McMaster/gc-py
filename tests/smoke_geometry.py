@@ -16,38 +16,35 @@ def main() -> None:
     print(deck.summary())
     print()
 
-    tubes = deck.placement("tubes")
-    print("0.65 mL tube holder")
-    print(f"  pitch      X {tubes.col_vec}  Y {tubes.row_vec}")
-    print(f"  anchor A1  {tubes.xy(0, 0)}")
-    print(f"  col X      {tubes.col_x_values()}")
-    print(f"  row Y      {tubes.row_y_values()}")
-    print(f"  centre     {tubes.grid_center()}")
-    print()
+    # Walk whatever the layout actually holds. Naming placements here made this
+    # crash the moment a rack came off the deck, which is exactly when you most
+    # want to run it.
+    for name, p in sorted(deck.placements.items()):
+        if p.labware.rows * p.labware.cols == 1:
+            continue
+        print(f"{name}  ({p.labware.display_name})")
+        print(f"  col_vec    {tuple(round(v, 4) for v in p.col_vec)}")
+        print(f"  row_vec    {tuple(round(v, 4) for v in p.row_vec)}")
+        print(f"  A1         {p.xy(0, 0)}")
+        print(f"  col X      {[round(v, 4) for v in p.col_x_values()]}")
+        print(f"  row Y      {[round(v, 4) for v in p.row_y_values()]}")
+        print(f"  centre     {p.grid_center()}")
+        print(f"  height     {p.labware.height_mm} mm"
+              f"   approach {p.labware.approach_order or 'XY (default)'}")
+        print()
 
-    tips = deck.placement("tips")
-    print("300 uL tiprack (three-corner solve)")
-    print(f"  col_vec    {tips.col_vec}")
-    print(f"  row_vec    {tips.row_vec}")
-    print(f"  col X      {[round(v, 4) for v in tips.col_x_values()]}")
-    print(f"  row Y      {[round(v, 4) for v in tips.row_y_values()]}")
-    print(f"  centre     {tips.grid_center()}")
-    print()
-
-    # The old accuracy protocol used rows 0-3, cols 0-4 of the tube rack.
-    print("accuracy-test tube block (rows 0-3, cols 0-4)")
-    for r in range(4):
-        print("   " + "  ".join(f"{tubes.xy(r, c)}" for c in range(5)))
-    print()
-
-    print("keep-out interaction with the tube rack")
+    print("keep-out interaction with every loaded grid")
     for k in deck.keepouts:
-        hits = [
-            (c, tubes.xy(0, c)[0])
-            for c in range(tubes.labware.cols)
-            if k.contains_x(tubes.xy(0, c)[0])
-        ]
-        print(f"  {k.id} X{k.x_range}: tube columns inside band -> {hits}")
+        print(f"  {k.id} X{k.x_range}, forbids {k.forbids} unless Z < "
+              f"{k.safe_when_z_below}")
+        for name, p in sorted(deck.placements.items()):
+            hits = [
+                (c, p.xy(0, c)[0])
+                for c in range(p.labware.cols)
+                if k.contains_x(p.xy(0, c)[0])
+            ]
+            if hits:
+                print(f"    {name}: columns inside the band -> {hits}")
     print()
 
     print("effectors")

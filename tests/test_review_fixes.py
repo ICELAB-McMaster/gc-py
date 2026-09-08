@@ -22,6 +22,12 @@ from lab.effector import EffectorError, LabError, Pipette, VolumeError
 from lab.machine import Machine, ProtocolError
 from lab.simulate import SimulationError
 
+# The per-run layout.json is the operator's bench and changes between runs, so
+# behaviour tests use a fixture that holds every piece of labware at once. Only
+# the handful of tests that deliberately assert the SHIPPED bench call
+# Deck.load() with no argument.
+TEST_LAYOUT = "layout_test.json"
+
 FAILURES: list[str] = []
 
 
@@ -45,6 +51,7 @@ def raises(exc, fn, msg):
 
 
 def _machine(effector="p300", **kw):
+    kw.setdefault("layout", TEST_LAYOUT)
     return Machine(effector=effector, name="review_fix", **kw)
 
 
@@ -60,7 +67,7 @@ def test_1_eject_approach_is_routed_and_checked():
     with tempfile.TemporaryDirectory() as td:
         m, _ = accuracy_test.build(effector_id="p300", name="rf_eject",
                                    eject_tip=True, shuffle=True, seed=0,
-                                   outdir=td, plot=False)
+                                   layout=TEST_LAYOUT, outdir=td, plot=False)
     band = next(k for k in m.deck.keepouts if k.id == "tip_ejector")
     lane_x = float(m.deck.station("tip_eject").spec["lane_x"])
 
@@ -148,8 +155,8 @@ def _config_without(*paths):
     """Temp LAB_CONFIG copy with the given deck z keys set to null."""
     import copy, os, shutil, tempfile
     d = Path(tempfile.mkdtemp())
-    for name in ("deck.json", "labware.json", "layout.json"):
-        shutil.copy(cfgmod.config_path(name), d / name)
+    for src in cfgmod.config_dir().glob("*.json"):
+        shutil.copy(src, d / src.name)
     shutil.copytree(cfgmod.config_path("effectors"), d / "effectors")
     deck = json.loads((d / "deck.json").read_text())
     for key in paths:
@@ -248,8 +255,8 @@ def test_4_traverse_clearance_uses_the_swept_segment():
 
     with tempfile.TemporaryDirectory() as td:
         d = Path(td)
-        for name in ("deck.json", "layout.json"):
-            (d / name).write_text(cfgmod.config_path(name).read_text())
+        for src in cfgmod.config_dir().glob("*.json"):
+            (d / src.name).write_text(src.read_text())
         (d / "effectors").mkdir()
         for p in cfgmod.config_path("effectors").glob("*.json"):
             (d / "effectors" / p.name).write_text(p.read_text())
@@ -338,8 +345,8 @@ def test_6_failed_aspirate_emits_nothing_and_leaves_no_stale_record():
     import copy, os
     with tempfile.TemporaryDirectory() as td:
         d = Path(td)
-        for name in ("deck.json", "labware.json", "layout.json"):
-            (d / name).write_text(cfgmod.config_path(name).read_text())
+        for src in cfgmod.config_dir().glob("*.json"):
+            (d / src.name).write_text(src.read_text())
         (d / "effectors").mkdir()
         for p in cfgmod.config_path("effectors").glob("*.json"):
             (d / "effectors" / p.name).write_text(p.read_text())

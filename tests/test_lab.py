@@ -10,6 +10,7 @@ moved and somebody needs to know.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -22,6 +23,12 @@ from lab.deck import Deck
 from lab.effector import EffectorError, Pipette, VolumeError
 from lab.machine import Machine, ProtocolError
 from lab.simulate import SimulationError
+
+# The per-run layout.json is the operator's bench and changes between runs, so
+# behaviour tests use a fixture that holds every piece of labware at once. Only
+# the handful of tests that deliberately assert the SHIPPED bench call
+# Deck.load(TEST_LAYOUT) with no argument.
+TEST_LAYOUT = "layout_test.json"
 
 FAILURES: list[str] = []
 
@@ -52,8 +59,12 @@ def raises(exc, fn, msg):
 # ==========================================================================
 
 def test_tube_rack_layout():
-    """The 0.65 mL tube holder: 12 mm in X, 18 mm in Y, 5 rows x 10 cols."""
-    d = Deck.load()
+    """The 0.65 mL tube holder: 12 mm in X, 18 mm in Y, 5 rows x 10 cols.
+
+    Reads the test fixture, not the bench: this holder comes on and off the
+    deck, and its geometry is worth asserting either way.
+    """
+    d = Deck.load(TEST_LAYOUT)
     p = d.placement("tubes")
 
     check(p.labware.rows == 5 and p.labware.cols == 10,
@@ -84,7 +95,7 @@ def test_tube_rack_layout():
 
 def test_tiprack_corner_solve():
     """Real pitch is 9.0909 / 9.10, not the nominal 9.00."""
-    d = Deck.load()
+    d = Deck.load(TEST_LAYOUT)
     p = d.placement("tips")
 
     check(abs(p.col_vec[0] - 100.0 / 11) < 1e-9,
@@ -104,7 +115,7 @@ def test_tiprack_corner_solve():
 
 
 def test_out_of_range_well():
-    d = Deck.load()
+    d = Deck.load(TEST_LAYOUT)
     p = d.placement("tubes")
     raises(IndexError, lambda: p.xy(5, 0), "row 5 of a 5-row rack should raise")
     raises(IndexError, lambda: p.xy(0, 10), "col 10 of a 10-col rack should raise")
@@ -116,7 +127,7 @@ def test_keepout_misses_the_tubes_in_use():
     Before the +70 correction the band appeared to cover columns 2 and 3, which
     the accuracy protocol uses. It actually covers 8 and 9, which nothing uses.
     """
-    d = Deck.load()
+    d = Deck.load(TEST_LAYOUT)
     p = d.placement("tubes")
     band = next(k for k in d.keepouts if k.id == "tip_ejector")
     inside = [c for c in range(p.labware.cols) if band.contains_x(p.xy(0, c)[0])]
@@ -213,6 +224,7 @@ def test_p125_has_no_tips_or_prewet():
 # ==========================================================================
 
 def _machine(effector="p300", **kw):
+    kw.setdefault("layout", TEST_LAYOUT)
     return Machine(effector=effector, name="unit_test", **kw)
 
 
@@ -273,12 +285,17 @@ def test_p125_rejects_tip_ops():
 # ==========================================================================
 
 def test_slots_are_seated_correctly():
-    """Every slot-mounted labware sits in the slot the operator named."""
+    """Every slot-mounted labware sits in the slot the operator named.
+
+    Asserts the SHIPPED bench deliberately - config/layout.json is the per-run
+    file, so this is the test that notices when it stops matching reality.
+    """
     d = Deck.load()
     bad = d.slot_seating_report()
     check(not bad, "slot seating problems: " + "; ".join(bad))
-    check(d.placement("tips").slot == 3, "the tip rack is in slot 3")
-    check(d.placement("tubes").slot == 8, "the tube holder is in slot 8")
+    expect = {"tips": 3, "big_tubes": 5, "plate1": 1, "plate2": 2}
+    got = {n: p.slot for n, p in d.placements.items() if p.slot is not None}
+    check(got == expect, f"shipped bench should be {expect}, got {got}")
     check(d.near_slots().get("water") == 9, "water sits at slot 9")
 
 
@@ -469,7 +486,7 @@ def test_ejection_passes_the_envelope_checks():
 def test_holder_heights_convert_to_commanded_z():
     """A height above the stage, not a stored Z: the Z depends on the tip."""
     from lab.simulate import Simulator
-    d = Deck.load()
+    d = Deck.load(TEST_LAYOUT)
     sim = Simulator(d, eff_mod.load("p300"))
     p = d.placement("tubes")
     check(p.labware.height_mm == 35.0, "the 0.65 mL holder is 35 mm tall")
@@ -486,7 +503,7 @@ def test_holder_heights_convert_to_commanded_z():
 
 def test_empty_height_is_flagged_as_incomplete():
     """35 mm is the EMPTY holder; tubes and caps make it taller."""
-    d = Deck.load()
+    d = Deck.load(TEST_LAYOUT)
     check(d.placement("tubes").labware.height_is_empty_only,
           "the tube holder should be flagged as empty-height-only")
     m = _machine()
@@ -500,7 +517,7 @@ def test_empty_height_is_flagged_as_incomplete():
 
 def test_tube_holder_is_approached_y_first():
     """Caps make Y motion across the holder difficult, so Y goes first."""
-    d = Deck.load()
+    d = Deck.load(TEST_LAYOUT)
     check(d.placement("tubes").labware.approach_order == "YX",
           "the 0.65 mL holder should ask for YX")
 
@@ -528,7 +545,7 @@ def test_every_dispense_approach_is_y_first():
     import accuracy_test
     with tempfile.TemporaryDirectory() as td:
         m, _ = accuracy_test.build(effector_id="p300", name="order_probe",
-                                   outdir=td, plot=False)
+                                   layout=TEST_LAYOUT, outdir=td, plot=False)
     legs = [s for s in m.steps
             if s.op == "dispense" and s.kind == "move" and s.axes in ("X", "Y")]
     orders, cur = [], []
@@ -601,9 +618,10 @@ def test_ejection_variant_is_functionally_identical():
     import accuracy_test
     with tempfile.TemporaryDirectory() as td:
         plain, _ = accuracy_test.build(effector_id="p300", name="fe_plain",
-                                       outdir=td, plot=False)
+                                       layout=TEST_LAYOUT, outdir=td, plot=False)
         eject, _ = accuracy_test.build(effector_id="p300", name="fe_eject",
-                                       eject_tip=True, outdir=td, plot=False)
+                                       eject_tip=True, layout=TEST_LAYOUT,
+                                       outdir=td, plot=False)
 
     def working(m):
         return {(d["x"], d["y"], d["z"], d["target_volume_uL"],
@@ -616,6 +634,231 @@ def test_ejection_variant_is_functionally_identical():
     check(plain.tip_fitted and not eject.tip_fitted,
           "only the ejecting version should end with the tip off")
 
+
+
+# ==========================================================================
+# well-form aspiration, and mixing
+# ==========================================================================
+
+def _p300_with_z(**depths):
+    """Temp LAB_CONFIG with the unmeasured depths filled in provisionally.
+
+    The real values are null on purpose, so any test that needs to exercise
+    motion into a plate or the 1.5 mL tube has to supply its own.
+    """
+    import json as _json, shutil
+    from lab import config as cfgmod
+    d = Path(tempfile.mkdtemp())
+    for src in cfgmod.config_dir().glob("*.json"):
+        shutil.copy(src, d / src.name)
+    shutil.copytree(cfgmod.config_path("effectors"), d / "effectors")
+    spec = _json.loads((d / "effectors" / "p300.json").read_text())
+    for lid, keys in depths.items():
+        spec["z_for_labware"].setdefault(lid, {}).update(keys)
+    (d / "effectors" / "p300.json").write_text(_json.dumps(spec))
+    return d
+
+
+class _WithConfig:
+    def __init__(self, path):
+        self.path = str(path)
+
+    def __enter__(self):
+        self.old = os.environ.get("LAB_CONFIG")
+        os.environ["LAB_CONFIG"] = self.path
+        return self
+
+    def __exit__(self, *exc):
+        if self.old is None:
+            os.environ.pop("LAB_CONFIG", None)
+        else:
+            os.environ["LAB_CONFIG"] = self.old
+        return False
+
+
+def test_plates_resolve_in_slots_1_and_2():
+    """A1 comes from the slot centre and the grid span, not a stored anchor."""
+    d = Deck.load()
+    for name, slot, a1 in (("plate1", 1, (286.5, 396.5)),
+                           ("plate2", 2, (150.5, 396.5))):
+        p = d.placement(name)
+        check(p.slot == slot, f"{name} should be in slot {slot}, got {p.slot}")
+        check(p.xy(0, 0) == a1, f"{name} A1 should be {a1}, got {p.xy(0, 0)}")
+        check((p.labware.rows, p.labware.cols) == (8, 12),
+              f"{name} should be 8x12, got {p.labware.rows}x{p.labware.cols}")
+        cx, cy = d.slot_center(slot)
+        px, py = d.slot_pitch()
+        x0, x1, y0, y1 = p.well_bounds()
+        check(x0 >= cx - px / 2 and x1 <= cx + px / 2
+              and y0 >= cy - py / 2 and y1 <= cy + py / 2,
+              f"{name} should fit its cell, got X[{x0}, {x1}] Y[{y0}, {y1}]")
+    # The two wells centrifuge_test uses must clear the ejector band.
+    band = next(k for k in d.keepouts if k.id == "tip_ejector")
+    for name in ("plate1", "plate2"):
+        for well in ((3, 5), (4, 6)):
+            x = d.placement(name).xy(*well)[0]
+            check(not band.contains_x(x),
+                  f"{name} well {well} at X {x} is inside the keep-out band")
+
+
+def test_unmeasured_depths_refuse_rather_than_guess():
+    """The shipped config leaves the plate and 1.5 mL depths null on purpose."""
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    m.aspirate_uL(100.0)
+    raises(EffectorError, lambda: m.dispense("plate1", 3, 5),
+           "dispensing into the plate should refuse while its Z is null")
+
+
+def test_aspirate_from_reaches_the_well():
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 45.0})):
+        m = _machine()
+        m.startup()
+        m.get_tip()
+        pos = m.aspirate_from("big_tubes", 0, 0, volume_uL=100.0)
+        e = eff_mod.load("p300")
+        check(pos == e.aspirate_pos(100.0),
+              f"should return the aspirate POS {e.aspirate_pos(100.0)}, got {pos}")
+        check(m.fluid_uL == 100.0, f"should hold 100 uL, got {m.fluid_uL}")
+        deep = [s for s in m.steps
+                if s.op == "aspirate" and s.kind == "move" and s.axes == "Z"
+                and s.to[2] == 45.0]
+        check(deep, "should have descended to the tube's work Z of 45.0")
+        # It must honour the holder's Y-first approach.
+        legs = [s for s in m.steps
+                if s.op == "aspirate" and s.kind == "move" and s.axes in ("X", "Y")]
+        check([s.axes for s in legs][:2] == ["Y", "X"],
+              f"approach should be Y then X, got {[s.axes for s in legs][:2]}")
+        check(m._last_aspirate["source"] == "tube_rack_1p5",
+              "the aspirate record should name the source labware")
+
+
+def test_aspirate_from_refuses_bad_state():
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 45.0})):
+        m = _machine()
+        m.startup()
+        raises(ProtocolError,
+               lambda: m.aspirate_from("big_tubes", 0, 0, volume_uL=100.0),
+               "aspirating from a well with no tip should raise")
+        m.get_tip()
+        m.aspirate_from("big_tubes", 0, 0, volume_uL=100.0)
+        raises(ProtocolError,
+               lambda: m.aspirate_from("big_tubes", 0, 1, volume_uL=100.0),
+               "aspirating while already holding fluid should raise")
+
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 45.0})):
+        m = _machine()
+        m.startup()
+        m.get_tip()
+        raises(IndexError,
+               lambda: m.aspirate_from("big_tubes", 0, 99, volume_uL=100.0),
+               "an out-of-range well should raise")
+
+
+def test_mix_cycles_at_the_bottom():
+    with _WithConfig(_p300_with_z(
+            tube_rack_1p5={"work": 45.0, "bottom": 55.0})):
+        m = _machine()
+        m.startup()
+        m.get_tip()
+        n = len(m.steps)
+        m.mix("big_tubes", 0, 0, cycles=5, volume_uL=200.0)
+
+        e = eff_mod.load("p300")
+        top = round(e.blowout_pos - e.displacement_mm(200.0), e.decimals)
+        acts = [s.pos_after for s in m.steps[n:] if s.kind == "actuator"]
+        # one priming blowout, then a draw/push pair per cycle
+        check(acts == [e.blowout_pos] + [top, e.blowout_pos] * 5,
+              f"expected a prime then 5 draw/push pairs, got {acts}")
+        check(m.fluid_uL == 0.0,
+              f"a mix must not leave fluid held, got {m.fluid_uL}")
+
+        # Every cycle must happen at the BOTTOM Z, deeper than the work Z.
+        at = {s.to[2] for s in m.steps[n:]
+              if s.kind == "move" and s.axes == "Z"}
+        check(55.0 in at, f"should have descended to the bottom Z 55.0, got {at}")
+        check(55.0 > 45.0, "bottom must be deeper than work (+Z is down)")
+
+
+def test_mix_refuses_bad_state():
+    with _WithConfig(_p300_with_z(
+            tube_rack_1p5={"work": 45.0, "bottom": 55.0})):
+        m = _machine()
+        m.startup()
+        m.get_tip()
+        raises(ProtocolError,
+               lambda: m.mix("big_tubes", 0, 0, cycles=0, volume_uL=200.0),
+               "zero cycles should raise")
+        raises(VolumeError,
+               lambda: m.mix("big_tubes", 0, 0, cycles=3, volume_uL=400.0),
+               "a stroke outside the calibration window should raise")
+        m.aspirate_from("big_tubes", 0, 0, volume_uL=100.0)
+        raises(ProtocolError,
+               lambda: m.mix("big_tubes", 0, 0, cycles=3, volume_uL=200.0),
+               "mixing while holding fluid should raise")
+
+
+def test_goto_well_honours_approach_order():
+    """It used to drop `prefer` and ignore the holders' Y-first rule."""
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    n = len(m.steps)
+    m.goto_well("big_tubes", 0, 0, op="probe")
+    legs = [s.axes for s in m.steps[n:] if s.kind == "move" and s.axes in ("X", "Y")]
+    check(legs == ["Y", "X"], f"should be Y then X, got {legs}")
+
+
+def test_centrifuge_protocol_balances_the_plates():
+    with _WithConfig(_p300_with_z(
+            sbs_96_wellplate={"work": 55.0},
+            tube_rack_1p5={"work": 45.0, "bottom": 55.0})):
+        import importlib
+        import centrifuge_test
+        importlib.reload(centrifuge_test)
+        with tempfile.TemporaryDirectory() as td:
+            m, _ = centrifuge_test.build(layout=TEST_LAYOUT, outdir=td,
+                                         plot=False)
+
+        per_plate = {}
+        for d in m.dispenses:
+            per_plate.setdefault(d["placement"], []).append(d["target_volume_uL"])
+        check(per_plate.get("plate1") == [100.0, 100.0],
+              f"plate1 should get 2x100 uL, got {per_plate.get('plate1')}")
+        check(per_plate.get("plate2") == [100.0, 100.0],
+              f"plate2 should get 2x100 uL, got {per_plate.get('plate2')}")
+        check(sum(per_plate["plate1"]) == sum(per_plate["plate2"]),
+              "the two plates must receive equal mass - that is the whole point")
+
+        wells = {d["placement"]: [x["well"] for x in m.dispenses
+                                 if x["placement"] == d["placement"]]
+                 for d in m.dispenses}
+        check(wells["plate1"] == wells["plate2"] == ["D6", "E7"],
+              f"both plates should use D6 and E7, got {wells}")
+        check(m.toggles["tube_contents_at_end_uL"] == 100.0,
+              "the tube should finish with 100 uL")
+
+
+def test_centrifuge_protocol_checks_its_own_arithmetic():
+    with _WithConfig(_p300_with_z(
+            sbs_96_wellplate={"work": 55.0},
+            tube_rack_1p5={"work": 45.0, "bottom": 55.0})):
+        import importlib
+        import centrifuge_test
+        importlib.reload(centrifuge_test)
+        with tempfile.TemporaryDirectory() as td:
+            # Nothing tracks liquid in a well, so the protocol must catch this.
+            raises(ProtocolError,
+                   lambda: centrifuge_test.build(
+                       tube_preload_uL=0.0, stock_uL=100.0,
+                       layout=TEST_LAYOUT, outdir=td, plot=False),
+                   "withdrawing more than the tube holds should raise")
+            raises(ProtocolError,
+                   lambda: centrifuge_test.build(
+                       well_a=(3, 5), well_b=(3, 5), layout=TEST_LAYOUT,
+                       outdir=td, plot=False),
+                   "using the same well twice should raise")
 
 # ==========================================================================
 # end to end
@@ -652,7 +895,8 @@ def test_full_protocol_and_manifest():
 
     with tempfile.TemporaryDirectory() as td:
         m, result = accuracy_test.build(
-            effector_id="p300", name="unit_p300", outdir=td, plot=False
+            effector_id="p300", name="unit_p300", layout=TEST_LAYOUT,
+            outdir=td, plot=False
         )
         check(len(m.dispenses) == 20, f"expected 20 dispenses, got {len(m.dispenses)}")
         gpath = Path(result["gcode"])
@@ -681,7 +925,8 @@ def test_full_protocol_and_manifest():
 def test_simulation_failure_writes_nothing():
     """A run that fails simulation must not leave a .gcode behind."""
     with tempfile.TemporaryDirectory() as td:
-        m = Machine(effector="p300", name="should_not_exist", strict=False)
+        m = Machine(effector="p300", name="should_not_exist",
+                    layout=TEST_LAYOUT, strict=False)
         m.startup()
         m.get_tip()
         m.aspirate_uL(150.0)

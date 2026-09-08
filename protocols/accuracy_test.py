@@ -59,12 +59,14 @@ def build(
     eject_tip: bool = False,
     shuffle: bool = False,
     seed: int = 0,
+    layout: str = "layout.json",
     outdir: str = ".",
     plot: bool = True,
     strict: bool = True,
 ):
     name = name or f"{effector_id}_accuracy"
-    m = Machine(effector=effector_id, name=name, strict=strict, temp_log=temp_log)
+    m = Machine(effector=effector_id, name=name, layout=layout,
+                strict=strict, temp_log=temp_log)
 
     eff = m.effector
     if not isinstance(eff, Pipette):
@@ -199,6 +201,8 @@ def main(argv=None) -> int:
                     help="layout placement holding the tube rack")
     ap.add_argument("--replicates", type=int, default=REPLICATES)
     ap.add_argument("--col-offset", type=int, default=COL_OFFSET)
+    ap.add_argument("--layout", default="layout.json",
+                    help="layout file in the config dir; the per-run bench")
     ap.add_argument("--outdir", default=".")
     ap.add_argument("--no-tip", dest="get_tip", action="store_false")
     ap.add_argument("--no-prewet", dest="prewet", action="store_false")
@@ -226,7 +230,8 @@ def main(argv=None) -> int:
             replicates=a.replicates, col_offset=a.col_offset,
             get_tip=a.get_tip, prewet=a.prewet, wall_wipe=a.wall_wipe,
             temp_log=a.temp_log, eject_tip=a.eject_tip, shuffle=a.shuffle,
-            seed=a.seed, outdir=a.outdir, plot=a.plot, strict=a.strict,
+            seed=a.seed, layout=a.layout, outdir=a.outdir, plot=a.plot,
+            strict=a.strict,
         )
     except LabError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
