@@ -30,6 +30,10 @@ a few uL light - and an even mass is the entire point of this protocol.
 The two wells are diagonally opposite about the plate centre, so each plate is
 internally balanced as well as matched to the other.
 
+The run ends by ejecting the tip and returning home. The ejection forces a
+mandatory G28 - the strip force can skip steps on an open-loop machine - so the
+park that follows is only a Z move. Pass --no-eject-tip to leave the tip on.
+
 Volumes are requested in microlitres. The millimetre displacement comes from the
 pipette's stored calibration at generation time; no mm value is typed here.
 """
@@ -80,7 +84,7 @@ def build(
     get_tip: bool = True,
     prewet: bool = True,
     temp_log: bool = True,
-    eject_tip: bool = False,
+    eject_tip: bool = True,
     layout: str = "layout.json",
     outdir: str = ".",
     plot: bool = True,
@@ -192,6 +196,8 @@ def build(
 
     m.log_temps("end")
     if do_eject and m.tip_fitted:
+        # The ejection forces a mandatory G28, so the machine is already at the
+        # home position; park() then only has to drop Z.
         m.eject_tip()
     m.park()
 
@@ -273,10 +279,12 @@ def main(argv=None) -> int:
     ap.add_argument("--no-prewet", dest="prewet", action="store_false")
     ap.add_argument("--no-temp-log", dest="temp_log", action="store_false")
     ap.add_argument("--no-plot", dest="plot", action="store_false")
-    ap.add_argument("--eject-tip", action="store_true",
-                    help="eject the tip at the end. OFF by default: the "
-                         "ejection routine has never been validated on "
-                         "hardware.")
+    ap.add_argument("--no-eject-tip", dest="eject_tip", action="store_false",
+                    help="skip the tip ejection. It runs by default, and it "
+                         "forces a G28 afterwards, which is what returns the "
+                         "machine home. NOTE the ejection routine has still "
+                         "never been validated on hardware - dry-run it and "
+                         "step it through at reduced feedrate the first time.")
     ap.add_argument("--lenient", dest="strict", action="store_false",
                     help="collect every simulation error instead of raising on "
                          "the first. Still refuses to write the gcode.")

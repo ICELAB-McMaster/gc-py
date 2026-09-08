@@ -702,13 +702,67 @@ def test_plates_resolve_in_slots_1_and_2():
 
 
 def test_unmeasured_depths_refuse_rather_than_guess():
-    """The shipped config leaves the plate and 1.5 mL depths null on purpose."""
+    """A null depth refuses rather than guessing. The refusal IS the feature.
+
+    The plate depths are measured now, so the one still null is the 1.5 mL
+    tube's `work`. When that is supplied this test must be re-pointed again -
+    or, better, deleted once nothing is null.
+    """
+    e = eff_mod.load("p300")
+    still_null = [
+        (lid, key)
+        for lid, entry in e.spec["z_for_labware"].items()
+        for key in ("work", "mix", "bottom")
+        if key in entry and entry[key] is None
+    ]
+    check(still_null,
+          "this test needs at least one null depth to exercise; if every depth "
+          "is measured, delete it")
+
+    lid, key = still_null[0]
+    raises(EffectorError, lambda: e.z_for(lid, key),
+           f"z_for({lid!r}, {key!r}) should refuse while it is null")
+
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    raises(EffectorError,
+           lambda: m.aspirate_from("big_tubes", 0, 0, volume_uL=100.0),
+           "aspirating from the 1.5 mL tube should refuse while its work Z is null")
+
+
+def test_plate_depths_are_measured_and_ordered():
+    """work must sit above the well floor, and bottom is a limit not a target."""
+    e = eff_mod.load("p300")
+    plate = e.spec["z_for_labware"]["sbs_96_wellplate"]
+    check(plate["work"] == 53.5, f"plate work should be 53.5, got {plate['work']}")
+    check(plate["bottom"] == 60.8,
+          f"plate bottom should be 60.8, got {plate['bottom']}")
+    # +Z is DOWN, so the dispense depth must be a SMALLER number than the floor.
+    check(plate["work"] < plate["bottom"],
+          "the dispense depth must be above the well floor")
+    check(plate["bottom"] - plate["work"] > 5.0,
+          f"only {plate['bottom'] - plate['work']} mm of clearance above the floor")
+    # And the floor itself must be reachable at all.
+    from lab.simulate import Simulator
+    sim = Simulator(Deck.load(), e)
+    limit, missing = sim.effective_z_limit(tip_fitted=True)
+    check(not missing and plate["bottom"] < limit,
+          f"the plate floor {plate['bottom']} must be above the tipped stage "
+          f"limit {limit}")
+
+
+def test_well_bottom_crash_is_enforced_from_the_effector_table():
+    """The limit is tip-dependent, so it cannot live in labware.json."""
     m = _machine()
     m.startup()
     m.get_tip()
     m.aspirate_uL(100.0)
-    raises(EffectorError, lambda: m.dispense("plate1", 3, 5),
-           "dispensing into the plate should refuse while its Z is null")
+    m.goto_placement("plate1", 3, 5)
+    # 61.0 is past the measured 60.8 well floor.
+    raises(SimulationError, lambda: m._move_z(61.0, 600, "probe",
+                                              labware="sbs_96_wellplate"),
+           "descending past the plate's well floor should be blocked")
 
 
 def test_aspirate_from_reaches_the_well():
@@ -756,9 +810,10 @@ def test_aspirate_from_refuses_bad_state():
                "an out-of-range well should raise")
 
 
-def test_mix_cycles_at_the_bottom():
+def test_mix_cycles_at_the_mix_depth():
+    """Three distinct depths: work to dispense, mix to stir, bottom to avoid."""
     with _WithConfig(_p300_with_z(
-            tube_rack_1p5={"work": 45.0, "bottom": 55.0})):
+            tube_rack_1p5={"work": 40.0, "mix": 45.0, "bottom": 55.0})):
         m = _machine()
         m.startup()
         m.get_tip()
@@ -774,16 +829,19 @@ def test_mix_cycles_at_the_bottom():
         check(m.fluid_uL == 0.0,
               f"a mix must not leave fluid held, got {m.fluid_uL}")
 
-        # Every cycle must happen at the BOTTOM Z, deeper than the work Z.
+        # Every cycle happens at the MIX Z: deeper than work, above the floor.
         at = {s.to[2] for s in m.steps[n:]
               if s.kind == "move" and s.axes == "Z"}
-        check(55.0 in at, f"should have descended to the bottom Z 55.0, got {at}")
-        check(55.0 > 45.0, "bottom must be deeper than work (+Z is down)")
+        check(45.0 in at, f"should have descended to the mix Z 45.0, got {at}")
+        check(55.0 not in at,
+              "must NOT descend to the well bottom - that is a crash limit")
+        # +Z is down, so deeper is a larger number.
+        check(40.0 < 45.0 < 55.0, "work < mix < bottom, shallowest first")
 
 
 def test_mix_refuses_bad_state():
     with _WithConfig(_p300_with_z(
-            tube_rack_1p5={"work": 45.0, "bottom": 55.0})):
+            tube_rack_1p5={"work": 40.0, "mix": 45.0, "bottom": 55.0})):
         m = _machine()
         m.startup()
         m.get_tip()
@@ -811,9 +869,8 @@ def test_goto_well_honours_approach_order():
 
 
 def test_centrifuge_protocol_balances_the_plates():
-    with _WithConfig(_p300_with_z(
-            sbs_96_wellplate={"work": 55.0},
-            tube_rack_1p5={"work": 45.0, "bottom": 55.0})):
+    # Only the tube's work Z is still unmeasured; the rest is the real config.
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 40.0})):
         import importlib
         import centrifuge_test
         importlib.reload(centrifuge_test)
@@ -838,12 +895,15 @@ def test_centrifuge_protocol_balances_the_plates():
               f"both plates should use D6 and E7, got {wells}")
         check(m.toggles["tube_contents_at_end_uL"] == 100.0,
               "the tube should finish with 100 uL")
+        check(m.toggles["eject_tip"], "the tip should be ejected by default")
+        check(not m.tip_fitted, "the run should end with no tip fitted")
+        homes = [s for s in m.steps if s.kind == "home"]
+        check(any(s.detail.get("reason") == "post-ejection" for s in homes),
+              "the ejection must be followed by a G28, which returns home")
 
 
 def test_centrifuge_protocol_checks_its_own_arithmetic():
-    with _WithConfig(_p300_with_z(
-            sbs_96_wellplate={"work": 55.0},
-            tube_rack_1p5={"work": 45.0, "bottom": 55.0})):
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 40.0})):
         import importlib
         import centrifuge_test
         importlib.reload(centrifuge_test)

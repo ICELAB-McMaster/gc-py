@@ -116,15 +116,11 @@
       "grid_centered_note": "14.38 + 11*9/2 = 63.88 = 127.76/2 and 11.24 + 7*9/2 = 42.74 = 85.48/2, so A1-from-centre is derivable from the grid span. Placement may still override with a1_from_center.",
       "z": {
         "top": null,
-        "work": null,
-        "bottom": null,
-        "top_note": "Unmeasured. Note that deck z.slot_edge_with_p300_tip (53.0) is currently the binding traverse constraint - the raised location edges. This rim only matters if the labware stands HIGHER than those edges, i.e. would be hit at a Z below 53 with a tip fitted."
+        "note": "Working and crash depths are per-effector and live in effectors/*.json -> z_for_labware, because the commanded Z at which a tip reaches a well floor depends on the tip. For p300 with a 300 uL tip: work 53.5, bottom 60.8."
       },
       "note": "Not used by any current protocol. Included as a standard definition.",
       "uncalibrated": [
         "height_mm",
-        "z.work",
-        "z.bottom",
         "z.top"
       ],
       "height_mm": null,
