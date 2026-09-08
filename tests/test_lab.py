@@ -701,34 +701,48 @@ def test_plates_resolve_in_slots_1_and_2():
                   f"{name} well {well} at X {x} is inside the keep-out band")
 
 
-def test_unmeasured_depths_refuse_rather_than_guess():
-    """A null depth refuses rather than guessing. The refusal IS the feature.
+def test_a_null_commanded_depth_refuses_rather_than_guessing():
+    """A null COMMANDED depth must stop the run; a null crash LIMIT must warn.
 
-    The plate depths are measured now, so the one still null is the 1.5 mL
-    tube's `work`. When that is supplied this test must be re-pointed again -
-    or, better, deleted once nothing is null.
+    That distinction is the whole design: descending to a depth nobody measured
+    is a crash, whereas not knowing where the floor is only means the check
+    cannot be evaluated. Every commanded depth is measured now, so this proves
+    both halves - the refusal against a deliberately blanked config, and the
+    warning against the real one.
     """
     e = eff_mod.load("p300")
-    still_null = [
+
+    # Nothing the protocols command may be null any more.
+    null_commanded = [
         (lid, key)
         for lid, entry in e.spec["z_for_labware"].items()
-        for key in ("work", "mix", "bottom")
+        for key in ("work", "mix")
         if key in entry and entry[key] is None
     ]
-    check(still_null,
-          "this test needs at least one null depth to exercise; if every depth "
-          "is measured, delete it")
+    check(not null_commanded,
+          f"these commanded depths are still null and would block a run: "
+          f"{null_commanded}")
 
-    lid, key = still_null[0]
-    raises(EffectorError, lambda: e.z_for(lid, key),
-           f"z_for({lid!r}, {key!r}) should refuse while it is null")
+    # The refusal still works: blank one out and it stops the run.
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": None})):
+        m = _machine()
+        m.startup()
+        m.get_tip()
+        raises(EffectorError,
+               lambda: m.aspirate_from("big_tubes", 0, 0, volume_uL=100.0),
+               "a null work Z should refuse rather than pick a depth")
 
+    # The tube floor is unmeasured, and that WARNS instead of blocking.
+    check(e.spec["z_for_labware"]["tube_rack_1p5"].get("bottom") is None,
+          "this test assumes the 1.5 mL tube floor is still unmeasured")
     m = _machine()
     m.startup()
     m.get_tip()
-    raises(EffectorError,
-           lambda: m.aspirate_from("big_tubes", 0, 0, volume_uL=100.0),
-           "aspirating from the 1.5 mL tube should refuse while its work Z is null")
+    m.aspirate_from("big_tubes", 0, 0, volume_uL=100.0)
+    check(any("well-bottom crash for tube_rack_1p5" in w
+              for w in m.sim.report.warnings),
+          f"an unmeasured floor should warn, not pass silently: "
+          f"{m.sim.report.warnings}")
 
 
 def test_plate_depths_are_measured_and_ordered():
