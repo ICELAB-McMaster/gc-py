@@ -73,12 +73,11 @@
       "note": "Measured 2026-09-08 with a 300 uL tip fitted. 'work' 53.5 is the dispense depth, about halfway down a well. 'bottom' 60.8 is the well floor - a CRASH LIMIT the machine must never reach, not somewhere to aim; the simulator fails any move deeper than it. Dispensing therefore sits 7.3 mm above the floor. Note 53.5 is 0.5 mm deeper than the raised-edge limit of 53.0, which is fine inside a location - the checks forbid crossing a location boundary at that depth, not being there."
     },
     "tube_rack_1p5": {
-      "work": null,
+      "work": 35.0,
+      "mix": 45.0,
       "bottom": null,
       "uncalibrated": true,
-      "note": "'work' and 'bottom' are still UNMEASURED. 'work' is the dispense and aspirate depth in a 1.5 mL tube; 'bottom' is the tube floor, a crash limit. 'mix' 45.0 is measured. Effector.z_for raises naming a null field, so protocols/centrifuge_test.py still refuses until 'work' is supplied.",
-      "mix": 45.0,
-      "mix_note": "Measured 2026-09-08 with a 300 uL tip fitted. The depth Machine.mix cycles the plunger at. Deliberately a separate number from 'work' (dispense) and 'bottom' (crash limit)."
+      "note": "Measured 2026-09-08 with a 300 uL tip fitted. 'work' 35.0 is the dispense and aspirate depth, 'mix' 45.0 is where Machine.mix cycles - 10 mm deeper, so a mix reaches under the liquid it is stirring rather than skimming the surface. 'bottom', the tube floor, is still UNMEASURED; that one only warns, because a crash LIMIT being unknown is not the same as a commanded depth being unknown."
     }
   },
   "feedrates": {
@@ -86,7 +85,6 @@
   },
   "uncalibrated": [
     "z_for_labware.tube_rack_0p65_5x10.work",
-    "z_for_labware.tube_rack_1p5.work",
     "z_for_labware.tube_rack_1p5.bottom"
   ]
 }

@@ -94,7 +94,7 @@
   "open_questions": [
     "Which tiprack corner is A1 - the three measured corners fix the grid but not the labelling.",
     "Which X edge of the tiprack is the post-pickup exit (toward X 18 or X 118).",
-    "Dispense Z for sbs_96_wellplate and for tube_rack_1p5, plus the BOTTOM Z in the 1.5 mL tube that protocols/centrifuge_test.py mixes at. All three are null in config/effectors/p300.json, so that protocol refuses to generate.",
-    "Do any of the loaded racks or plates stand HIGHER than the raised location edges? The edge limit (Z 53 with a 300 uL tip) is the binding traverse constraint, but sbs_96_wellplate has no height_mm so it cannot be checked."
+    "Do any of the loaded racks or plates stand HIGHER than the raised location edges? The edge limit (Z 53 with a 300 uL tip) is the binding traverse constraint, but sbs_96_wellplate has no height_mm so it cannot be checked.",
+    "The BOTTOM Z in the 1.5 mL tube is still unmeasured, so the well-floor crash check there only warns. The plate's floor (60.8) and both dispense depths are measured."
   ]
 }
