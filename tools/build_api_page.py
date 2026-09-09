@@ -81,7 +81,7 @@ def convert(md: str):
                 out.append(f'<h{lvl} id="{sid}">'
                            f'<a class="anchor" href="#{sid}" aria-label="link">#</a>'
                            f'{inline(txt)}</h{lvl}>')
-            if lvl in (2, 3):
+            if lvl in (2, 3, 4):
                 toc.append((lvl, sid, txt))
             i += 1
             continue
@@ -162,6 +162,10 @@ BODY, TOC = convert(MD)
 FLOW = ["lab/config.py", "lab/labware.py", "lab/effector.py", "lab/deck.py",
         "lab/machine.py", "lab/simulate.py", "lab/logbook.py"]
 
+# A module is an h2 and its members are h3 - except lab/machine.py, which
+# is large enough to group 48 members under h3 section headings and put the
+# members at h4. Both shapes flatten into one nav list, with an h3 that has
+# h4 children carried as a group label so the grouping survives.
 modules, current = [], None
 for lvl, sid, txt in TOC:
     bare = txt.strip("`")
@@ -170,7 +174,13 @@ for lvl, sid, txt in TOC:
                    "is_module": bare in FLOW}
         modules.append(current)
     elif current is not None:
-        current["fns"].append((sid, bare))
+        current["fns"].append([sid, bare, lvl, False])
+
+# An h3 is a group label only where an h4 actually follows it.
+for mod in modules:
+    for i, entry in enumerate(mod["fns"]):
+        rest = mod["fns"][i + 1:]
+        entry[3] = entry[2] == 3 and bool(rest) and rest[0][2] == 4
 
 nav = []
 step = 0
@@ -180,19 +190,32 @@ for mod in modules:
     if mod["is_module"]:
         step += 1
         marker = f'<span class="flow-step">{step}</span>'
-    count = (f'<span class="fn-count">{len(mod["fns"])}</span>'
-             if mod["fns"] else "")
+    members = [e for e in mod["fns"] if not e[3]]
+    count = (f'<span class="fn-count">{len(members)}</span>'
+             if members else "")
     nav.append(f'<li class="{cls}">{marker}'
                f'<a href="#{mod["id"]}"><span>{html.escape(mod["label"])}</span>'
                f'{count}</a>')
     if mod["fns"]:
-        nav.append('<ul class="nav-fns">' + "".join(
-            f'<li><a href="#{sid}"><code>{html.escape(label)}</code></a></li>'
-            for sid, label in mod["fns"]) + "</ul>")
+        items = []
+        for sid, label, _lvl, is_group in mod["fns"]:
+            if is_group:
+                items.append(f'<li class="nav-group">'
+                             f'<a href="#{sid}">{html.escape(label)}</a>'
+                             f'</li>')
+            else:
+                items.append(f'<li><a href="#{sid}">'
+                             f'<code>{html.escape(label)}</code></a></li>')
+        nav.append('<ul class="nav-fns">' + "".join(items) + "</ul>")
     nav.append("</li>")
 NAV = "\n".join(nav)
 
-n_fns = sum(len(m["fns"]) for m in modules)
+n_fns = sum(1 for m in modules for e in m["fns"] if not e[3])
+
+# Count tests from the suites themselves; a hardcoded 66 was already stale.
+N_TESTS = sum(
+    len(re.findall(r"^def (test_\w+)", open(f, encoding="utf-8").read(), re.M))
+    for f in ("tests/test_lab.py", "tests/test_review_fixes.py"))
 
 CSS = """
 :root {
@@ -333,6 +356,13 @@ h1 code { font-size:.86em; background:none; padding:0; color:var(--accent); }
   color:var(--ink-faint); font-variant-numeric:tabular-nums;
 }
 .nav-fns { margin:0 0 10px; padding:0 0 0 26px; }
+.nav-group { margin:7px 0 1px; }
+.nav-group a {
+  display:block; padding:2px 8px; text-decoration:none; font-weight:600;
+  font-size:10px; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--ink-faint);
+}
+.nav-group a:hover { color:var(--accent); }
 .nav-fns li { margin:0; }
 .nav-fns a {
   display:block; text-decoration:none; padding:2.5px 0 2.5px 10px;
@@ -472,8 +502,8 @@ HTML = f"""<title>lab API Reference</title>
       prevent.</p>
       <ul class="stats">
         <li><b>{n_fns}</b>functions</li>
-        <li><b>7</b>modules</li>
-        <li><b>66</b>tests</li>
+        <li><b>{len(FLOW)}</b>modules</li>
+        <li><b>{N_TESTS}</b>tests</li>
       </ul>
     </div>
     <div class="zcard">

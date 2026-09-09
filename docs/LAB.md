@@ -72,6 +72,7 @@ python protocols/accuracy_test.py --effector p300 --outdir out
 | Plunger POS stays in `[pos_min + stroke_margin, blowout_pos]` | `Pipette.check_pos` |
 | `goto()` is the only public XY move, and it lifts to travel height first | `Machine.goto` |
 | Y motion never happens inside a keep-out band | `Machine._route_xy` |
+| A fitted tip is never routed over the tip rack | `Deck.no_fly_rects` |
 | A traverse must clear every loaded labware along the whole swept path | `Simulator._check_traverse_clearance` |
 | Tips are consumed edge-first, and a used position is never revisited | `Machine._next_free_tip_col` |
 | After a tip pickup, the exit is X-first over already-consumed positions | `Machine._exit_tip_box` |
@@ -86,6 +87,28 @@ The keep-out exemption is carried **per step**, not per operation: only the
 waypoints that actually engage the ejector are exempt, so the approach and
 retract that surround them are checked like any other traverse. Naming an
 operation `eject_tip` buys nothing.
+
+## Never fly over the tip rack
+
+The tips stand upright well above the rack body, and a fitted tip hangs 52.25 mm
+below the nosecone. So crossing the rack with a tip on shears it off, and
+**travelling higher does not help** - it is not a Z problem. The rack carries
+`avoid_traverse: true`, and two things act on it:
+
+* `Machine._route_xy` routes around it. It is candidate-based: the preferred
+  axis order, then the other order, then X doglegs, then Y doglegs, and it takes
+  the first whose every leg is clear.
+* `Simulator` *fails* a tipped crossing rather than warning, so a hand-rolled
+  move cannot bypass the router.
+
+Y doglegs earn their place on their own. When both ends of a move sit inside the
+rack's Y span - dispensing into plate 1 straight after a pickup is exactly that -
+no axis order and no X dogleg can get there. The only route is Y clear of the
+rack, X across, Y back.
+
+This was found on hardware. The water station at X 70 sits *underneath* the rack
+in X, so every unrouted approach to water from a high Y ran straight through it:
+six colliding legs in one run, all at travel height.
 
 ## Conventions that read backwards
 

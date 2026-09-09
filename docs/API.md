@@ -1,9 +1,9 @@
 # `lab` API reference
 
-Every public function in the library, what it does, what it raises, and - the
+Every public function in the library: what it does, what it raises, and - the
 part worth reading - what mistake it exists to prevent.
 
-Generated from the source on 2026-08-26. If the code and this file disagree,
+Regenerated from the source on 2026-09-08. If the code and this file disagree,
 the code is right and this file is stale; `tests/test_lab.py` and
 `tests/test_review_fixes.py` are the executable version of the same claims.
 
@@ -27,7 +27,10 @@ directly above them.
 
 **A check that cannot be evaluated is not a pass.** Where a measurement is
 missing, the simulator records an explicit `cannot check ...` warning and puts
-it in the run manifest. Silence always means checked.
+it in the run manifest. Silence always means checked. One refinement worth
+knowing: a null *commanded depth* stops the run, because descending somewhere
+nobody measured is a crash; a null *crash limit* only warns, because not knowing
+where a floor is means the check cannot be evaluated.
 
 ## The shape of it
 
@@ -36,6 +39,7 @@ config/                     data, no logic
   deck.json                 envelope, slots, stations, keep-outs, Z references
   labware.json              labware geometry and height - slot-independent
   layout.json               what is loaded where, right now
+  layout_test.json          fixture for the test suite: everything at once
   effectors/<id>.json       one file per end effector
 
 lab/
@@ -46,6 +50,10 @@ lab/
   machine.py                the object a protocol drives
   simulate.py               every safety check, run as the gcode is generated
   logbook.py                run manifest + balance CSV
+
+protocols/
+  accuracy_test.py          ISO 8655 accuracy/repeatability, any pipette
+  centrifuge_test.py        two plates loaded to equal mass for a centrifuge
 ```
 
 Data flows one way: `config` -> `labware`/`effector` -> `deck` -> `machine`,
@@ -58,18 +66,37 @@ the result. Nothing below `machine` knows gcode exists.
 from lab.machine import Machine
 
 m = Machine(effector="p300", name="my_protocol")
-m.startup()                        # home Z, home XY, home actuator, prime, lift
-m.get_tip()                        # next unused tip, edge-first
-m.prewet()                         # only if the effector config enables it
-m.aspirate_uL(150.0)               # microlitres, always
-m.dispense("tubes", row=0, col=0)  # a placement name from layout.json
-m.eject_tip()
+m.startup()                              # home, prime the plunger, lift
+m.get_tip()                              # next unused tip, edge-first
+m.prewet(3)                              # only if the effector config enables it
+
+m.aspirate_uL(150.0)                     # from the water station
+m.dispense("plate1", row=3, col=5)       # a placement name from layout.json
+
+m.aspirate_from("big_tubes", 0, 0, 100.0)   # or from a WELL
+m.mix("big_tubes", 0, 0, cycles=5, volume_uL=200.0)
+
+m.eject_tip()                            # forces a G28, which returns home
 m.park()
-result = m.finalize(outdir="out")  # simulates, THEN writes
+result = m.finalize(outdir="out")        # simulates, THEN writes
 ```
 
 `finalize()` runs the whole-run checks and refuses to write the `.gcode` if any
-hard check fails, so a failed run leaves nothing behind to run by accident.
+hard check fails, so a failed run leaves nothing behind to execute by accident.
+
+## The three per-labware depths
+
+Every effector records up to three commanded Z values per labware, shallowest
+first. They are separate numbers on purpose:
+
+| key | meaning | p300 + 300 uL tip |
+|---|---|---|
+| `work` | dispense and aspirate depth | plate 53.5, 1.5 mL tube 35.0 |
+| `mix` | where `Machine.mix` cycles the plunger | 1.5 mL tube 45.0 |
+| `bottom` | the well floor. A LIMIT, never a target | plate 60.8 |
+
+Aiming a mix at `bottom` would drive the tip into the floor, which is why it is
+not the mix key.
 
 ## Errors
 
@@ -79,7 +106,7 @@ protocol catches one class:
 | class | raised when |
 |---|---|
 | `LabError` | base; catch this |
-| `EffectorError` | the effector cannot do what was asked |
+| `EffectorError` | the effector cannot do what was asked, or a depth is null |
 | `VolumeError` | volume outside the calibration window or the available stroke |
 | `DeckError` | the config cannot describe the deck, or a lookup missed |
 | `ProtocolError` | the protocol asked for something illegal in sequence |
@@ -89,830 +116,913 @@ protocol catches one class:
 
 ## `lab/config.py`
 
-Config discovery, loading and hashing. Every path resolves against the location of `config.py` itself (`_REPO_ROOT = Path(__file__).resolve().parent.parent`, so the repo root, and `_DEFAULT_CONFIG_DIR = <repo>/config`), never against the working directory, so `python protocols/accuracy_test.py` behaves the same from the repo root, from `protocols/`, or from a cron job with an arbitrary cwd. The other half of the module's job is provenance: a loaded config carries the SHA-256 of the exact bytes it came from, so a generated `.gcode` can always be traced back to the deck geometry that produced it.
+Config discovery, loading and hashing. Every path resolves against the location of `config.py` itself (`_REPO_ROOT = <repo>/`, so `_DEFAULT_CONFIG_DIR = <repo>/config`), never against the working directory, so `python protocols/accuracy_test.py` behaves identically from the repo root, from `protocols/`, or from a scheduler. The whole module is data access: no geometry, no defaults, no repair of bad config. The one piece of policy it enforces is that every load records the SHA-256 of the exact bytes read, so a generated `.gcode` can be traced back to the config that produced it.
 
-The four files this module knows about are `deck.json` (envelope, slot centres, stations, keep-outs, Z references), `labware.json` (slot-independent geometry), `layout.json` (what is loaded right now) and `effectors/<id>.json` (one file per end effector).
+Layer position: this is the bottom. `lab/deck.py`, `lab/effector.py` and the tests all obtain their JSON through here; nothing here imports anything else from `lab/`.
 
-### `config_dir() -> Path`
+### `config_dir()`
 
-Returns the directory holding `deck.json` / `labware.json` / `layout.json` / `effectors/`.
+```python
+def config_dir() -> Path
+```
 
-- Parameters: none.
-- Returns: the `LAB_CONFIG` environment variable if set (after `expanduser()` and `resolve()`), otherwise `<repo>/config`.
-- Raises: `FileNotFoundError` if `LAB_CONFIG` is set but does not point at a directory. It fails loudly rather than silently falling back to the in-repo config, because silently generating gcode from the wrong deck is the failure mode that matters.
-- Why: it is the single override point for running against an alternate deck. `tests/test_review_fixes.py` uses it heavily: it copies the real config into a temp dir, nulls out one measured Z or one geometry field, points `LAB_CONFIG` at the copy, and checks that the library refuses to emit motion. The env var is re-read on every call and nothing is cached, so a test that flips `LAB_CONFIG` mid-process affects only loads made after the flip.
+Returns the directory holding `deck.json`, `labware.json`, `layout.json` and `effectors/`.
 
-### `repo_root() -> Path`
+- No parameters.
+- **Returns:** an absolute `Path`. `$LAB_CONFIG` if that environment variable is set (expanded with `~` and resolved), otherwise `<repo>/config`.
+- **Raises:** `FileNotFoundError` if `LAB_CONFIG` is set but does not name an existing directory. The message quotes the resolved path.
 
-Returns the repository root (the parent of `lab/`).
+**Why it exists:** it is the single seam that lets a test point the whole library at a temp directory. Both test files use exactly this pattern - copy `config/*.json` plus `config/effectors/` to a temp dir, mutate one field, set `os.environ["LAB_CONFIG"]`, run, restore the old value in a `finally` (`tests/test_review_fixes.py` `_config_without`, `tests/test_lab.py` `_p300_with_z` / `_WithConfig`). Failing loudly on a bad `LAB_CONFIG` rather than silently falling back to `<repo>/config` is deliberate: a silent fallback would make a test that thinks it removed a measurement actually assert against the real bench.
 
-- Parameters: none.
-- Returns: `Path` to the repo root. Never raises.
-- Why: `Machine.git_commit()` and `Machine.git_dirty()` run `git rev-parse HEAD` and `git status --porcelain` with `cwd=str(config.repo_root())`. Without this the provenance block in the run manifest would describe whatever repository the operator's shell happened to be sitting in, or nothing at all.
+**Note:** the env var is read on every call, not cached. `Deck.load()` therefore picks up a mid-process change, which is what makes `_WithConfig` work as a context manager - but it also means a long-lived object holding a `Path` from an earlier call can disagree with a later one.
 
-### `config_path(*parts: str) -> Path`
+### `repo_root()`
 
-Joins path components onto `config_dir()`.
+```python
+def repo_root() -> Path
+```
 
-- `*parts`: path components, e.g. `config_path("effectors", "p300.json")`.
-- Returns: the joined `Path`. Does not check existence; propagates `FileNotFoundError` from `config_dir()` if `LAB_CONFIG` is bad.
+Returns the repository root, `Path(__file__).resolve().parent.parent`.
 
-### `sha256_of(path: Path) -> str`
+- No parameters. Returns an absolute `Path`. Raises nothing.
+
+**Why it exists:** `Machine.git_commit()` and `Machine.git_dirty()` run `git rev-parse HEAD` / `git status` with `cwd=str(config.repo_root())` so the manifest records the commit of *this* library regardless of where the protocol was invoked from. Unlike `config_dir()`, this is not overridable - it is the code's location, not the data's.
+
+### `config_path(*parts)`
+
+```python
+def config_path(*parts: str) -> Path
+```
+
+Joins path segments onto `config_dir()`.
+
+- `*parts`: path segments, e.g. `config_path("effectors", "p300.json")`.
+- **Returns:** a `Path`. Does not check existence.
+- **Raises:** whatever `config_dir()` raises.
+
+**Why it exists:** so callers never build config paths by string concatenation and never bake in `"config/"`. Used directly by the tests to enumerate the effector directory (`cfgmod.config_path("effectors").glob("*.json")`).
+
+### `sha256_of(path)`
+
+```python
+def sha256_of(path: Path) -> str
+```
 
 Hex SHA-256 of a file's bytes.
 
 - `path`: file to hash.
-- Returns: 64-character lowercase hex digest.
-- Raises: whatever `read_bytes()` raises (`FileNotFoundError`, `PermissionError`).
-- **Note:** no caller in the repo uses this. `ConfigFile.__init__` hashes inline off the bytes it already read, which avoids a second read and guarantees the hash matches the parsed data. Treat `sha256_of` as a convenience for hashing something that is not a `ConfigFile` (a gcode file, say), and prefer `ConfigFile.sha256` for configs.
+- **Returns:** 64-character lower-case hex digest.
+- **Raises:** `OSError` / `FileNotFoundError` from `read_bytes` if the file is missing or unreadable.
+
+**Why it exists:** provenance for a file that is not loaded as a `ConfigFile` (a calibration CSV, a reference `.gcode`).
+
+**Note:** nothing in `lab/`, `protocols/`, `tools/` or `tests/` currently calls it - `ConfigFile` hashes inline in its constructor rather than delegating here. It is a public helper with no in-tree caller; do not assume it is exercised by the test suite.
 
 ### `class ConfigFile`
 
-A loaded JSON config plus the hash of the bytes it came from. Uses `__slots__ = ("path", "data", "sha256")`, so you cannot attach extra attributes to an instance (`AttributeError`).
+A loaded JSON config plus the SHA-256 of the bytes it came from. `__slots__ = ("path", "data", "sha256")`, so it holds no other state and accepts no extra attributes.
 
 Attributes:
 
-- `path: Path` - where it was read from. `lab/logbook.py` reports `machine.deck.deck_cfg.path.parent` as the run's `config_dir`, and `Machine.config_hashes()` uses `Path(layout_cfg.path).name` as the manifest key, so a non-default layout file is named in the manifest rather than being flattened to "layout.json".
-- `data: Any` - the parsed JSON (a dict for every config in this repo).
-- `sha256: str` - hex digest of the raw bytes.
+- `path` (`Path`): the file it was read from.
+- `data` (`dict`): the parsed JSON.
+- `sha256` (`str`): hex digest of the raw bytes, computed **before** decoding, so it is the hash of what is on disk byte for byte.
 
-Why the class exists rather than a bare `json.load`: the hash and the data cannot drift apart, because both come from one `read_bytes()`. `Machine.config_hashes()` emits four entries (`deck.json`, `labware.json`, the layout file's real name, and `effectors/<id>.json`) into the manifest's provenance block. A gcode file plus that manifest fully determines the geometry it was generated from.
+**Why it exists:** the hash and the data must not be able to drift apart. Reading the bytes once and deriving both from that single `read_bytes()` means the manifest's `provenance.config_sha256` cannot name a version of the file that was not the one used. `Machine.config_hashes()` assembles exactly four entries from these - `deck.json`, `labware.json`, the layout file under its own name, and `effectors/<id>.json` - and `tests/test_lab.py` asserts `len(man["provenance"]["config_sha256"]) == 4`.
 
-### `ConfigFile.__init__(self, path: Path) -> None`
+#### `ConfigFile.__init__(path)`
 
-Reads, hashes and parses one JSON config.
+```python
+def __init__(self, path: Path) -> None
+```
 
-- `path`: file to load.
-- Raises: `FileNotFoundError` if `path` is not a file, with a three-line message that names the file, the current `config_dir()` and the `LAB_CONFIG` override - written that way because "file not found" on a path resolved relative to a module is otherwise very hard for an operator to act on. `ValueError` (chained from `json.JSONDecodeError`) if the bytes are not valid JSON, naming the file and the parse position. A file that is not valid UTF-8 raises `UnicodeDecodeError` from `raw.decode("utf-8")` and is not wrapped.
+- `path`: the JSON file to load. No units.
+- **Raises:** `FileNotFoundError` if `path` is not an existing file; the message also prints the current `config_dir()` and suggests setting `LAB_CONFIG`, because the usual cause is pointing at the wrong config tree rather than a genuinely missing file. `ValueError` (chained from `json.JSONDecodeError`) if the bytes are not valid JSON, naming the file. `UnicodeDecodeError` if the file is not UTF-8 - decoding is explicitly `raw.decode("utf-8")`, not locale-dependent, which matters on this Windows box where the ambient codepage is `cp1252`.
 
-### `ConfigFile.__getitem__(self, key: str) -> Any`
+#### `ConfigFile.__getitem__(key)` / `get(key, default=None)` / `require(key)`
 
-Indexes into `data`. Raises the plain `KeyError` from the dict. Used for keys that must exist, e.g. `labware_cfg["labware"]` in `Deck.__init__`.
+```python
+def __getitem__(self, key: str) -> Any
+def get(self, key: str, default: Any = None) -> Any
+def require(self, key: str) -> Any
+```
 
-### `ConfigFile.get(self, key: str, default: Any = None) -> Any`
+Top-level key access only - none of the three descends into nested dicts.
 
-`data.get`. Used for optional top-level blocks, e.g. `layout_cfg.get("placements", [])` and `layout_cfg.get("open_questions", [])`, so a layout with no placements loads and produces an empty deck rather than an exception.
+- `__getitem__` raises `KeyError` with the bare key name (`cfg["slots"]`).
+- `get` returns `default` when absent.
+- `require` raises `KeyError` naming the file: `"deck.json is missing required key 'z'"`.
 
-### `ConfigFile.require(self, key: str) -> Any`
+**Why `require` exists:** the same failure with a filename attached. A bare `KeyError: 'z'` from deep inside `Deck.__init__` does not say which of four JSON files is short a key.
 
-Like `__getitem__` but raises `KeyError(f"{self.path.name} is missing required key {key!r}")`, i.e. the message names the file.
+**Note:** `require` has no in-tree caller; `Deck.__init__` uses plain `d["feedrates"]` / `d["z"]` subscripting and so produces the less helpful message. Prefer `require` in new code.
 
-- `key`: top-level key that must be present.
-- Returns: `data[key]`.
-- Raises: `KeyError` when absent.
-- **Note:** no caller uses this; every reader currently uses `[]` or `.get`. It is the better choice for required keys (a bare `KeyError: 'axes'` does not say which of four JSON files is missing `axes`), so prefer it in new code.
+#### `ConfigFile.__repr__()`
 
-### `ConfigFile.__repr__(self) -> str`
+`<ConfigFile p300.json sha=1a2b3c4d>` - basename plus the first 8 hex characters of the hash. Useful in a traceback for telling two config trees apart.
 
-`<ConfigFile deck.json sha=1a2b3c4d>` - filename plus the first 8 hex characters of the hash. Enough to tell two configs apart in a traceback or a log line without dumping the whole file.
+### `load(*parts)`
 
-### `load(*parts: str) -> ConfigFile`
+```python
+def load(*parts: str) -> ConfigFile
+```
 
-Loads `config_dir()/<parts...>` as a `ConfigFile`. Raises everything `ConfigFile.__init__` raises. The generic form; prefer the four named loaders below so the filenames live in one place.
+`ConfigFile(config_path(*parts))`. The generic loader the four named loaders below wrap. Raises whatever `ConfigFile.__init__` raises.
 
-### `load_deck() -> ConfigFile`
+### `load_deck()`, `load_labware()`, `load_layout(name)`, `load_effector_spec(effector_id)`
 
-Loads `deck.json`. No parameters.
+```python
+def load_deck() -> ConfigFile
+def load_labware() -> ConfigFile
+def load_layout(name: str = "layout.json") -> ConfigFile
+def load_effector_spec(effector_id: str) -> ConfigFile
+```
 
-### `load_labware() -> ConfigFile`
+The four config kinds, named so a caller never spells a filename.
 
-Loads `labware.json`. No parameters.
+- `load_deck()` -> `config/deck.json`: the machine frame. Envelope, `z` (`stage_surface` 114.75, `stage_surface_with_p300_tip` 62.5, `slot_edge_with_p300_tip` 53.0, `travel` 5.0), the nine `slots`, `stations`, `keepouts`, `klipper_macros`, `coordinate_frame`.
+- `load_labware()` -> `config/labware.json`: slot-independent geometry for every known labware.
+- `load_layout(name)` -> `config/<name>`; `.json` is appended if absent, so `load_layout("layout_test")` and `load_layout("layout_test.json")` are the same call. This is the per-run file - the tests pass `TEST_LAYOUT = "layout_test.json"` for behaviour and reserve the no-argument form for the handful of tests that deliberately assert the shipped bench.
+- `load_effector_spec(effector_id)` -> `config/effectors/<effector_id>.json`, e.g. `"p300"` -> the actuator limits, the calibration coefficients behind `d_mm = 0.0533 * V_uL + 0.122`, and `z_for_labware`.
+- All four raise `FileNotFoundError` / `ValueError` per `ConfigFile.__init__`.
 
-### `load_layout(name: str = "layout.json") -> ConfigFile`
+**Why one file per effector:** the per-labware working depths are a property of the *nosecone plus tip*, not of the labware, so they cannot live in `labware.json`. `sbs_96_wellplate` has `z.top: null` and a note pointing at `effectors/*.json -> z_for_labware`, where p300 carries plate `work` 53.5 and `bottom` 60.8. `tests/test_lab.py::test_well_bottom_crash_is_enforced_from_the_effector_table` pins that separation.
 
-Loads a layout file, appending `.json` if `name` does not already end in it.
+### `available_effectors()`
 
-- `name`: layout filename or bare stem. `load_layout("bench_2026_08")` and `load_layout("bench_2026_08.json")` are the same call.
-- Returns: `ConfigFile`. Raises `FileNotFoundError` / `ValueError` as above.
-- Why: layout is the per-run file (the current one is `id: "accuracy_bench_2026_08"`), so it is the one config an operator is expected to swap. Accepting the stem means `Deck.load(layout="...")` can be driven from a CLI argument without the caller remembering the extension.
+```python
+def available_effectors() -> Dict[str, Path]
+```
 
-### `load_effector_spec(effector_id: str) -> ConfigFile`
+Every effector JSON on disk, keyed by id (the filename stem).
 
-Loads `effectors/<effector_id>.json`.
+- No parameters.
+- **Returns:** `{"p125": Path(...), "p300": Path(...)}`, insertion-ordered by sorted filename. Returns `{}` - not an error - if `config/effectors/` does not exist.
+- Raises nothing beyond `config_dir()`'s `FileNotFoundError`.
 
-- `effector_id`: file stem, e.g. `"p300"`, `"p125"`, `"gripper"`.
-- Returns: `ConfigFile`. Raises `FileNotFoundError` if there is no such file.
-- Why: absolute working Z and the volume-to-displacement coefficients are effector properties, not labware properties - `p300` is `d = 0.0533*V + 0.122` and `p125` is `d = 0.1274*V + 0.049`, and a fitted 300 uL tip hangs 52.25 mm below the nosecone. Keeping one file per effector is what lets `labware.json` leave every absolute `z` null and point at `effectors/*.json -> z_for_labware`.
+**Why it exists:** so `--effector` is validated against what is actually installed and the error can list the real options. `lab/effector.py` uses it both for that check and for `list_effectors()`.
 
-### `available_effectors() -> Dict[str, Path]`
-
-Every effector JSON on disk, keyed by file stem.
-
-- Parameters: none.
-- Returns: `{stem: path}` from `sorted(dir.glob("*.json"))`; an empty dict if `config_dir()/effectors` does not exist. Never raises for a missing directory.
-- Why: it makes the effector set discoverable instead of hardcoded. `lab/effector.py` calls it twice: `load()` uses it to reject an unknown id with the actual list of available ones plus the filename to create, and `available()` returns `sorted(...)` for CLI help. Adding a pipette is a new JSON file, not a code change.
+---
 
 ## `lab/labware.py`
 
-Labware geometry and its placement on the deck. Geometry (rows, cols, pitch, well naming, physical height) is slot-independent and lives in `labware.json`; *where* a piece of labware sits lives in `layout.json`. This module joins the two and answers exactly one question: given a well, what are its machine coordinates?
+Labware geometry and its placement on the deck. `labware.json` says what a rack *is* (rows, cols, pitch, well naming, height, approach order); `layout.json` says where it *is* (slot, station, or a measured anchor). This module joins the two and answers exactly one question: given a well, what are its machine coordinates in XY? No Z, no motion, no gcode. Z belongs to the effector table; motion belongs to `lab/machine.py`.
 
-### The three vectors, and the two grid models
-
-Every placement, whatever it was measured or declared as, collapses to the same three vectors:
+The load-bearing idea: **every placement, whatever its grid model, reduces to the same three vectors.**
 
 ```
 xy(row, col) = origin + col * col_vec + row * row_vec
 ```
 
-`origin` is the machine XY of well `(0, 0)`, `col_vec` is the mm displacement per unit column index, and `row_vec` the mm displacement per unit row index. All the model-specific work happens once, in `build_placement`, and everything downstream (`Placement.xy`, the bounds and centre helpers, the simulator's traverse-clearance sweep, `tools/check_alignment.py`) sees only the vectors. That is why a 96-position tip rack solved from three measured corners, a 5x10 tube holder built from a nominal pitch, and a single-point water reservoir all cost the same two multiplies and two adds, and why nothing downstream contains an `if model ==` branch.
+`origin` is the centre of well (0, 0) in machine coordinates; `col_vec` is the XY step per column index; `row_vec` the step per row index. All three are already-rotated, already-signed millimetres. The three grid models differ only in how those vectors are obtained, and after `build_placement` returns, nothing downstream can tell which model was used:
 
-**`pitch`** - the labware states `pitch_x`, `pitch_y` and integer direction vectors `col_dir` / `row_dir`; the placement states where A1 is. The directions are per-labware on purpose: `tube_rack_0p65_5x10` has `col_dir: [-1, 0]` (column index runs toward *lower* X) while `sbs_96_wellplate` has `col_dir: [1, 0]`. There is no global convention to hardcode. Optional `rotation` (degrees CCW) is applied to both vectors.
+- **`pitch`** - `pitch_x`/`pitch_y` times integer `col_dir`/`row_dir` from `labware.json`, rotated by the placement's `rotation`, with the origin derived from a slot centre, a station, an `anchor_xy`, an `a1_from_center` override, or `a1_from_slot_edge` insets. Used by both tube holders and the 96-well plate.
+- **`corners`** - three measured well centres are solved for pitch *and* rotation. Used by the tip rack, because the real ClipTip pitch is `100.0 / 11 = 9.090909...` in X and `63.7 / 7 = 9.1` in Y, not the nominal 9.00. Assuming 9.00 accumulates about 1.0 mm by column 12, which is enough to miss a tip entirely.
+- **`single`** - a one-position station; both vectors are `(0, 0)`. Used by `reservoir_water`, whose stored `(70, 175)` is a dip point, not a trough centre.
 
-**`corners`** - the placement supplies three *measured well centres* (`origin`, `along_col`, `along_row`) and the module divides out the index spans to recover pitch and rotation together. For the loaded tip rack: `origin (18.0, 399.2)`, `along_col (118.0, 399.2)`, `along_row (18.0, 335.5)` over 12 columns and 8 rows gives `col_vec = (100.0/11, 0) = (9.090909..., 0.0)` and `row_vec = (0, -63.7/7) = (0.0, -9.1)`.
+Column senses are **per labware and must not be generalised.** `sbs_96_wellplate` and both tube holders have `col_dir: [-1, 0]` - increasing column index moves toward *lower* X, so A1 sits at the high-X, high-Y corner. The tip rack's solved `col_vec` runs the other way, toward *higher* X (origin X 18.0 to `along_col` X 118.0). `col_dir` on the plate was `[1, 0]` until 2026-09-08; that put A1 at the low-X end and displaced every well by the full 11 x 9 = 99 mm column span. It was caught only by the operator measuring plate1's A1 at (387, 399) against a prediction of (286.5, 396.5), and is now pinned by `tests/test_lab.py::test_plate_column_direction_runs_toward_low_x`.
 
-The corners model exists because the real tip pitch is **9.0909, not the nominal 9.00**. The error per column is only 0.09 mm, but it accumulates: `11 * 0.0909 = 1.0 mm` of X error by the last column, which is enough to miss a tip entirely. A pitch model with `pitch_x: 9.0` would place column 0 perfectly and column 11 at X 117.0 instead of 118.0. Measuring three corners also picks up any rack rotation for free, and the same measurement independently confirmed the coordinate frame: the solved grid centre X 68.0 against slot 3's centre X 65.0 is a 3.0 mm offset, consistent with a rack that is already in the post-shift frame, which is why the tip rack is on the `unaffected` list of the `+70` X correction while the tube rack's `anchor_xy` had to be moved from X 186 to X 256.
+### `_rotate(v, degrees)` (private)
 
-There is also a **`single`** model (`reservoir_water`): one position, `col_vec` and `row_vec` both `(0.0, 0.0)`, so the same arithmetic returns the origin for the only legal well.
+```python
+def _rotate(v: Vec2, degrees: float) -> Vec2
+```
 
-**Note:** `labware.json`'s `grid_models` documentation block now lists a third name, `a1_from_slot_edge`, alongside `pitch` and `corners`. It is not a grid model as far as this code is concerned - `build_placement` accepts only `pitch`, `corners` and `single`, and raises `ValueError: unknown grid model 'a1_from_slot_edge'` for anything else. It is an *anchoring* strategy read by `_resolve_origin`. The `tube_rack_1p5` entry does the right thing (`grid.model: "pitch"` with `a1_from_slot_edge` as a sibling of `grid`); do not copy the doc block's framing into a new labware's `model` field.
+Rotates an XY vector counter-clockwise about the origin.
 
-### `_rotate(v: Vec2, degrees: float) -> Vec2` (private)
+- `v`: `(x, y)` in mm.
+- `degrees`: CCW degrees; reduced modulo 360.
+- **Returns:** the rotated `(x, y)` in mm.
+- Raises nothing.
 
-Rotates a vector CCW about the origin, special-casing 0/90/180/270 as exact integer swaps before falling back to `math.cos`/`math.sin`.
+0/90/180/270 are handled by exact integer swaps and sign flips rather than `cos`/`sin`, so a quarter-turn rack keeps its pitch to the last decimal instead of picking up `1e-16` dirt that then shows up in a coordinate diff. Other angles fall through to `math.radians` and trigonometry.
 
-The special cases are not an optimisation. `math.cos(math.radians(90))` is `6.12e-17`, so the generic path would give a 12.0 mm column vector a Y component of `7.3e-16`, and `col_x_values()` would start reporting `255.99999999999997` instead of `256.0` - which then breaks the exact-equality assertions in `tests/test_lab.py` and makes diffs of generated gcode unreadable. Called only from the `pitch` branch of `build_placement`. Protocol authors should never call it.
+Protocol authors should never call this. It exists only for the `pitch` model inside `build_placement`.
 
-### `well_name(row: int, col: int) -> str`
+### `well_name(row, col)`
 
-0-indexed `(row, col)` to an `'A1'` style label; row 0 is `A`, col 0 is `1`.
+```python
+def well_name(row: int, col: int) -> str
+```
 
-- `row`, `col`: 0-based indices (not mm).
-- Returns: e.g. `well_name(1, 2) == "B3"`.
-- Raises: `ValueError` if `row` is negative or `>= 26` ("row {row} has no single-letter name") - there is no `AA` naming.
-- Why: the 1-based-in-the-name, 0-based-in-code off-by-one is centralised here instead of being re-derived at each call site. It is the labelling used in the run manifest and by `tools/check_alignment.py` when it maps an old gcode coordinate back onto a named well, so a bug here would silently mislabel provenance rather than crash.
-- **Note:** `col` is not validated. `well_name(0, -1)` returns `"A0"`, and `parse_well("A0")` round-trips it back to `(0, -1)`, which only fails later at `check_well`. Also relevant: `tiprack_300_96.grid.a1_corner` is `"unconfirmed"` in `labware.json` - the three measured corners fix the grid but not which physical corner is called A1, so tip well *names* in a manifest are not yet trustworthy even though the coordinates are.
+0-indexed `(row, col)` to an `'A1'` style label. Row 0 is `A`, col 0 is `1`.
 
-### `parse_well(name: str) -> Tuple[int, int]`
+- `row`, `col`: 0-indexed integers, dimensionless.
+- **Returns:** e.g. `well_name(1, 2) == "B3"`.
+- **Raises:** `ValueError` if `row` is negative or past 25 ("row 26 has no single-letter name"). `col` is **not** range-checked here and is not checked against the labware at all - `well_name(0, 99)` cheerfully returns `"A100"`.
 
-`'B3'` to `(1, 2)`.
+**Why it exists:** so the operator-facing label is generated in exactly one place. It is what the manifest, the CSV and the alignment report show, and it is the only string an operator can cross-check against a physical rack. Imported by `lab/machine.py`, both protocols and `tools/check_alignment.py`.
 
-- `name`: well label; whitespace-stripped and upper-cased first, so `" b3 "` works.
-- Returns: `(row, col)`, both 0-based.
-- Raises: `ValueError` if shorter than 2 characters, if the first character is not alphabetic, or if the remainder is not all digits. A non-ASCII alphabetic first character (`"A1"` typed with a Cyrillic A) passes the `isalpha()` check and then raises `ValueError` from `string.ascii_uppercase.index` with a less helpful message.
-- Why: lets a protocol say `p.well("A1")` instead of `p.xy(0, 0)`. It does *not* bound-check against the actual labware - that is `Placement.check_well`'s job, reached via `Placement.xy`.
+**Note:** because it validates nothing about the actual labware, a label is not evidence the well exists. `Placement.check_well` is the check.
 
-### `class Labware` (frozen dataclass)
+### `parse_well(name)`
 
-Slot-independent geometry, straight out of `labware.json`. Fields: `id` (the key in the JSON's `labware` map, e.g. `"tiprack_300_96"`) and `spec` (the raw JSON subtree, kept whole so keys this class does not model are still reachable, as `Machine` does for `consume_order`).
+```python
+def parse_well(name: str) -> Tuple[int, int]
+```
 
-Frozen because `Deck.catalogue` holds one instance per labware type and shares it with every `Placement` of that type. If a placement could mutate it, moving one rack would silently change the geometry of another. All the accessors below are read-only views over `spec` with defaults, so a partially specified labware loads instead of raising at import time - the library's convention is to let unmeasured fields be `None` and refuse to emit *motion* later, not to refuse to *load*.
+Inverse of `well_name`: `'B3'` -> `(1, 2)`.
 
-### `Labware.display_name -> str`
+- `name`: a well label. Stripped and upper-cased first, so `" b3 "` works.
+- **Returns:** `(row, col)`, both 0-indexed.
+- **Raises:** `ValueError` if the string is shorter than 2 characters, does not start with a letter, or has a non-digit tail - so `"AA1"` and `"B"` are rejected. Multi-letter rows are not supported, matching `well_name`.
 
-`spec["display_name"]`, falling back to `id`. Human-facing strings only, e.g. `"300 uL ClipTip rack, 96 position"`.
+**Note:** `"A0"` parses to `(0, -1)` without complaint. A negative index is caught later by `Placement.check_well` (which requires `0 <= col`), so `Placement.well("A0")` does raise `IndexError` - but if you call `parse_well` directly, validate the result before using it as an index.
 
-### `Labware.type -> str`
+### `class Labware`
 
-`spec["type"]`, default `"unknown"`. One of `tube_rack`, `tiprack`, `wellplate`, `reservoir` in the current config. Categorical only; nothing dispatches motion on it.
+```python
+@dataclass(frozen=True)
+class Labware:
+    id: str
+    spec: Dict[str, Any]
+```
 
-### `Labware.grid -> Dict[str, Any]`
+Slot-independent geometry, straight out of `labware.json`. Frozen, and every accessor is a read-through to `spec`, so a `Labware` is a typed view over config rather than a parsed copy. Nothing here knows where the labware is.
 
-The raw `grid` block, or `{"model": "single", "rows": 1, "cols": 1}` if the labware has none. The default means a labware entry that forgot its grid behaves as a single-position station rather than crashing with a `KeyError` deep inside `_pitch_vectors`.
+`spec` is the raw dict, and anything without an accessor is read through it directly - which is how `avoid_traverse` is consumed (`lab/deck.py`: `p.labware.spec.get("avoid_traverse")`) and how the tests reach `a1_from_slot_edge` and `a1_from_center`.
 
-### `Labware.rows -> int` / `Labware.cols -> int`
+#### `Labware.display_name`
 
-`int(grid["rows"])` / `int(grid["cols"])`, default 1 each. `tube_rack_0p65_5x10` is 5 x 10, `tiprack_300_96` is 8 x 12, `tube_rack_1p5` is 3 x 7, `reservoir_water` is 1 x 1. These are the bounds `Placement.check_well` enforces and the spans `_corner_vectors` divides by, so an incorrect count corrupts the solved pitch rather than just the range check: `tube_rack_1p5` lists `grid.rows` and `grid.cols` in its own `uncalibrated` array precisely because they were derived from what fits a location, not stated by the operator.
+`spec["display_name"]`, falling back to `id`. Operator-facing, e.g. `"300 uL ClipTip rack, 96 position"`.
 
-### `Labware.model -> str`
+#### `Labware.type`
 
-`grid["model"]`, default `"single"`. See the grid-models section above for the three values `build_placement` accepts.
+`spec["type"]` or `"unknown"`. One of `tube_rack`, `tiprack`, `wellplate`, `reservoir` today. Descriptive; no code branches on it.
 
-### `Labware.footprint -> Optional[Vec2]`
+#### `Labware.grid`
 
-Physical outline `(width_mm, height_mm)`, or `None` when the labware has no `footprint` key or it is `null`.
+The `grid` block, or `{"model": "single", "rows": 1, "cols": 1}` if absent. The default is what lets a station labware omit the block entirely and still resolve.
 
-Only `sbs_96_wellplate` has one today: `[127.76, 85.48]`, the standard SBS outline. Both tube holders and the tip rack are `null`, which is why `Placement.footprint_bounds()` returns `None` for every currently loaded placement and the simulator downgrades its traverse-clearance check to well centres with a warning.
+#### `Labware.rows` / `Labware.cols`
 
-### `Labware.wipe -> Optional[Dict[str, Any]]`
+`int` of `grid["rows"]` / `grid["cols"]`, defaulting to 1. Dimensionless counts. 5 x 10 for the 0.65 mL holder, 8 x 12 for the tip rack and plate, 3 x 6 for the 1.5 mL holder.
 
-The wall-wipe parameters, or `None`.
+**Why the counts matter more than they look:** the 1.5 mL holder's 3 x 6 is *inferred*, not stated by the operator, and 6 was chosen as the fail-safe. A 7th column would sit at X 132.50, which is 0.25 mm inside the location's low-X edge at 132.25, so an 11 mm tube there would overhang into slot 6 by 5.25 mm. If the holder really has 7 columns, asking for column 6 raises a clear `IndexError`; the opposite mistake would drive a tip into empty space over a slot boundary. `grid.rows` and `grid.cols` are both listed in that labware's `uncalibrated`.
 
-For `tube_rack_0p65_5x10`: `{"dx": 3.2, "dz": 4.0, "feed": 1500, "uncalibrated": true}`. Consumed by `Machine`'s wall wipe, which steps `dx` sideways to contact the inner wall, moves `z_work - dz` (which is 4.0 mm *upward*, since +Z is down) to drag the droplet up, then returns. The physical constraint encoded in `dx`: it must be less than the tube inner radius, or the tip is driven into the wall rather than brushed against it. Both `dx` and `dz` are listed in the labware's `uncalibrated` array.
+#### `Labware.model`
 
-### `Labware.height_mm -> Optional[float]`
+`grid["model"]` or `"single"`. One of `"pitch"`, `"corners"`, `"single"`; `build_placement` raises on anything else.
 
-Physical height above the stage in mm, contents included when known: returns `height_with_contents_mm` if set, otherwise `height_mm`, otherwise `None`.
+#### `Labware.footprint`
 
-- Returns: `35.0` for the 0.65 mL holder, `45.0` for the 1.5 mL holder, `None` for the tip rack, the SBS plate and the reservoir.
-- Why a height and not a commanded Z: a height above the stage is independent of both the coordinate frame and the fitted effector, whereas a commanded Z is not. Travel Z is 5.0, so with a 300 uL tip fitted the orifice rides `114.75 - 52.25 - 5.0 = 57.5` mm above the stage; anything taller than 57.5 mm is struck at travel height. At 35.0 mm the 0.65 mL holder has 22.5 mm of headroom for tubes and caps, and the 1.5 mL holder has 12.5 mm. Storing `35.0` survives a change of pipette; storing "Z 57.5 is fine" would not.
-- **Note:** nothing calls this property yet. `lab/simulate.py`'s traverse-clearance check still reads `p.labware.z("top")`, which is `null` for every labware in the config, so it emits `cannot check traverse clearance over tubes ... its z.top rim height is unmeasured` even though that holder's height *is* measured at 35.0. `labware.json`'s own `top_note` for that rack says z.top is `"Superseded by height_mm"`. Wiring the simulator to `height_mm` (minus the effector's reach) is the outstanding change; until then the measured heights are documentation, not a check.
+```python
+@property
+def footprint(self) -> Optional[Vec2]
+```
 
-### `Labware.height_is_empty_only -> bool`
+`(width_x_mm, depth_y_mm)` of the physical outline, or `None` if never measured. `sbs_96_wellplate` is `(127.76, 85.48)`; both tube holders and the tip rack are explicitly `null`.
 
-`True` when `height_mm` is set but `height_with_contents_mm` is `null`, i.e. only the empty holder was measured.
+**Why `Optional` and not a guess:** it is the input to `Placement.footprint_bounds`, which feeds the deck's overlap check. A guessed footprint would let that check report a pass it never earned.
 
-`True` for both tube holders today. It exists so a clearance check can distinguish "35 mm and that is the whole story" from "35 mm empty, plus an unmeasured amount of tube and cap", which are very different things to plan a traverse against. Also unused so far.
+#### `Labware.wipe`
 
-### `Labware.approach_order -> Optional[str]`
+The `wipe` block or `None`. For the 0.65 mL holder: `dx` 3.2 mm sideways to contact the inner wall, `dz` 4.0 mm dragging the droplet *up* (recall +Z is down, so the wipe moves toward a smaller Z), `feed` 1500, and `uncalibrated: true`. `dx` must be less than the tube inner radius.
 
-Preferred XY axis order when approaching a well in this labware: `"YX"`, `"XY"`, or `None` if unspecified. Upper-cased on read, so `"yx"` in JSON works.
+`Machine.dispense(..., wall_wipe=True)` checks this **before** moving, and raises `ProtocolError` if it is `None` - pinned by `tests/test_review_fixes.py::test_10_dispense_checks_wipe_config_before_moving`, whose defect was a full blow-out emitted before the precondition check. `reservoir_water` and the 1.5 mL holder have no wipe block, so a wipe there is refused.
 
-- Returns: `"YX"` for both tube holders, `None` for everything else.
-- Why: this encodes a real obstruction. `"YX"` means reach the Y position first while still clear of the holder in X, then come in along X. The tube caps make Y motion *across* the holder difficult, while X motion passes between cap rows. `Machine.goto` is passed this as `prefer=p.labware.approach_order` from `goto_well`, `get_tip` and `dispense`; it validates the value (`ProtocolError` if it is not `"XY"` or `"YX"`) and the keep-out router may still override it, saying so when it does. Set this on the labware, not in a protocol, so every protocol that touches the rack inherits it.
+#### `Labware.height_mm`
 
-### `Labware.uncalibrated -> List[str]`
+```python
+@property
+def height_mm(self) -> Optional[float]
+```
 
-Dotted names of fields that are not yet trusted, e.g. `["wipe.dx", "wipe.dz", "z.work"]` for the 0.65 mL holder and `["grid.a1_corner", "consume_order.exit_edge"]` for the tip rack. Returns a fresh `list` (a copy, so a caller cannot append into the shared spec); `[]` when the key is absent.
+Physical height of the labware **above the stage**, in mm, contents included if known. Returns `spec["height_with_contents_mm"]` when present, otherwise `spec["height_mm"]`, otherwise `None`.
 
-`Deck.uncalibrated()` aggregates these across placements, `Machine.uncalibrated()` adds the effector's, and the result lands in the run manifest and in `protocols/accuracy_test.py`'s pre-run printout. The point is that "we do not know this yet" is a first-class, machine-readable value that follows the geometry into every artefact, instead of a comment someone has to remember to read.
+- 0.65 mL holder: 35.0 (empty). 1.5 mL holder: 45.0 (empty). `sbs_96_wellplate`: `None` - unmeasured.
+- Raises nothing; `None` means unmeasured.
 
-### `Labware.z(self, key: str) -> Optional[float]`
+**Why a height and not a commanded Z:** a height is both frame-independent and effector-independent. The commanded Z at which the tool would strike the labware depends on which nosecone is fitted and whether it has a tip on, so it is derived per run: `Simulator.labware_top_z` computes `z_stage_surface - height` bare and subtracts the tip length again when tipped. `tests/test_lab.py::test_holder_heights_convert_to_commanded_z` pins the arithmetic: 35 mm tops out at Z 79.75 bare and Z 27.5 with a 300 uL tip (114.75 - 35 = 79.75; 79.75 - 52.25 = 27.5), and travel Z 5.0 must be a *smaller* number than 27.5 to be physically above it. The same test pins `max_labware_height() == 57.5` - the tallest labware that still clears travel height with a tip fitted (114.75 - 52.25 - 5.0). The 0.65 mL holder therefore has 22.5 mm of headroom for tubes and caps; the 1.5 mL holder has 12.5 mm.
 
-One nominal Z from the labware's `z` block, in mm of commanded Z (larger = physically lower).
+The physical constraint encoded here: taller than 57.5 mm and travel height *strikes it*, and because `height_mm` on the plate is `None`, traverse clearance over the plates reports "cannot check" rather than passing.
+
+#### `Labware.height_is_empty_only`
+
+```python
+@property
+def height_is_empty_only(self) -> bool
+```
+
+`True` when `height_mm` is set but `height_with_contents_mm` is not - i.e. the number we have is the empty rack and the tubes and caps standing in it are unaccounted for. `True` for both tube holders today. Takes no parameters, raises nothing.
+
+**Why it exists:** it turns a missing measurement into a warning that reaches the operator instead of an assumption. `tests/test_lab.py::test_empty_height_is_flagged_as_incomplete` runs a real dispense over the 0.65 mL holder and asserts the run warns that contents are unaccounted for - the third project convention, that a check which cannot be evaluated is not a pass.
+
+#### `Labware.approach_order`
+
+```python
+@property
+def approach_order(self) -> Optional[str]
+```
+
+Preferred XY axis order when approaching a well on this labware, upper-cased, or `None` for the default X-first.
+
+- **Returns:** `"YX"` for both tube holders; `None` for the plate (deliberately unset - a plate has no caps) and the reservoir.
+- Raises nothing.
+
+`"YX"` means reach the Y position first, **while still clear in X**, then come in along X. The physical constraint: the tube caps make Y motion *across* the holder difficult, while X motion passes between cap rows. `lab/machine.py` honours it per labware; the keep-out router can still override it, and says so when it does. Pinned by `test_tube_holder_is_approached_y_first`, `test_goto_well_honours_approach_order` (whose defect was dropping the `prefer` argument outright) and `test_aspirate_from_reaches_the_well`, all of which assert the first two move legs are `["Y", "X"]`.
+
+#### `Labware.uncalibrated`
+
+```python
+@property
+def uncalibrated(self) -> List[str]
+```
+
+Copy of `spec["uncalibrated"]` - dotted field names this labware admits it does not know, e.g. `["wipe.dx", "wipe.dz", "z.work"]` for the 0.65 mL holder, `["grid.a1_corner", "consume_order.exit_edge"]` for the tip rack. Empty list if absent. Returns a fresh list, so mutating it does not touch the config.
+
+Aggregated by `Deck.uncalibrated()` into `Machine.uncalibrated()` and into the manifest, and printed by the one-liner in `CLAUDE.md`. Read this before treating any value from this labware as known.
+
+#### `Labware.z(key)`
+
+```python
+def z(self, key: str) -> Optional[float]
+```
+
+A nominal Z from the labware's own `z` block.
 
 - `key`: e.g. `"top"`, `"work"`, `"bottom"`, `"approach"`, `"pick"`.
-- Returns: the value as `float`, or `None` if the `z` block is missing, the key is absent, or the value is `null`. Never raises on an unknown key.
-- Why `None` everywhere in the current config: absolute Z is effector-dependent, because a fitted tip hangs 52.25 mm below the nosecone, so the real working Z lives in `effectors/*.json` under `z_for_labware` and is looked up by `Machine`. These fields stay null rather than being filled with a plausible guess. The only current consumer is the simulator's clearance check, which treats `None` as "cannot check" and warns.
+- **Returns:** the value as `float`, or `None` if the block or the key is missing.
+- Raises nothing - a missing `z` block yields `None`, not `KeyError`.
 
-### `class Placement` (mutable dataclass)
+**Note:** every `z` value in the shipped `labware.json` is currently `null`, by design. Absolute Z is effector-dependent, so the real numbers live in `effectors/*.json -> z_for_labware` (p300: plate `work` 53.5 / `bottom` 60.8; 1.5 mL tube `work` 35.0 / `mix` 45.0, `bottom` still unmeasured). Do not reach for `Labware.z` when you want a depth to command - it will hand you `None`. It is a placeholder for stage-referenced nominals that would only become useful if a labware-local Z were ever measured.
 
-One piece of labware at a definite spot on the deck: the resolved product of a `labware.json` entry and a `layout.json` entry. Built by `build_placement`, keyed by name in `Deck.placements`.
+### `class Placement`
 
-Fields:
+```python
+@dataclass
+class Placement:
+    name: str
+    labware: Labware
+    origin: Vec2
+    col_vec: Vec2
+    row_vec: Vec2
+    mount: str
+    rotation: float = 0.0
+    slot: Optional[int] = None
+    station: Optional[str] = None
+    spec: Dict[str, Any] = field(default_factory=dict)
+```
 
-- `name: str` - the layout's `name`, e.g. `"tubes"`, `"tips"`, `"water"`. `Deck` rejects duplicates.
-- `labware: Labware` - the shared geometry object.
-- `origin: Vec2` - machine XY (mm) of well `(0, 0)`.
-- `col_vec: Vec2` - mm displacement per unit column index, rotation already applied.
-- `row_vec: Vec2` - mm displacement per unit row index, rotation already applied.
-- `mount: str` - `"slot"`, `"station"` or `"fixed"` (the default when the layout omits it). `Deck.slot_seating_report` only checks placements with `mount == "slot"`; a `station` mount carries `near_slot` as a human reference, not a seating claim.
-- `rotation: float` - degrees CCW, default 0.0. Informational on the resolved object, since it is already baked into the two vectors; forced to `0.0` for the corners model.
-- `slot: Optional[int]` - slot number if slot-mounted (front row 1-3 at Y 365, middle 4-6 at Y 272, back 7-9 at Y 178.5, X descending within a row).
-- `station: Optional[str]` - station name if station-mounted, e.g. `"water"`.
-- `spec: Dict[str, Any]` - the raw layout entry, so notes and unmodelled keys stay reachable (`Deck` reads `near_slot` and `slot_disputed` out of it).
+One piece of labware at a definite spot on the deck: geometry joined to placement, resolved down to the three vectors. Built by `build_placement`, collected by `Deck` into `deck.placements[name]`. Not frozen, but treat it as immutable - `Deck` validates seating and occupancy at construction, and assigning to `origin` afterwards bypasses all of it.
 
-Not frozen, unlike `Labware`, but treat it as read-only: mutating `origin` after construction bypasses every consistency check in `_corner_vectors` and in `Deck.__init__`.
+Fields: `name` is the layout's placement name (`"tips"`, `"big_tubes"`, `"plate1"`), and the string a protocol passes to `Machine.dispense`/`aspirate_from`. `origin` is well (0, 0) in machine mm. `mount` is `"slot"`, `"station"` or `"fixed"`. `rotation` is degrees, already baked into the vectors. `slot` / `station` are whichever applies. `spec` is the layout entry.
 
-**Note:** `spec` is not identical to the layout file. `Deck.__init__` injects a private `_slot_pitch` key into a shallow copy of the entry before calling `build_placement` (because `a1_from_slot_edge` needs the cell size), so `spec["_slot_pitch"] == [135.5, 93.25]` is present on every slot-mounted placement. Harmless today because nothing serializes `spec` wholesale, but do not assume `spec` round-trips to `layout.json`.
+**Note:** `spec` is not byte-identical to `layout.json`. `Deck.__init__` injects a private `_slot_pitch` key into a shallow copy of each slot-mounted entry before calling `build_placement`, so `spec["_slot_pitch"] == [135.5, 93.25]` is present on every slot-mounted placement. Harmless today because nothing serializes `spec` wholesale; do not assume it round-trips.
 
-### `Placement.xy(self, row: int, col: int) -> Vec2`
+#### `Placement.xy(row, col)`
 
-The machine XY of one well.
+```python
+def xy(self, row: int, col: int) -> Vec2
+```
 
-- `row`, `col`: 0-based indices.
-- Returns: `(x, y)` in mm, each rounded to 4 decimal places. Rounding matters because the tip rack's pitch is `100.0/11`, so column 11 computes to `118.00000000000001` and would otherwise print that way in gcode and in every diff.
-- Raises: `IndexError` via `check_well` for an out-of-range index.
-- Real values: `tubes.xy(0, 0) == (256.0, 223.0)`, `tubes.xy(0, 9) == (148.0, 223.0)`, `tubes.xy(4, 0) == (256.0, 151.0)`; `tips.xy(0, 0) == (18.0, 399.2)`, `tips.xy(7, 11) == (118.0, 335.5)`.
+The machine XY of a well centre. The whole point of the module.
 
-### `Placement.well(self, name: str) -> Vec2`
+- `row`, `col`: 0-indexed integers, dimensionless.
+- **Returns:** `(x_mm, y_mm)` in machine coordinates, each rounded to 4 decimals - so a coordinate diff shows a real move, not float noise.
+- **Raises:** `IndexError` via `check_well` if the well is outside the labware's `rows` x `cols`.
 
-`parse_well` then `xy`. `p.well("B3")` for `p.xy(1, 2)`.
+Real values from the shipped bench: `d.placement("plate1").xy(0, 0) == (387.0, 399.0)`; `tips.xy(0, 11) == (118.0, 399.2)` and `tips.xy(7, 0) == (18.0, 335.5)` - the solve closes exactly on the two far measured corners; `big_tubes.xy(0, 0) == (252.5, 305.5)`, the operator's direct measurement. In the test fixture, the 0.65 mL holder's A1 is `(256.6, 218.5)`.
 
-- `name`: `'A1'` style label.
-- Returns: `(x, y)` in mm.
-- Raises: `ValueError` for a malformed name, `IndexError` for a well the labware does not have.
-- **Note:** for the tip rack, well names are provisional - `grid.a1_corner` is `"unconfirmed"`, so `tips.well("A1")` is a well-defined *coordinate* (18.0, 399.2) but not a confirmed *label*. Index-based access is the honest interface there until the corner is confirmed.
+Rounding is applied after the multiply-add, not to the vectors, so the tip rack's irrational `100/11` pitch accumulates in full precision and only the emitted coordinate is rounded.
 
-### `Placement.check_well(self, row: int, col: int) -> None`
+#### `Placement.well(name)`
 
-Bounds check. Raises `IndexError` naming the placement, the indices, the labware id and its actual dimensions (`"tubes: well (row=5, col=0) is outside tube_rack_0p65_5x10 which is 5 x 10"`); returns `None` otherwise.
+```python
+def well(self, name: str) -> Vec2
+```
 
-Why the loud message: an off-grid index does not produce an error on this machine, it produces a coordinate. Well `(0, 10)` of the tube rack would resolve to X 136, one clean pitch step past the last real column and into the next location, and the tip would be driven into the stage or an edge piece. Called by `xy`, and directly by `Machine` before it commits to a move.
+`xy(*parse_well(name))`. Same return and rounding; raises `ValueError` for a malformed label and `IndexError` for a well outside the labware. Convenience for operator-facing code; index-driven code should use `xy`.
 
-### `Placement.all_wells(self) -> List[Tuple[int, int]]`
+#### `Placement.check_well(row, col)`
 
-Every `(row, col)` pair, row-major (all of row 0 first). 50 entries for the tube rack, 96 for the tip rack. Returns a fresh list; never raises.
+```python
+def check_well(self, row: int, col: int) -> None
+```
 
-Note the ordering: many protocols on this deck want *column*-major iteration (row index selects volume, column index selects replicate, per the tube-rack layout notes), and the tip rack must be consumed column by column. Use `col_x_values()` or your own loop for those; `all_wells()` is for exhaustive passes such as tests and a stage tour.
+Raises `IndexError` unless `0 <= row < labware.rows` and `0 <= col < labware.cols`. Returns `None` on success.
 
-### `Placement.corner_wells(self) -> List[Tuple[int, int]]`
+**Why it exists / what mistake it prevents:** this is the bound between "a coordinate you can compute" and "a well that physically exists". The arithmetic in `xy` is perfectly happy to extrapolate column 6 of a 6-column holder and hand you a plausible number 20 mm past the last tube, over the slot boundary. The message names the placement, the labware id and the actual shape, e.g. `"big_tubes: well (row=0, col=6) is outside tube_rack_1p5 which is 3 x 6"`. It is also what makes the 1.5 mL holder's fail-safe 6-column choice work.
 
-The four extreme wells: `[(0, 0), (0, cols-1), (rows-1, 0), (rows-1, cols-1)]`.
+#### `Placement.all_wells()`
 
-For a 1x1 labware such as `reservoir_water` all four entries are `(0, 0)`; for a single-row or single-column labware they contain duplicates. Harmless, because the only consumer takes a min and a max.
+```python
+def all_wells(self) -> List[Tuple[int, int]]
+```
 
-### `Placement.well_bounds(self) -> Tuple[float, float, float, float]`
+Every `(row, col)` in row-major order - 96 for the plate, 50 for the 0.65 mL holder, 18 for the 1.5 mL holder. Raises nothing. For sweeping a whole piece of labware (resolve-everything checks, exhaustive envelope tests) without re-deriving the shape.
 
-`(x_min, x_max, y_min, y_max)` in mm over **well centres**, not the physical outline.
+#### `Placement.corner_wells()`
 
-- Returns: `tubes -> (148.0, 256.0, 151.0, 223.0)`; `tips -> (18.0, 118.0, 335.5, 399.2)`; `water -> (70.0, 70.0, 175.0, 175.0)`.
-- Why centres, and why it matters: the rim of a rack extends past the outermost well centre by an unmeasured amount, so these bounds *understate* the obstacle. The simulator prefers `footprint_bounds()` and only falls back to this with an explicit warning that a path clipping the rim will not be caught. `Deck.slot_seating_report` uses the bounds to check a slot claim: the tube grid spans X 148-256, Y 151-223, entirely inside slot 8's cell of `[132.25, 267.75] x [131.75, 225.25]`.
+```python
+def corner_wells(self) -> List[Tuple[int, int]]
+```
 
-### `Placement.grid_center(self) -> Vec2`
+The four extreme index pairs: `[(0, 0), (0, cols-1), (rows-1, 0), (rows-1, cols-1)]`. Raises nothing. Note these are *index* corners, which are geometric corners only because the two vectors are linearly independent - true for every current labware.
 
-Centre of `well_bounds()`, each component rounded to 4 dp.
+#### `Placement.well_bounds()`
 
-- Returns: `tubes -> (202.0, 187.0)`, `tips -> (68.0, 367.35)`, `water -> (70.0, 175.0)`.
-- Why: this is the number that catches a wrong slot label or a wrong coordinate frame. `Deck.slot_seating_report` compares it against the claimed slot centre and complains when the offset exceeds half a slot pitch. It is also the evidence in the frame audit: the tube grid centre `132 + 70 = 202` against slot 8 at 200 is 2.0 mm, whereas unshifted it straddles the slot 8/9 seam at X 132.25 and is seated in neither.
-- Because the grid is a parallelogram, its bounding-box centre equals its true centroid, so this agrees exactly with the centroid `_corner_vectors` validates against `corners.solved.grid_center` - the two are not two different definitions that could disagree under rotation.
+```python
+def well_bounds(self) -> Tuple[float, float, float, float]
+```
 
-### `Placement.footprint_bounds(self) -> Optional[Tuple[float, float, float, float]]`
+`(x_min, x_max, y_min, y_max)` in mm over **well centres**, computed from the four corner wells.
 
-Physical outline bounds in mm, or `None` if the footprint was never measured.
+- Raises `IndexError` for a degenerate 0-row or 0-col labware (via `xy`).
+- **These are centres, not the physical outline** - no tube radius, no rack body. A tube whose centre is inside the bounds still overhangs by half its diameter. `tests/test_lab.py` does that arithmetic explicitly when it checks the 1.5 mL holder for overhang, using `tube_d = 11.0` and comparing `x - tube_d / 2` against the location's low-X edge. For the outline, use `footprint_bounds`.
 
-- Returns: `(cx - w/2, cx + w/2, cy - h/2, cy + h/2)` around `grid_center()`, or `None`. `None` for all three currently loaded placements, since only `sbs_96_wellplate` has a footprint and it is not loaded.
-- Why `None` and not an estimate: it keeps the overlap and clearance checks honest. `Deck`'s overlap check and the simulator both report "cannot check" and warn, rather than passing on a guess. A fabricated footprint would turn a missing measurement into a silent green light.
-- **Note:** it assumes the footprint is centred on the grid centre, which is only true for labware whose grid genuinely is centred on its outline. `sbs_96_wellplate` declares `grid_centered_on_footprint: true` and satisfies it (`14.38 + 11*9/2 = 63.88 = 127.76/2`), but nothing here checks that declaration before centring. If someone measures and adds a footprint for the tip rack, whose well span of 100 x 63.7 mm is much smaller than its box and not obviously concentric with it, this would return mis-centred bounds that the simulator's clearance check would then trust. Gate on `grid_centered_on_footprint` or store an explicit outline offset before adding footprints to off-centre labware.
+Used to confirm each plate fits its slot cell: `x0 >= cx - px/2 and x1 <= cx + px/2` and the same in Y, with `px, py = d.slot_pitch()`.
 
-### `Placement.col_x_values(self) -> List[float]`
+#### `Placement.grid_center()`
 
-X coordinate (mm) of each column, taken along row 0.
+```python
+def grid_center(self) -> Vec2
+```
 
-- Returns: `tubes -> [256.0, 244.0, 232.0, 220.0, 208.0, 196.0, 184.0, 172.0, 160.0, 148.0]`; `tips -> [18.0, 27.0909, 36.1818, 45.2727, 54.3636, 63.4545, 72.5455, 81.6364, 90.7273, 99.8182, 108.9091, 118.0]`.
-- Why: the protocols on this deck are column-loops, and the tip rack's consume order is a column policy. `Machine._next_free_tip_col` works from this ladder to pick the first unused column counting inward from the exit edge, because after pickup the effector cannot pass over occupied tip positions without shearing the tip off, and the first move after pickup is in X. The tip list above is also the clearest single argument for the corners model: with a nominal 9.00 pitch the last entry would be 117.0.
+Midpoint of `well_bounds`, rounded to 4 decimals. `(68.0, 367.35)` for the tip rack - which is 3.0 mm in X and 2.35 mm in Y from slot 3's centre `(65.0, 365.0)`. That 3.0 mm X offset is what confirmed the `x' = 420 + x` frame rather than a rack sitting a column off. Raises nothing beyond `well_bounds`.
 
-### `Placement.row_y_values(self) -> List[float]`
+Also the reference point for `footprint_bounds`, and used by `Deck` for slot seating reports.
 
-Y coordinate (mm) of each row, taken along column 0.
+#### `Placement.footprint_bounds()`
 
-- Returns: `tubes -> [223.0, 205.0, 187.0, 169.0, 151.0]` (descending, because `row_dir` is `[0, -1]`); `tips -> [399.2, 390.1, 381.0, 371.9, 362.8, 353.7, 344.6, 335.5]`.
-- **Note on both of these:** each samples only one line of the grid (row 0, column 0 respectively). That is exact for an axis-aligned grid, which all three loaded placements are, but for a rotated `pitch` grid or a skewed corner solve the values along one edge are not the values for the whole column or row. Use `xy(row, col)` if you ever place something rotated.
+```python
+def footprint_bounds(self) -> Optional[Tuple[float, float, float, float]]
+```
 
-### `Placement.__repr__(self) -> str`
+Physical outline bounds in mm as `(x_min, x_max, y_min, y_max)`, taken as `grid_center()` plus/minus half the footprint - or **`None` if the footprint was never measured**.
 
-`<Placement tubes tube_rack_0p65_5x10 slot origin=(256.0, 223.0) 5x10>` - name, labware id, mount, origin and dimensions, which is enough to spot a wrong frame or a wrong rack in a traceback.
+- Raises nothing.
+- Today only `sbs_96_wellplate` has a footprint (127.76 x 85.48), so this returns `None` for the tip rack, the reservoir and both tube holders.
 
-### `_pitch_vectors(labware: Labware) -> Tuple[Vec2, Vec2]` (private)
+**Why `None` rather than a fallback to the well bounds:** it keeps the overlap check honest. `Deck` and `Simulator` both branch on `None` and report "cannot check" instead of silently passing - a fabricated outline would make two racks look non-overlapping when nobody has measured either.
 
-Builds `(col_vec, row_vec)` from the labware's nominal pitch and direction vectors.
+**Note:** the outline is centred on the *well grid* centre, which assumes the grid is centred on the body. That holds for an SBS plate (the `grid_centered_on_footprint` note works it out: 14.38 + 11*9/2 = 63.88 = 127.76/2), but if a footprint is ever added for a labware whose grid is off-centre, this will place the box wrong.
 
-`col_dir` defaults to `[1, 0]` and `row_dir` to `[0, -1]`. Raises `KeyError` if `pitch_x` or `pitch_y` is missing. For `tube_rack_0p65_5x10`: `12.0 * [-1, 0] = (-12.0, 0.0)` and `18.0 * [0, -1] = (0.0, -18.0)`. Not for protocol authors; `build_placement` is the entry point.
+#### `Placement.col_x_values()` / `Placement.row_y_values()`
 
-### `_corner_vectors(labware: Labware, corners: Dict[str, Any]) -> Tuple[Vec2, Vec2, Vec2]` (private)
+```python
+def col_x_values(self) -> List[float]
+def row_y_values(self) -> List[float]
+```
 
-Solves origin, pitch **and** rotation from three measured well centres, and optionally verifies the solve against numbers recorded in the placement.
+The X of every column taken along row 0, and the Y of every row taken along column 0. Both in mm, both `xy`-rounded. Raise `IndexError` only for a degenerate labware.
 
-- `corners`: the placement's `corners` block. Requires `origin`, `along_col` and `along_row`, each `[x, y]` in mm of measured *well centre* (not box outline). Optional `solved` block with `col_pitch`, `row_pitch`, `grid_center`.
-- Returns: `(origin, col_vec, row_vec)`; `col_vec = (along_col - origin) / (cols - 1)`, `row_vec = (along_row - origin) / (rows - 1)`.
-- Raises: `KeyError` naming the missing corner key; `ValueError` if the labware has fewer than 2 rows or 2 columns (you cannot divide by a zero span); `ValueError` if `solved.col_pitch` or `solved.row_pitch` disagrees with the computed `math.hypot` by more than `1e-6`, or if `solved.grid_center` disagrees with the computed centroid by more than `1e-4`, in both cases telling the operator to re-measure or delete `corners.solved`.
-- Why the cross-check: a stored number that nothing verifies is exactly how the old scripts' hardcoded displacement tables drifted away from the equations printed above them. Here the stored expectation is a tripwire, not documentation. The tolerances are set for float noise, not for measurement slop: the tip rack's row pitch computes to `9.099999999999998` against a stored `9.1`, which passes, while a genuinely stale entry (a 9.00 pitch left behind after re-measuring) fails at load.
+For the 1.5 mL holder: columns at 252.5, 232.5, 212.5, 192.5, 172.5, 152.5 (20 mm apart, descending X); rows at 305.5, 275.5, 245.5 (30 mm apart, descending Y).
 
-### `_resolve_origin(entry, labware, deck, name, needs_grid, col_vec=(0,0), row_vec=(0,0)) -> Vec2` (private)
+**Why they exist:** keep-out and routing logic reasons in whole columns, not wells. `lab/machine.py` calls `col_x_values()` in three places for exactly that, and the tests use them to check which columns fall inside the tip-ejector band `X[148, 162]` - the 0.65 mL holder's columns 8 and 9 (which no protocol uses; before the +70 correction the band appeared to cover columns 2 and 3, which the accuracy protocol does use), and plate2's columns 10 and 11 at X 161 and 152, the *high* indices, because the column sense runs toward lower X.
 
-Answers "where is well (0, 0)?" by strict precedence.
+**Note:** these only describe row 0 / column 0. Under a non-axis-aligned rotation or a rotated corner solve, "the X of column c" varies by row and these lists become a single slice through the grid rather than the whole story. Every current placement has `rotation: 0` and an axis-aligned solve.
 
-- `entry`: the layout placement dict (as amended by `Deck` with `_slot_pitch`).
-- `labware`: the geometry, consulted for fallback keys held on the labware rather than the placement.
-- `deck`: the **raw** `deck.json` dict, needed for `deck["slots"]` and `deck["stations"]`.
-- `name`: placement name, for error messages only.
-- `needs_grid`: `False` for the `single` model, `True` for `pitch`. When `False`, a slot mount returns the bare slot centre.
-- `col_vec`, `row_vec`: mm per index, already rotated, used only by the last fallback to halve the grid span.
-- Returns: `(x, y)` in mm.
+#### `Placement.__repr__()`
 
-Precedence, in order:
+`<Placement tips tiprack_300_96 slot origin=(18.0, 399.2) 8x12>` - name, labware id, mount, origin and shape.
 
-1. `entry["anchor_xy"]` - an explicitly measured machine coordinate always wins. This is how `tubes` is anchored: `[256.0, 223.0]`, the `+70`-corrected value of the old scripts' X 186.
-2. `entry["station"]` - the station's `xy` from `deck.json`. `water` resolves to `(70.0, 175.0)`, which is a *dip point* rather than a trough centre, and is kept as a station for exactly that reason. Raises `KeyError` for an unknown station name.
-3. `entry["slot"]` - the slot centre from `deck.json`, then, if `needs_grid`:
-   - `a1_from_center` (placement first, then labware): slot centre plus the stored offset.
-   - `a1_from_slot_edge` (placement first, then labware): A1 dimensioned from the *location edges*. The cell is the slot centre expanded by half the slot pitch, so with `_slot_pitch == [135.5, 93.25]` the half-extents are `(67.75, 46.625)`. `x_edge: "high"` gives `cx + 67.75 - x_inset` and `"low"` gives `cx - 67.75 + x_inset`, same for Y with `y_edge`; both default to `"high"`. Result rounded to 4 dp. For `tube_rack_1p5` (`x_inset 14.0`, `y_inset 13.0`) this is `(cx + 53.75, cy + 33.625)`, matching the offsets recorded in `labware.json`; in slot 5 that is A1 at `(253.75, 305.625)` with columns running down to X 133.75, inside slot 5's cell.
-   - Otherwise the labware must declare `grid_centered_on_footprint`, in which case A1 is the slot centre minus half the grid span.
-   - Raises `KeyError` for an unknown slot; `ValueError` if `a1_from_slot_edge` is used but `_slot_pitch` was not injected ("Deck must pass it in"); `ValueError` if none of the above applies, refusing to guess where A1 is.
-4. Nothing at all - `ValueError`: no `anchor_xy`, no slot, no station means there is no way to know where it is.
+### Building placements from `layout.json`
 
-Why the precedence runs measured-before-derived: every derived form inherits error from the deck frame, and this deck's frame is known to be imperfect. The `a1_from_slot_edge` path is the weakest of them - **Note:** `Deck._raw_slot_pitch` computes the pitch as `(max - min) / (n - 1)`, i.e. a *mean*, while `deck.json` records the real spacing as irregular ("X pitch is 136/135 and Y pitch is 93.0/93.5 - irregular by ~1 mm", provenance unverified). An edge-dimensioned A1 therefore carries up to roughly 0.5 mm of frame error, varying by slot, on top of the operator's own `x_edge` uncertainty (`tube_rack_1p5` lists `a1_from_slot_edge.x_edge` as uncalibrated: if "the very left" is the low-X edge rather than the high-X edge, the whole grid mirrors). Replace it with a measured `anchor_xy` as soon as the rack is on the deck.
+#### `_pitch_vectors(labware)` (private)
 
-Also note that with `needs_grid=False` the slot branch returns the slot centre and ignores `a1_from_center` and `a1_from_slot_edge` entirely. That is correct for a one-position vessel, but it will silently ignore an offset someone adds to a `single` labware. And `entry.get("anchor_xy")` is a truthiness test, so an empty list falls through to the next rule rather than erroring.
+```python
+def _pitch_vectors(labware: Labware) -> Tuple[Vec2, Vec2]
+```
 
-Not for protocol authors.
+`(col_vec, row_vec)` in mm from the labware's `pitch_x`/`pitch_y` and its integer `col_dir`/`row_dir`, **before** rotation.
 
-### `build_placement(entry: Dict[str, Any], labware: Labware, deck: Dict[str, Any]) -> Placement`
+- **Raises:** `KeyError` on `grid["pitch_x"]` or `grid["pitch_y"]` if the labware declares `model: "pitch"` without them.
+- Defaults: `col_dir` `[1, 0]`, `row_dir` `[0, -1]`.
 
-Turns one `layout.json` `placements[]` entry into a resolved `Placement`. This is the module's public entry point and the only place the grid models are distinguished.
+The `col_dir` default is the trap. Every labware in the shipped config that uses this model overrides it to `[-1, 0]`, and the plate defect of 2026-09-08 was exactly this value left at the default. If you add a `pitch` labware, state `col_dir` and `row_dir` explicitly and verify with `tools/check_alignment.py`. Not for protocol authors.
 
-- `entry`: one element of the layout's `placements` array. Reads `name` (default: the labware id), `mount` (default `"fixed"`), `rotation` (degrees CCW, default 0), `slot`, `station`, and whichever anchoring keys apply. Stored whole on the result as `Placement.spec`.
-- `labware`: the `Labware` from `Deck.catalogue` for `entry["labware"]`.
-- `deck`: the **raw** `deck.json` dict, not a `Deck` object - it needs `deck["slots"]` and `deck["stations"]`. Passing the wrong one is the easy mistake here.
-- Returns: a fully resolved `Placement` with `origin`, `col_vec` and `row_vec` filled in.
-- Raises:
-  - `KeyError` if the labware's model is `"corners"` but the placement has no `corners` block, naming both the placement and the labware.
-  - `ValueError` if `rotation` is nonzero with the `"corners"` model. The measured corners already encode any rotation, so applying one on top double-counts it and rotates the rack away from where it was measured. The message says to set rotation to 0 and re-measure if the rack moved.
-  - `ValueError` for any model other than `pitch`, `corners` or `single`.
-  - Everything `_corner_vectors`, `_pitch_vectors` and `_resolve_origin` raise.
-- Dispatch: `corners` solves the vectors and stores `rotation=0.0`; `single` resolves the origin with `needs_grid=False` and sets both vectors to `(0.0, 0.0)`; `pitch` builds nominal vectors, rotates them, then resolves the origin with `needs_grid=True` so the grid-span fallback can use the rotated vectors.
-- Why it is a free function rather than a `Placement` classmethod: `Deck.__init__` calls it once per layout entry, and it is the seam the tests exercise directly - `tests/test_lab.py` asserts exact resolved coordinates, and `tests/test_review_fixes.py` builds deliberately broken entries to confirm each of the raises above actually fires. Nothing after this point can be model-specific, which is what keeps `Machine` and `simulate` free of geometry branches.
+#### `_corner_vectors(labware, corners)` (private)
+
+```python
+def _corner_vectors(labware, corners) -> Tuple[Vec2, Vec2, Vec2]
+```
+
+Solves origin, `col_vec` and `row_vec` from three measured well centres. Returns `(origin, col_vec, row_vec)` in mm.
+
+- `corners`: the placement's `corners` block. Needs `origin`, `along_col` and `along_row`, each `[x_mm, y_mm]`. `origin` is well (0, 0); `along_col` is the far well in the same row; `along_row` the far well in the same column.
+- The solve is a plain division by span: `col_vec = (along_col - origin) / (cols - 1)`, `row_vec = (along_row - origin) / (rows - 1)`. Because the vectors come from measured points, **rotation and pitch fall out together** - no rotation parameter is needed or accepted.
+- **Raises:** `KeyError` naming the missing key if any of the three is absent. `ValueError` if the labware has fewer than 2 rows or 2 cols (division by zero otherwise). `ValueError` if the optional `corners.solved` cross-check fails.
+
+For the tip rack: origin (18.0, 399.2), `along_col` (118.0, 399.2), `along_row` (18.0, 335.5), giving `col_vec` (100/11, 0) = (9.0909..., 0) and `row_vec` (0, -63.7/7) = (0, -9.1). `tests/test_lab.py` asserts both to 1e-9.
+
+**Why the model exists:** the nominal 9.00 mm pitch is wrong. Real is 9.0909 in X, and 9.00 accumulates about 1.0 mm by column 12 - enough to miss a tip, with no crash to tell you.
+
+**Why `corners.solved` exists:** it holds the solve to what the measurement is supposed to produce. If present it may carry `col_pitch`, `row_pitch` (checked against `math.hypot` of each vector to 1e-6) and `grid_center` (checked to 1e-4). The shipped values are `col_pitch: 9.090909090909092`, `row_pitch: 9.1`, `grid_center: [68.0, 367.35]`. The failure message says which number disagrees and tells you to re-measure or delete `corners.solved` - deliberately refusing to pick a winner. The comment in the source names the reason: a stored number nothing checks is how the old scripts' own displacement tables drifted away from the equations printed above them.
+
+**Note:** the three corners fix the grid but *not* which corner is A1. `labware.json` records `grid.a1_corner: "unconfirmed"` and lists it in `uncalibrated`; it is an open question in `layout.json`. Coordinates from this placement are trustworthy; the well *names* attached to them are not yet.
+
+#### `_resolve_origin(entry, labware, deck, name, needs_grid, col_vec, row_vec)` (private)
+
+```python
+def _resolve_origin(entry, labware, deck, name, needs_grid,
+                    col_vec=(0.0, 0.0), row_vec=(0.0, 0.0)) -> Vec2
+```
+
+Answers "where is well (0, 0)?" for the `pitch` and `single` models. Returns `(x_mm, y_mm)`.
+
+- `entry`: the layout placement dict, as amended by `Deck` with `_slot_pitch`.
+- `labware`: for the labware-level fallbacks and the grid span.
+- `deck`: the **raw `deck.json` dict**, not a `Deck` object - it needs `deck["slots"]` and `deck["stations"]`. Passing the wrong one is the easy mistake here.
+- `needs_grid`: `False` for a single-position labware (the slot centre is the answer); `True` for a grid, which enables the A1-offset paths.
+- `col_vec`, `row_vec`: mm, already rotated, needed only by the centred-grid span branch.
+
+Precedence, first match wins:
+
+1. **`entry["anchor_xy"]`** - an explicitly measured machine coordinate. Always wins, so pinning a coordinate is always available as an escape hatch.
+2. **`entry["station"]`** - `deck["stations"][name]["xy"]`. Raises `KeyError` naming the placement and the unknown station. This is how `water` resolves to `(70, 175)`: the stored value is a *dip point*, 5.0 mm in X and 3.5 mm in Y off slot 9's centre, which is precisely why it is a station and not slot-mounted.
+3. **`entry["slot"]`** - looks up `deck["slots"][str(slot)]["center"]`; raises `KeyError` for an unknown slot. Then:
+   - if `needs_grid` is `False`, the slot centre *is* the origin;
+   - **`a1_from_center`** on the entry or the labware - the slot centre plus a stored `[dx, dy]` in mm. The plate uses `[51.0, 34.0]`, so slot 1's centre (336, 365) gives A1 at (387, 399), the operator's 2026-09-08 measurement. It is applied to *every* placement of that labware, on the theory that how the plate seats against a location's retaining features is a property of the plate, not of the location - which is why plate2's (251, 399) is inferred and still an open question. This override takes precedence over the centred-grid derivation below, which would have given (+49.5, +31.5);
+   - **`a1_from_slot_edge`** on the entry or the labware - insets from the **location edges** rather than from a measured machine coordinate. The location cell is the slot centre expanded by half the slot pitch, so the pitch must be passed in via the private `entry["_slot_pitch"]` that `Deck.__init__` injects; without it, `ValueError` ("Deck must pass it in"). `x_edge`/`y_edge` are `"high"` or `"low"` (default `"high"`) and name which edge each inset is measured from: high means `centre + pitch/2 - inset`, low means `centre - pitch/2 + inset`. Result rounded to 4 decimals. The 1.5 mL holder uses `x_inset` 15.25, `y_inset` 13.125 from the high edges: slot 5's centre (200, 272) with the mean pitch (135.5, 93.25) gives A1 at (200 + 67.75 - 15.25, 272 + 46.625 - 13.125) = (252.50, 305.50), the measured value, and `tests/test_lab.py` recomputes exactly that expression rather than hardcoding it. The insets were *calibrated from* that measurement, not from the verbal description "13 mm down from the top and 14 mm in from the very left" - which predicted (253.75, 305.625), right to 0.125 mm in Y and 1.25 mm out in X. That same measurement is what settled "the very left" as the *high*-X edge; the low-X reading would have put A1 at X 146.25, 106 mm away. **Caveat carried in the config:** these insets were calibrated in slot 5 and the slot X pitch is irregular (136 between slots 1-2, 135 between 2-3, mean 135.5), so a cell derived from the mean pitch is up to 0.5 mm out in another slot. Re-measure A1 if the holder moves rather than trusting the model to transfer;
+   - **`grid_centered_on_footprint`** - only if the labware declares it. Origin is the slot centre minus half the grid span, `span = (cols-1)*col_vec + (rows-1)*row_vec`. Note it centres on the *well span*, not the footprint, so the declaration is an assertion that those coincide;
+   - otherwise **`ValueError`**, refusing to guess: "Cannot guess where well A1 is - add anchor_xy or a1_from_center to the placement."
+4. Nothing at all - `ValueError`: "has no anchor_xy, no slot and no station - there is no way to know where it is."
+
+**Why the refusals matter more than the branches:** every raise here is a coordinate the library declined to invent. A guessed A1 does not crash - the tube pitch is 12 mm and a plausible-looking origin lands the tip inside *some* tube, in the wrong column, with the balance readings still looking reasonable. That is the failure mode the whole module is shaped around.
+
+**Note:** the `if not pitch` guard on `_slot_pitch` is falsy for `[0, 0]` as well as for a missing key, so a single-slot deck (pitch 0, 0 from `Deck._raw_slot_pitch`) would report "the slot pitch was not supplied" rather than the truth. Not reachable with the nine-slot deck.
+
+#### `build_placement(entry, labware, deck)`
+
+```python
+def build_placement(entry: Dict[str, Any],
+                    labware: Labware,
+                    deck: Dict[str, Any]) -> Placement
+```
+
+Turns one `layout.json` `placements[]` entry into a resolved `Placement`. The module's only public constructor, and the single point where a grid model is dispatched.
+
+- `entry`: the placement dict. Reads `name` (default `labware.id`), `mount` (default `"fixed"`), `rotation` (degrees, default 0), `slot`, `station`, `corners`, and the origin keys above. The whole dict is stored as `Placement.spec`.
+- `labware`: the catalogue entry, which supplies the model.
+- `deck`: the **raw `deck.json` dict** - `deck["slots"]` and `deck["stations"]`, not a `Deck` object.
+- **Returns:** a fully resolved `Placement`; `origin`, `col_vec` and `row_vec` are final and rotation is already applied.
+- **Raises:**
+  - `KeyError` if the labware's model is `"corners"` but the placement supplies no `corners` block - the block belongs to the placement, because it is a measurement of *this rack in this slot*, which is also why moving the tip rack means re-measuring rather than editing a slot number;
+  - `ValueError` if a `"corners"` placement also sets a non-zero `rotation`: "rotation is meaningless with the 'corners' model - the measured corners already encode any rotation." Applying both would double-count it. The returned `Placement` has `rotation=0.0` forced;
+  - `ValueError` for an unknown model: `"{labware.id}: unknown grid model {model!r}"`;
+  - anything `_corner_vectors`, `_pitch_vectors` or `_resolve_origin` raises.
+
+Dispatch order is `corners`, then `single`, then `pitch`, with anything else rejected.
+
+**Note:** for the `single` model, `rotation` is stored on the `Placement` but has no effect - both vectors are `(0, 0)`, so there is nothing to rotate. A non-zero rotation on a single-position station is silently inert rather than an error. Harmless for a dip point; misleading if someone later gives a station a grid.
+
+**Note:** `deck` is the raw dict, so `build_placement` cannot see `Deck`'s validation. Seating checks (`_check_recorded_slot_center`), duplicate-name detection and slot-occupancy checks all live in `Deck.__init__` *after* this returns. Building a `Placement` directly skips them; go through `Deck.load()` unless you are writing a geometry test.
 
 ---
 
 ## `lab/effector.py`
 
-End effectors: one JSON file per effector in `config/effectors/`, one class here per `kind`. The module owns three things and only three: effector identity and provenance (id, display name, config SHA-256), the per-effector Z table for each labware, and - for pipettes - the volume-to-plunger-displacement calibration plus every guard on plunger travel. It also defines `LabError`, the root of the whole library's exception tree, because `lab/deck.py`, `lab/simulate.py` and `lab/machine.py` all import it from here.
+The end-effector layer: identity, the calibration curve, plunger-position arithmetic, and the per-effector Z table. One JSON file per physical effector in `config/effectors/` (`p300.json`, `p125.json`, `gripper.json`), one class per `kind` value. Adding a new effector is a new JSON file; adding a new *kind* of effector is a new class here plus an entry in `_KINDS`. Nothing else in the library changes.
 
-Adding an effector is a new JSON file. Adding an effector *kind* is a new JSON file plus a class here plus an entry in `_KINDS`. Nothing else in the library needs to change.
+Two responsibilities sit here rather than anywhere else, and both are deliberate:
 
-Two conventions apply throughout:
+**uL -> mm conversion is exclusive to `Pipette`.** Protocols request microlitres (`aspirate_uL(150.0)`); the only code that multiplies by a slope is `Pipette.displacement_mm`, reading `calibration.slope` / `calibration.intercept` out of the effector JSON. The scripts this library replaced carried hardcoded displacement tables (`[1.722, 8.123, 12.123, 16.123]` for the p300) alongside a curve written in a comment, and the two drifted apart - `config/effectors/p300.json -> calibration.supersedes` records both. Because every mm value is now derived at call time from the coefficients in use, a displacement cannot claim to be a volume it is not. The corollary is a hard rule: **no mm value is ever typed into a protocol.**
 
-- **Volumes are always uL.** Millimetres are computed, never typed.
-- **Plunger POS is a millimetre coordinate on the actuator axis** driven by the `ACTUATOR_MOVE POS=` macro, and it counts *down* as fluid is drawn in: `blowout_pos` (30.0 for p300) is the plunger bottomed out, and a smaller POS means more air displaced and more liquid held. It is a separate axis from the Cartesian Z and does not share Z's "larger is lower" sense in any physical way - but numerically it also has its dangerous end at the low numbers, since POS 0 is a hard stop.
+**The Z table is per-effector, not per-labware.** `labware.json` stores a height above the stage; the commanded Z at which *this* effector works in *that* labware depends on what is fitted to the nosecone. The bare p300 nosecone contacts the stage at Z 114.75 and the same stage with a 300 uL tip at Z 62.5, so a fitted tip moves the reference point 52.25 mm. The same 1.5 mL tube therefore needs a different commanded Z with a tip on than without, which is why `z_for_labware` lives in the effector file. Remember throughout that **+Z is DOWN**: Z 0 is home at the top, and a larger number is physically lower.
 
-### Exception hierarchy
+### `class LabError(Exception)`
 
-```python
-class LabError(Exception)
-class EffectorError(LabError)
-class VolumeError(EffectorError)
-```
-
-`LabError` is the base for every error the library raises deliberately. The full tree, gathered from across the package:
+Base for every error this library raises. Subclasses, all defined across the package but rooted here:
 
 ```
-LabError                       lab/effector.py
-├── EffectorError              lab/effector.py   effector cannot do what was asked
-│   └── VolumeError            lab/effector.py   volume outside what can be metered
-├── DeckError                  lab/deck.py       deck/labware/layout geometry
-├── SimulationError            lab/simulate.py   a move the simulator rejects
-└── ProtocolError              lab/machine.py    protocol sequencing (no tip fitted, etc.)
+LabError
+  EffectorError        (this module)  effector cannot do what was asked
+    VolumeError        (this module)  volume outside what can be metered
+  DeckError            lab/deck.py
+  ProtocolError        lab/machine.py
+  SimulationError      lab/simulate.py
 ```
 
-**Why it exists:** every message in this library is written to tell the operator what to fix and where, so a protocol script can do `except LabError as e: print(e); sys.exit(1)` and produce a one-line actionable failure instead of a traceback. `protocols/accuracy_test.py` does exactly that.
+**Why it exists:** a protocol can wrap its body in `except LabError as exc: print(exc)` and show the operator a sentence instead of a traceback. The messages are written for that - they name the file and key to edit (`config/effectors/p300.json -> z_for_labware`), not the Python frame. `tests/test_lab.py` pins the contract that an out-of-envelope `goto()` surfaces as a `LabError`, so catching the one class is genuinely sufficient.
 
-`VolumeError` is separated from `EffectorError` so a caller sweeping a range of volumes can catch "this volume is out of range" and skip the point, without also swallowing "this effector has no Z for that labware".
+### `class EffectorError(LabError)`
 
-**Note:** the split between `VolumeError` and `EffectorError` is not clean along the axis you would expect. `check_volume` raises `VolumeError`, but `check_pos` raises plain `EffectorError` even when the cause is a volume that needs too much stroke. In practice `check_volume`'s stroke test fires first and gives the better message, so `except VolumeError` usually suffices - but do not rely on it.
+Raised when the effector cannot perform the request: unknown effector id, unknown `kind`, a placeholder loaded for motion, a missing or unmeasured Z entry, an unsupported calibration model, an inconsistent air gap, or a plunger POS outside its legal band.
 
-**Note:** malformed or incomplete config is *not* under `LabError`. `lab/config.py` raises `FileNotFoundError` for a missing file and `ValueError` for bad JSON, and `Pipette.__init__` raises bare `KeyError` if `actuator.blowout_pos`, `actuator.air_gap`, `actuator.gap_pos`, `calibration.slope`, `calibration.intercept`, `calibration.window_uL` or `nominal_uL` is absent. A protocol that catches only `LabError` will still show a traceback when someone breaks a config file.
+### `class VolumeError(EffectorError)`
+
+Raised only by `Pipette.check_volume`, for a volume outside the fitted calibration window or beyond the available plunger stroke. Separate from `EffectorError` so a protocol sweeping a volume series can catch just the volume case and skip a point.
 
 ---
 
-### class `Effector` (base)
+### `class Effector`
 
-Identity, config access, the Z table, and the boolean flags that let `Machine` and `Simulator` branch on effector capability without knowing which effector is loaded. Class attribute `kind = "generic"`; subclasses override it and it is what `load()` dispatches on.
+`Effector(cfg: config.ConfigFile)`
 
-### `Effector.__init__(self, cfg: config.ConfigFile) -> None`
+Base class: identity, raw config access, and the Z table. `kind = "generic"`; not registered in `_KINDS`, so it is never instantiated by `load()` directly.
 
-Wraps an already-loaded `ConfigFile` and pulls out the identity fields.
+Attributes set in `__init__`:
 
-- `cfg` - a `lab.config.ConfigFile` for one `config/effectors/<id>.json`. Do not construct this yourself; call `load()`.
+| attribute | source | notes |
+|---|---|---|
+| `cfg` | the `ConfigFile` | keeps `path`, `data`, `sha256` |
+| `spec` | `cfg.data` | the parsed JSON dict; escape hatch for fields with no accessor |
+| `id` | `spec["id"]` | raises `KeyError` if absent |
+| `display_name` | `spec["display_name"]`, default `id` | |
+| `sha256` | `cfg.sha256` | hash of the exact bytes loaded |
 
-Sets:
+**Why `sha256` is carried:** `lab/machine.py` writes it into the run manifest as `effectors/p300.json: <sha>`, so a generated `.gcode` can be traced back to the precise calibration file that produced it. A recalibration that changes a slope changes the hash, and old output stays attributable.
 
-| attribute | meaning |
-| --- | --- |
-| `self.cfg` | the `ConfigFile` object |
-| `self.spec` | `cfg.data`, the raw parsed JSON dict. Subclasses and `Machine` read fields off this directly for things with no accessor (`z_conflict`, `actuator.decimals`, `z_for_labware`) |
-| `self.id` | `spec["id"]`, e.g. `"p300"` |
-| `self.display_name` | `spec["display_name"]`, falling back to `id` |
-| `self.sha256` | SHA-256 of the config file bytes |
+### `Effector.z_for(labware_id: str, key: str = "work") -> float`
 
-**Raises:** `KeyError` if the JSON has no `id`.
+Absolute commanded Z, in millimetres, for this effector at this labware.
 
-**Why `sha256` is carried on the effector:** `Machine.config_hashes()` writes it into the run manifest as `effectors/<id>.json`, so a generated `.gcode` can be traced back to the exact calibration coefficients that produced it. If someone re-fits the curve, old gcode is still attributable to the old numbers.
+- `labware_id` (str): a labware id as it appears in `labware.json` and as a key of `spec["z_for_labware"]`, e.g. `"sbs_96_wellplate"`, `"tube_rack_1p5"`, `"tiprack_300_96"`.
+- `key` (str): which depth. See the three-key convention below.
 
-### `Effector.z_for(self, labware_id: str, key: str = "work") -> float`
+Returns the Z as a float (larger = physically lower). Raises `EffectorError` in three distinct cases, each with a different fix:
 
-Absolute machine Z, in mm, for this effector working at this labware.
+1. no entry for that labware - message lists the known ids and names the file to edit;
+2. entry exists but lacks that key - message lists the keys present;
+3. the key is present but `null` - "it has never been measured. Measure it and put it in the config."
 
-- `labware_id` - a labware type id from `config/labware.json`, e.g. `"reservoir_water"`, `"tube_rack_0p65_5x10"`, `"tiprack_300_96"`. Not a slot number and not a placement name.
-- `key` - which Z within that labware's entry. In use today: `"work"` (submerged / dispensing depth), and for the tip rack `"approach"` (47.0) and `"pick"` (59.0).
+**Why it exists / what it prevents:** case 3 is the point. A missing measurement stored as `null` must refuse, not fall back to a plausible default, because descending to a depth nobody measured is a crash. `tests/test_lab.py` blanks out `tube_rack_1p5.work` in a copied config and asserts that `aspirate_from` then raises rather than picking a depth.
 
-**Returns:** the Z as a float. Remember +Z is down: p300 at `reservoir_water` `work` is 40.0, which is 22.5 mm *above* the stage floor with a tip fitted (62.5).
+**The three-key convention, shallowest first.** For the p300, from `config/effectors/p300.json`:
 
-**Raises** `EffectorError` in three distinct cases, each with a different fix:
+| key | `sbs_96_wellplate` | `tube_rack_1p5` | meaning |
+|---|---|---|---|
+| `work` | 53.5 | 35.0 | the dispense / aspirate depth. What `dispense`, `aspirate` and `prewet` command. |
+| `mix` | (absent) | 45.0 | where `Machine.mix` cycles - 10 mm deeper than `work`, so a mix reaches under the liquid it is stirring instead of skimming the surface. |
+| `bottom` | 60.8 | `null` | the vessel floor. A **CRASH LIMIT, never a target.** `lab/simulate.py` fails any move deeper than it. |
 
-1. No entry for that labware at all - message lists the known labware ids and names the file and key to add.
-2. Entry exists but not that key - e.g. `p300.z_for("tiprack_300_96", "work")` fails, because that entry only has `approach` and `pick`.
-3. The key is present but `null` - "it has never been measured".
+Because +Z is down, the ordering constraint is `work < mix < bottom` as numbers. The plate dispenses 7.3 mm above its floor (60.8 - 53.5). `tests/test_lab.py::test_plate_depths_are_measured_and_ordered` pins 53.5 and 60.8, asserts `work < bottom`, and asserts more than 5 mm of clearance.
 
-**Why it lives on the effector and not on the labware:** a fitted tip moves the reference point. The p300 bare nosecone contacts the stage at Z 114.75; with a 300 uL tip it contacts at 62.5. The tip is therefore 52.25 mm long, and *the same tube needs a commanded Z 52.25 mm smaller with a tip on*. A per-labware Z table would be silently wrong for every effector but the one it was measured with. The mistake this prevents is exactly the one recorded in `config/effectors/p125.json` under `z_conflict`: p125's water Z (50.0) is 10 mm lower than p300's (40.0) while its tube Z (20.0) is 25 mm higher than p300's (45.0). A constant tip-length offset would move both in the same direction by the same amount, so those two numbers cannot both be right. Keeping the table per-effector is what makes that contradiction visible instead of averaging it away.
+`bottom` is allowed to be `null` where `work` and `mix` are not: an unknown *limit* only means a check cannot be evaluated, so `Simulator` emits `cannot check well-bottom crash for tube_rack_1p5` and carries on; an unknown *commanded depth* is a refusal. Both halves are pinned by `tests/test_lab.py`.
 
-**Note:** case 2's "Known:" list filters out keys whose name ends in `note`, but nothing else - so for `p300` / `tiprack_300_96` it also offers `superseded` (value 57.5, the old `Z_TIP_PICK`), which is not a usable Z key.
+Two entries do not use these keys at all. `tiprack_300_96` carries `approach: 47.0` and `pick: 59.0` and **no `work`**, so a bare `z_for("tiprack_300_96")` raises; `Machine.get_tip` asks for `"approach"` and `"pick"` explicitly. `reservoir_water` carries only `work: 40.0`.
 
-### `Effector.z_is_uncalibrated(self, labware_id: str) -> bool`
+Note that plate `work` 53.5 is 0.5 mm deeper than the 53.0 tipped traverse limit over raised location edges. That is legal - the limit forbids *crossing a location boundary* at that depth, not being at it inside a well.
 
-True if this effector's entry for that labware carries `"uncalibrated": true`.
+**Note:** the "no Z key" message filters candidates with `if not k.endswith('note')`, which hides `note` and `gap_pos_note` but still advertises `superseded` (the p300 tip rack records `superseded: 57.5`) as if it were a usable key. Cosmetic only.
 
-- `labware_id` - labware type id, as for `z_for`.
+### `Effector.z_is_uncalibrated(labware_id: str) -> bool`
 
-**Returns:** `bool`. `p300.z_is_uncalibrated("tube_rack_0p65_5x10")` is `True` (its config note: "was marked `<-- TUNE` in the source and was never tuned"); `p300.z_is_uncalibrated("reservoir_water")` is `False`.
+True when `spec["z_for_labware"][labware_id]["uncalibrated"]` is truthy - the value exists and will be commanded, but was derived or guessed rather than measured. Currently true for the p300 at `tube_rack_0p65_5x10` (45.0, "was marked `<-- TUNE` in the source and was never tuned") and `tube_rack_1p5`, and for both p125 entries.
 
-**Raises:** nothing.
+**Note:** nothing in `lab/`, `protocols/` or `tools/` calls this method. The same information reaches the operator by a different route - `Effector.uncalibrated()` feeding the run manifest - so this is a convenience predicate awaiting a caller, not dead-but-load-bearing code.
 
-**Why:** `Machine` and `Simulator` use it to emit a loud warning in the gcode and the manifest rather than refusing to generate. The value is usable, it is just not trustworthy, and the operator needs to know that before the run rather than after.
+### `Effector.needs_tip -> bool` (property)
 
-**Note:** it returns `False` for a labware with no entry at all, which is indistinguishable from a calibrated one. Use `z_for` (which raises) to detect absence; do not use this as a presence test.
+`spec["tips"]["required"]`, default `False`. True for the p300, false for the p125. Read by `Machine.get_tip` (returns early when false) and by the guard that refuses to aspirate with no tip fitted.
 
-### `Effector.needs_tip` (property) -> `bool`
+### `Effector.tip_labware -> Optional[str]`
 
-`tips.required` from the config, default `False`. `True` for p300, `False` for p125 and the gripper.
+`spec["tips"]["labware"]` - `"tiprack_300_96"` for the p300, `None` for the p125. `Machine.get_tip` compares it against the placement it was handed and raises if they disagree, so a p300 cannot pick a tip out of a rack it was not calibrated against.
 
-**Why:** `Machine.aspirate_uL` refuses to run if `needs_tip` and no tip is fitted, and `Machine.get_tip` refuses if `not needs_tip` (so a p125 script cannot accidentally drive a tip-press stroke). `protocols/accuracy_test.py` also ANDs it with the `--get-tip` flag so the manifest records what was actually done, not what was requested.
+### `Effector.can_eject_tip -> bool`
 
-**Note:** for p125 this flag is listed in that file's own `uncalibrated` array. The old p125 script did no tip pickup, and whether that was intentional (bare nosecone) or an omission is unresolved - and it changes every Z in that file.
+`spec["tips"]["eject_supported"]`, default `False`. True for the p300. Gates `Machine.eject_tip` and the `--eject-tip` path in the protocols. Independent of the deck-side gate: `deck.stations.tip_eject.validated` is `false`, the routine has never run on hardware, and it stays off by default.
 
-### `Effector.tip_labware` (property) -> `Optional[str]`
+### `Effector.is_placeholder -> bool`
 
-The labware type id this effector takes tips from: `"tiprack_300_96"` for p300, `None` for p125 and the gripper.
+`spec["status"] == "placeholder"`. True for `gripper.json`, where every numeric field is `null`. `load()` refuses a placeholder unless asked not to.
 
-**Why:** `Machine._tip_placement()` matches the *labware type* rather than trusting a placement named "tips". Routing by placement name alone would send a second effector with a different tip geometry to the first rack it finds and press a 300 uL tip onto the wrong nosecone.
+### `Effector.uncalibrated() -> List[str]`
 
-### `Effector.can_eject_tip` (property) -> `bool`
+Returns the effector's own `uncalibrated` list, each entry prefixed with the effector id, e.g. `["p300.z_for_labware.tube_rack_0p65_5x10.work", "p300.z_for_labware.tube_rack_1p5.bottom"]`. `Machine` concatenates it with `Deck.uncalibrated()` so one call enumerates everything unmeasured in a run. This is a flat list maintained by hand in the JSON, not derived from the `uncalibrated: true` flags - the two can disagree if someone edits one and not the other.
 
-`tips.eject_supported`, default `False`. `True` only for p300.
+### `Effector.feedrate(name: str, default: Optional[int] = None) -> Optional[int]`
 
-**Why:** `Machine.eject_tip` refuses outright when false, and `Simulator` uses it in its end-of-run check for a tip left fitted. The ejector routine (station `tip_eject`: lane X 155, Z 145 down to Z 137, an 8 mm *upward* strip because +Z is down) is flagged `"validated": false` in `deck.json` and has no working gcode reference anywhere in the repo, so gating it behind a per-effector flag keeps it out of the path of any effector that has not opted in.
+Per-effector feedrate override in mm/min, from `spec["feedrates"]`. The p300 sets `tip_press: 600`; the p125 and gripper set none. Returns `int` or `None`. Callers use it as an override on the deck default: `eff.feedrate("tip_press") or self.deck.feedrate("tip_press")`. **Why per-effector:** the pressing speed that seats a 300 uL tip is a property of that tip and nosecone, not of the machine.
 
-### `Effector.is_placeholder` (property) -> `bool`
+### `Effector.__repr__`
 
-True when `spec["status"] == "placeholder"`. Only the gripper.
-
-**Why:** it is the flag `load()` uses to refuse the file. See `load()`.
-
-### `Effector.uncalibrated(self) -> List[str]`
-
-Every field this effector's config declares unmeasured, each prefixed with the effector id.
-
-**Returns:** e.g. for p300 `['p300.z_for_labware.tube_rack_0p65_5x10.work']`; for p125 four entries including `'p125.tips.required'` and `'p125.z_reference.stage_surface'`; for the gripper the single entry `'gripper.ALL'`.
-
-**Raises:** nothing.
-
-**Why:** `Machine.uncalibrated()` concatenates this with the deck's list and both the printed report and the run manifest carry it. Unmeasured numbers are still used to generate motion, so the run record has to state which numbers were guesses. The id prefix is what keeps deck entries and effector entries distinguishable once they are in one list.
-
-### `Effector.feedrate(self, name: str, default: Optional[int] = None) -> Optional[int]`
-
-Look up a named feedrate (mm/min) in this effector's `feedrates` block.
-
-- `name` - feedrate key, e.g. `"tip_press"`.
-- `default` - returned when the key is absent.
-
-**Returns:** `int`, or `None` if the resolved value is `None`. `p300.feedrate("tip_press")` is `600`; `p125.feedrate("tip_press")` is `None` (its `feedrates` block is empty).
-
-**Why:** it exists so an effector can *override* a deck-wide feedrate without every effector having to restate all of them. `Machine.get_tip` reads `eff.feedrate("tip_press") or self.deck.feedrate("tip_press")` - effector first, deck fallback (also 600). A gentler pipette can lower its own press speed in one place.
-
-### `Effector.__repr__(self) -> str`
-
-`<Pipette p300>`. Uses `type(self).__name__`, so the subclass shows through.
+`<Pipette p300>`. For logs and test failure messages.
 
 ---
 
-### class `Pipette`
+### `class Pipette(Effector)`
 
-Air-displacement pipette: plunger geometry, the linear volume calibration, and the guards on both. `kind = "pipette"`.
+`Pipette(cfg: config.ConfigFile)` - `kind = "pipette"`. An air-displacement pipette: plunger POS arithmetic plus a linear volume calibration.
 
-### `Pipette.__init__(self, cfg: config.ConfigFile) -> None`
+Plunger geometry is expressed in **POS**, a single-axis position in mm on the actuator. POS *decreases* as the plunger retracts and liquid is drawn up; `blowout_pos` is bottomed (full dispense plus blow-out) and `pos_min` is the hard stop. Legal band, used by `check_pos`, is `pos_min + stroke_margin <= POS <= blowout_pos`.
 
-Loads and cross-checks the actuator and calibration blocks.
-
-Actuator attributes, all mm on the plunger axis except where noted (p300 / p125 values):
+Fields read from `spec["actuator"]`, with p300 / p125 values:
 
 | attribute | p300 | p125 | meaning |
-| --- | --- | --- | --- |
-| `blowout_pos` | 30.0 | 31.0 | plunger bottomed: full dispense plus blow-out. The high end of legal POS |
-| `air_gap` | 5.0 | 6.0 | trailing air gap, mm of plunger travel |
-| `gap_pos` | 25.0 | 25.0 | POS with the air gap armed, in air, before descending |
-| `post_asp_backoff` | 1.0 | 1.0 | extra retract in air after leaving the liquid, anti-drip (`TRAIL_GAP` in the old p125 script) |
+|---|---|---|---|
+| `blowout_pos` | 30.0 | 31.0 | plunger bottomed; full dispense plus blow-out |
+| `air_gap` | 5.0 | 6.0 | trailing air gap, armed **in air** before descending |
+| `gap_pos` | 25.0 | 25.0 | POS with the gap armed and no liquid; must equal `blowout_pos - air_gap` |
+| `post_asp_backoff` | 1.0 | 1.0 | extra retract in air after leaving the water, anti-drip |
 | `stroke_margin` | 1.0 | 1.0 | keep POS at least this far off the hard stop |
-| `pos_min` | 0.0 | 0.0 | POS of the hard stop itself |
-| `settle_s` | 1.0 | 1.0 | seconds (not mm) to dwell after a plunger move |
-| `decimals` | 3 | 3 | rounding for emitted POS and mm values |
+| `pos_min` | 0.0 | 0.0 | the hard stop |
+| `settle_s` | 1.0 | 1.0 | dwell after a plunger move, seconds |
+| `decimals` | 3 | 3 | rounding for every emitted POS and mm value |
 
-Calibration attributes: `slope` (mm per uL), `intercept` (mm), `window` (a `(lo, hi)` tuple in uL from `window_uL`), plus `nominal_uL` from the top level.
+From `spec["calibration"]`: `slope` (mm per uL), `intercept` (mm), `window` (a `(lo, hi)` tuple from `window_uL`). p300: 0.0533 / 0.122, window `(8.0, 320.0)`. p125: 0.1274 / 0.049, window `(10.0, 140.0)`. From the top level: `nominal_uL` (300.0 / 125.0).
 
-- p300: slope 0.0533, intercept 0.122, window (8.0, 320.0), nominal 300.0
-- p125: slope 0.1274, intercept 0.049, window (10.0, 140.0), nominal 125.0
+`__init__` raises `EffectorError` twice:
 
-**Raises:**
+1. `calibration.model != "linear_mm_per_uL"` - refuses rather than silently applying a linear fit to a curve that was not fitted linearly.
+2. `gap_pos != blowout_pos - air_gap` - "the air gap is not what it claims to be." Three numbers in the config encode two degrees of freedom; the redundancy is checked at load so a typo cannot make every subsequent aspirate off by the difference.
 
-- `EffectorError` if `calibration.model` is not `"linear_mm_per_uL"`. There is exactly one model implemented; a config claiming a polynomial fit must fail loudly rather than be silently treated as linear.
-- `EffectorError` if `gap_pos != blowout_pos - air_gap` ("the air gap is not what it claims to be"). This catches the case where someone edits `air_gap` and forgets `gap_pos`, or vice versa - the numbers would still look plausible individually, and every subsequent aspirate POS would be off by the difference. Both current configs satisfy it: 30.0 - 5.0 = 25.0, and 31.0 - 6.0 = 25.0.
-- `KeyError` for a missing required field (see the exception-hierarchy note above).
+It raises `KeyError` (not `EffectorError`) if `actuator`, `calibration`, `calibration.slope`, `calibration.window_uL` or `nominal_uL` are absent.
 
-### `Pipette.equation` (property) -> `str`
+### `Pipette.equation -> str` (property)
 
-The calibration curve rendered as text **from the coefficients actually in use**: `"d_mm = 0.0533 * V_uL + 0.122"`.
+`"d_mm = 0.0533 * V_uL + 0.122"` for the p300 - built from `self.slope` and `self.intercept`, the coefficients actually in use.
 
-**Why it is derived rather than read:** the config also carries an `equation` string, but nothing cross-checks it, and a free-text duplicate of a number is precisely the failure mode this library was written to remove - `config/effectors/p300.json` records that the scripts it replaces had a comment curve (`0.05338*V + 0.1218`) that disagreed with the hardcoded displacement table (`[1.722, 8.123, 12.123, 16.123]`) sitting a few lines below it. Reports and gcode headers use this property, so what is printed is always what was computed.
+**Why it exists:** the config carries its own free-text `equation` string that nothing cross-checks, and in the scripts this replaced exactly that kind of duplicate drifted from its own table. Reports (`lab/logbook.py`, both protocols' banners) use this derived property, so the printed curve can never disagree with the arithmetic. `tests/test_review_fixes.py::test_9_equation_is_derived_from_the_coefficients` deletes the config's `equation` key and asserts the reported string is unchanged.
 
-### `Pipette.displacement_mm(self, volume_uL: float) -> float`
+### `Pipette.displacement_mm(volume_uL: float) -> float`
 
-Plunger travel in mm for a requested volume, from the stored coefficients only.
+Plunger travel in millimetres for a volume in microlitres: `round(slope * V + intercept, decimals)`.
 
-- `volume_uL` - requested volume in microlitres.
+- `volume_uL` (float, microlitres).
 
-**Returns:** `round(slope * volume_uL + intercept, decimals)`. p300 at the ISO fractions of nominal (30 / 150 / 225 / 300 uL) gives 1.721 / 8.117 / 12.114 / 16.112 mm.
+Returns mm, rounded to `decimals` (3). Raises `VolumeError` via `check_volume` before computing anything.
 
-**Raises:** `VolumeError` via `check_volume` - both the window test and the stroke test - before computing anything.
+Real p300 values, pinned in `tests/test_lab.py::test_p300_calibration`: 30 uL -> 1.721 mm, 150 -> 8.117, 225 -> 12.114, 300 -> 16.112. p125: 12.5 -> 1.642, 62.5 -> 8.012, 93.75 -> 11.993, 125 -> 15.974.
 
-**Why:** this is the single conversion point in the library. See "Why uL to mm lives here" below.
+**Why it exists / what it prevents:** this is the single conversion point named in the module docstring and in `CLAUDE.md`. Anything that needs a millimetre calls this; nothing else does the multiplication. That is what stops a displacement drifting out of step with the volume it claims to be.
 
-### `Pipette.volume_uL(self, displacement_mm: float) -> float`
+### `Pipette.volume_uL(displacement_mm: float) -> float`
 
-Inverse of the curve, for reporting a measured or commanded stroke back as a volume.
+Inverse of the calibration, `(d - intercept) / slope`, rounded to 4 decimals. For reporting a measured or emitted stroke back as a volume.
 
-- `displacement_mm` - plunger travel in mm.
+**Note:** deliberately does *not* validate - it takes no `check_volume` path and will happily invert a displacement outside the fitted window. Fine for reporting; do not use it to decide whether a stroke is legal. It currently has no callers in the repo.
 
-**Returns:** `round((displacement_mm - intercept) / slope, 4)`. `p300.volume_uL(17.178)` is `320.0`.
+### `Pipette.aspirate_pos(volume_uL: float) -> float`
 
-**Raises:** nothing. `ZeroDivisionError` if a config ever set `slope` to 0.
+The plunger POS that holds this volume with the air gap already armed: `gap_pos - displacement_mm(V)`.
 
-**Note:** deliberately unvalidated and deliberately rounded to 4 decimals rather than `self.decimals`, since it is a reporting path. It will happily invert nonsense - `p300.volume_uL(30.0)` returns `560.5629` uL, well past the 320 uL window. Never feed its output back into `displacement_mm` as if it had been checked.
+- `volume_uL` (float, microlitres).
 
-### `Pipette.aspirate_pos(self, volume_uL: float) -> float`
+Returns POS in mm, rounded to `decimals`. Raises `VolumeError` (from `displacement_mm`) or `EffectorError` (from `check_pos`, message ends `while aspirating <V> uL`).
 
-The plunger POS that holds this volume with the air gap already armed.
+p300: 30 uL -> 23.279, 150 -> 16.883, 225 -> 12.886, 300 -> 8.888.
 
-- `volume_uL` - requested volume in microlitres.
+**Why it starts from `gap_pos` and not `blowout_pos`:** the air gap is armed in air *before* descending into liquid, so the plunger is already at 25.0 when the draw begins. Measuring the stroke from `blowout_pos` would over-aspirate by the whole `air_gap`. (Contrast `Machine.mix`, which starts bottomed and so validates `blowout_pos - d` instead - mixing carries no air gap.)
 
-**Returns:** `round(gap_pos - displacement_mm(volume_uL), decimals)`. p300 at 300 uL: 25.0 - 16.112 = `8.888`.
+### `Pipette.backoff_pos(volume_uL: float) -> float`
 
-**Raises:** `VolumeError` (from `displacement_mm`) if the volume is unmeterable; `EffectorError` (from `check_pos`) if the resulting POS is outside `[pos_min + stroke_margin, blowout_pos]`.
+POS after the anti-drip retract: `aspirate_pos(V) - post_asp_backoff`. Validated by `check_pos` with `what="post-aspirate backoff at <V> uL"`.
 
-**Why it starts from `gap_pos` and not `blowout_pos`:** the air gap is armed *in air*, before the tip descends into the liquid. The stroke that draws liquid therefore starts at POS 25.0, not at POS 30.0, and the gap's 5 mm is not available for metering. Computing from `blowout_pos` would over-aspirate by the whole air gap - about 94 uL on the p300 curve.
+**Why it is a method and not a subtraction at the call site:** this is the POS the machine actually ends up at, and it is the deepest point of the plunger stroke, so it is the one that must be checked. Every consumer - `Machine._aspirate_at`, `Pipette.table` - goes through here, which means no reported or emitted POS can be one `check_pos` would reject. `tests/test_review_fixes.py::test_5b_table_reports_only_legal_positions` pins that for `table()`.
 
-### `Pipette.backoff_pos(self, volume_uL: float) -> float`
+### `Pipette.max_volume_uL -> float` (property)
 
-The POS after the anti-drip retract, i.e. the position the plunger actually rests at while the tip travels to the dispense target.
-
-- `volume_uL` - requested volume in microlitres.
-
-**Returns:** `round(aspirate_pos(volume_uL) - post_asp_backoff, decimals)`. p300 at 300 uL: 8.888 - 1.0 = `7.888`.
-
-**Raises:** the same as `aspirate_pos`, plus its own `check_pos` on the backed-off value.
-
-**Why it exists as a method rather than a subtraction at the call site:** it validates. `Machine.aspirate_uL` and `Pipette.table` both use it, and the comment in `table()` is explicit about the reason - a bare `asp - eff.post_asp_backoff` in a report could print a POS that `check_pos` would have rejected, so the report and the machine would disagree about what is legal.
-
-### `Pipette.max_volume_uL` (property) -> `float`
-
-The largest volume whose *post-backoff* POS still clears the floor.
-
-**Returns:**
+Largest volume the plunger has stroke for, in microlitres:
 
 ```
-(gap_pos - pos_min - stroke_margin - intercept - post_asp_backoff) / slope
+gap_pos - pos_min - stroke_margin - intercept - post_asp_backoff
+--------------------------------------------------------------- 
+                        slope
 ```
 
-rounded to 4 dp. p300: `(25.0 - 0.0 - 1.0 - 0.122 - 1.0) / 0.0533 = 429.2308` uL. p125: `(25.0 - 0.0 - 1.0 - 0.049 - 1.0) / 0.1274 = 180.1491` uL.
+p300: `(25.0 - 0.0 - 1.0 - 0.122 - 1.0) / 0.0533 = 429.2308 uL`. p125: `(25.0 - 0.0 - 1.0 - 0.049 - 1.0) / 0.1274 = 180.1491 uL`. Both pinned in `tests/test_lab.py`. With the stock configs `pos_min` is 0.0 and these sit above the calibration windows (320 and 140), so the window is what actually binds - the stroke limit matters when `pos_min` is nonzero or a window is widened.
 
-**Raises:** nothing.
+**Why it subtracts both `pos_min` and `post_asp_backoff`:** two separate past defects, one test each.
 
-**Why it subtracts the backoff:** the machine does not stop at `aspirate_pos`. Once the tip is clear of the liquid it retracts a further `post_asp_backoff` (1.0 mm) in air, so the lowest POS the plunger ever visits during an aspirate is the backoff POS. Constraining `aspirate_pos` alone would validate a position the machine passes straight through, and the run would fail at the position after it - or worse, hit the hard stop with 1.0 mm of commanded travel left and lose steps on an open-loop axis with no error at all.
+- **`post_asp_backoff`.** The old script asserted `gap_pos - d >= margin`, which validates the *aspirate* POS - a position the machine passes through and then leaves, because it immediately retracts a further 1.0 mm in air. The constrained position is the one *after* the backoff. `tests/test_lab.py::test_max_volume_accounts_for_backoff` computes the backoff-ignoring bound and asserts the real limit is more than 15 uL below it.
+- **`pos_min`.** The floor `check_pos` enforces is `pos_min + stroke_margin`, not `stroke_margin` alone. Omitting `pos_min` made `check_volume` accept volumes that `check_pos` then rejected mid-primitive - a raise after gcode had already been emitted. `tests/test_review_fixes.py::test_5_max_volume_respects_pos_min` sets `pos_min = 6.0`, asserts the max drops to ~316.66, and then walks every volume from the window floor to that max through `backoff_pos` to prove the two checks now agree exactly.
 
-**Why it subtracts `pos_min`:** the floor is `pos_min + stroke_margin`, exactly the floor `check_pos` enforces, and `pos_min` is where the hard stop *is* rather than an assumed zero. Both current pipettes set `pos_min: 0.0`, so the term vanishes today - but the old p125 script asserted only `POS >= 0` with no margin at all, which is the assumption this parameterisation removes. If the actuator is ever re-zeroed, or a plunger with a mechanical dead length is fitted, the floor moves and every derived limit moves with it, in one place.
+The rule this encodes: **`check_volume` must accept only volumes whose entire stroke, backoff included, survives `check_pos`.** If you touch either, run both tests.
 
-**Note:** for both configured pipettes the *calibration window* is the binding constraint, not the stroke: 320 < 429.2 and 140 < 180.1. This property is therefore currently a guard against a future config - a widened window, a smaller `gap_pos`, a larger backoff - rather than a limit anyone hits today. Do not remove it on the grounds that it never fires.
+### `Pipette.check_volume(volume_uL: float) -> None`
 
-### `Pipette.check_volume(self, volume_uL: float) -> None`
+Two-stage validation; returns `None`, raises `VolumeError`.
 
-Assert a volume is both fitted and reachable. Returns `None`; the point is the raise.
+1. Outside `window` (with a 1e-9 tolerance) - "The curve was never fitted there; the displacement would be an extrapolation." For the p300 that rejects 5 uL and 400 uL, both pinned in `tests/test_lab.py::test_volume_window`.
+2. Above `max_volume_uL` - "needs more stroke than there is", naming the margin off the hard stop.
 
-- `volume_uL` - requested volume in microlitres.
+The window check comes first, so a volume that fails both reports the calibration reason - the more useful one, since widening the window is a measurement job while stroke is a mechanical fact.
 
-**Raises** `VolumeError` for either of two independent reasons:
+### `Pipette.check_pos(pos: float, what: str = "move") -> None`
 
-1. Outside `window` (tolerance 1e-9): "the curve was never fitted there; the displacement would be an extrapolation". A linear fit valid over 8 to 320 uL says nothing about 2 uL, where surface tension and the tip's dead volume dominate.
-2. Above `max_volume_uL`: not enough stroke before POS drops through the `stroke_margin` off the hard stop.
+Validates a single plunger POS against `[pos_min + stroke_margin, blowout_pos]`, both with 1e-9 tolerance. Returns `None`, raises `EffectorError` naming `what`, the offending POS, and the bound it broke (with `pos_min` and `stroke_margin` spelled out so the operator knows which config field to look at).
 
-**Why a protocol calls it directly:** `protocols/accuracy_test.py` pre-checks every test volume up front, before emitting a single line of gcode, so an out-of-range point fails at generation time with a message naming the volume rather than half way through a run.
+- `pos` (float, mm on the plunger axis).
+- `what` (str): a phrase describing the operation, interpolated into the message. Callers pass e.g. `"aspirating 150.0 uL"`, `"mixing 200.0 uL"`.
 
-### `Pipette.check_pos(self, pos: float, what: str = "move") -> None`
+**Why it exists:** `pos_min + stroke_margin` keeps the plunger off its hard stop - crashing a stepper into a mechanical stop loses position silently and every subsequent volume is wrong. The upper bound catches a POS past blowout, which would be commanding travel the actuator does not have. Called by `aspirate_pos`, `backoff_pos`, `prewet` positions via the machine, and directly by `Machine.mix` for the top of its stroke.
 
-Assert a plunger POS is inside the legal band.
+Note the p125's `stroke_margin` of 1.0 is not measured - its old script defined no margin and only asserted `POS >= 0`. The config records that 1.0 was copied from the p300 and that this can only *tighten* the check, never loosen it.
 
-- `pos` - plunger POS in mm.
-- `what` - short description of the operation, interpolated into the message ("aspirating 400.0 uL", "post-aspirate backoff at 300.0 uL", or the op name when called from `Machine.actuator`).
+### `Pipette.prewet_enabled -> bool`
 
-**Raises** `EffectorError` if `pos < pos_min + stroke_margin` (1.0 mm for both pipettes) or `pos > blowout_pos`, with 1e-9 tolerance at both ends. The messages spell out the arithmetic: "below the 1.0 mm floor (pos_min 0.0 + margin 1.0)".
+`spec["prewet"]["enabled"]`, default `False`. True for the p300, false for the p125 (whose old script performs no prewet at all). `Machine.prewet` raises `ProtocolError` if called when this is false - "enable it there rather than calling prewet() anyway."
 
-**Why:** it is the one definition of "a legal plunger position", and it is applied at three levels - inside `aspirate_pos`/`backoff_pos` when the value is derived, inside `Machine.actuator` for *every* emitted `ACTUATOR_MOVE` including hand-picked ones like `prewet_asp_pos`, and again in `lab/simulate.py` (which re-derives the same `pos_min + stroke_margin` floor independently while walking the finished gcode). The upper bound matters as much as the lower: commanding past `blowout_pos` drives the plunger into the other stop.
+### `Pipette.prewet_cycles -> int`
 
-### `Pipette.prewet_enabled` (property) -> `bool`
+`spec["prewet"]["cycles"]`, default 0. p300: 3. The default when `Machine.prewet(cycles=None)`.
 
-`prewet.enabled`, default `False`. `True` for p300, `False` for p125 (whose old script did no prewet at all).
+### `Pipette.prewet_min_cycles -> int`
 
-**Why:** `Machine.prewet()` raises `ProtocolError` if you call it on an effector with prewet disabled, rather than silently generating a wetting sequence the calibration was not fitted with.
+`spec["prewet"]["min_cycles"]`, default 0. p300: 3. A **floor**, not a default: `Machine.prewet` refuses fewer than this even when the caller asks explicitly. Prewetting fewer times than the calibration was fitted with changes the delivered volume, so the protocol is not allowed to shorten it silently.
 
-### `Pipette.prewet_cycles` (property) -> `int`
+### `Pipette.prewet_asp_pos -> float`
 
-`prewet.cycles`, default 0. 3 for p300.
+The POS the plunger draws to on each prewet cycle. Returns `spec["prewet"]["asp_pos"]` when present and non-null, otherwise derives `blowout_pos - prewet.displacement_mm`. For the p300 both routes give 10.0 (30.0 - 20.0).
 
-### `Pipette.prewet_min_cycles` (property) -> `int`
+**Why measured from `blowout_pos` and not `gap_pos`:** prewetting happens with no air gap armed - the plunger starts bottomed, draws, and pushes back. That is a different reference from `aspirate_pos`, and the config says so explicitly (`asp_pos_note: "measured from BOTTOMED, not from gap_pos"`).
 
-`prewet.min_cycles`, default 0. 3 for p300.
+**Note:** the fallback branch does `float(p["displacement_mm"])` unguarded, so on an effector whose `prewet` block has neither `asp_pos` nor `displacement_mm` - the p125, which has only `enabled: false` - this raises `KeyError` rather than a `LabError`. Unreachable today because `Machine.prewet` checks `prewet_enabled` first, but it is one refactor away from being a raw `KeyError` in front of the operator.
 
-**Why both exist:** `cycles` is the default count, `min_cycles` is a floor a caller cannot go under - `Machine.prewet(cycles=1)` on the p300 raises. The wetting of the tip wall is part of what the gravimetric fit measured; fewer cycles than the fit used makes the stored coefficients wrong in a way no check downstream can see.
+### `Pipette.table(volumes: List[float]) -> List[Dict[str, float]]`
 
-### `Pipette.prewet_asp_pos` (property) -> `float`
+One dict per volume with keys `volume_uL`, `displacement_mm`, `aspirate_pos`, `backoff_pos`. Raises whatever `displacement_mm` / `aspirate_pos` / `backoff_pos` raise on the first bad volume.
 
-The plunger POS for the aspirate half of a prewet cycle. Returns `prewet.asp_pos` when present and non-null (10.0 for p300), otherwise derives `round(blowout_pos - prewet.displacement_mm, decimals)`.
+**Why `backoff_pos` and not `aspirate_pos - post_asp_backoff`:** going through the validating method means the table cannot print a POS the machine would refuse to move to. A report that shows a legal-looking number for an illegal move is worse than an exception. Used by `tests/smoke_geometry.py` over `fractions([0.10, 0.50, 0.75, 1.00])`.
 
-**Why it is measured from `blowout_pos` and not `gap_pos`:** prewet is a full wet-and-blow-out cycle with no air gap armed, so its reference is the bottomed plunger. The config note on `p300.prewet.asp_pos` says so explicitly: "measured from BOTTOMED, not from gap_pos". Using `gap_pos` here would shorten the wetting stroke by the 5 mm air gap.
+### `Pipette.fractions(fracs: List[float]) -> List[float]`
 
-**Note:** on a config where `prewet` has neither `asp_pos` nor `displacement_mm` - which is p125, whose block is just `{"enabled": false}` - this property raises a bare `KeyError('displacement_mm')`, not a `LabError`. `Machine.prewet()` checks `prewet_enabled` first so the normal path never reaches it, but any report or introspection code that touches the property unconditionally will crash ungracefully on p125.
+Test volumes as fractions of `nominal_uL`, each rounded to 4 decimals. `fractions([0.1, 0.5, 0.75, 1.0])` gives `[30.0, 150.0, 225.0, 300.0]` on the p300 and `[12.5, 62.5, 93.75, 125.0]` on the p125.
 
-### `Pipette.table(self, volumes: List[float]) -> List[Dict[str, float]]`
-
-Build the per-volume displacement table for a report or a dry-run printout.
-
-- `volumes` - list of volumes in uL.
-
-**Returns:** one dict per volume with keys `volume_uL`, `displacement_mm`, `aspirate_pos`, `backoff_pos`.
-
-**Raises:** `VolumeError` or `EffectorError` on the first bad volume, so the table is all-or-nothing - you never get a partial table with the failing row quietly dropped.
-
-**Why:** it replaces the hardcoded tables the old scripts carried. For p300 at ISO fractions the computed displacements are 1.721 / 8.117 / 12.114 / 16.112 mm against the retired literal `[1.722, 8.123, 12.123, 16.123]`; for p125, 1.642 / 8.012 / 11.993 / 15.974 against `[1.671, 8.020, 11.988, 15.956]`. The p125 10% point moves by 0.029 mm, about 1.8% of a 12.5 uL target, which is the difference between passing and failing that ISO 8655-6 point.
-
-### `Pipette.fractions(self, fracs: List[float]) -> List[float]`
-
-Convert fractions of nominal volume into absolute volumes.
-
-- `fracs` - list of fractions, e.g. `[0.1, 0.5, 0.75, 1.0]`.
-
-**Returns:** `[round(f * nominal_uL, 4) for f in fracs]`. p300: `[30.0, 150.0, 225.0, 300.0]`. p125: `[12.5, 62.5, 93.75, 125.0]`.
-
-**Raises:** nothing - it does *not* validate. `protocols/accuracy_test.py` calls `fractions()` then loops `check_volume()` over the result.
-
-**Why:** the ISO 8655-6 test points are a property of the standard, not of the pipette, so one protocol expresses them once as fractions and both pipettes derive their own absolute volumes. That is what let two per-pipette scripts collapse into one `accuracy_test.py`.
+**Why it exists:** the ISO accuracy-and-precision points are defined as fractions of nominal, so the same protocol runs unchanged on either pipette and lands on that pipette's correct volumes. `protocols/accuracy_test.py` builds its volume series through this. The values it returns are not themselves validated - `displacement_mm` does that later - and note that the 10% p125 point shifts about 1.8% of its target versus the old hardcoded table, which is recorded in `p125.json -> calibration.note` precisely because it is the ISO point where it matters.
 
 ---
 
-### class `Gripper`
+### `class Gripper(Effector)`
 
-Plate gripper. Not built. `kind = "gripper"`. The class exists so `load()` has something to dispatch `"kind": "gripper"` onto, and so the placeholder refusal happens in one place.
+`Gripper(cfg: config.ConfigFile)` - `kind = "gripper"`. **Not built.** `gripper.json` has `status: "placeholder"` and every numeric field `null`, so `load("gripper")` refuses unless `allow_placeholder=True`.
 
-### `Gripper.__init__(self, cfg: config.ConfigFile) -> None`
+Attributes: `open_pos`, `closed_pos`, `grip_pos` (raw from `spec["actuator"]`, all `None` today, deliberately *not* coerced with `float()` so the class can be constructed for inspection); `carries_labware` (bool, default `True`); `held` (`Optional[str]`, initialised `None`).
 
-Reads the actuator block without coercing types, since every value in it is currently `null`.
+**Why the class exists at all:** so `load()` has something to dispatch to and `available()` lists the file. That is the whole of the integration - it has no motion methods, `lab/deck.py` does not reference effectors, and `lab/simulate.py` validates plunger POS only for `Pipette`, so a gripper POS would reach disk unvalidated. `tests/test_lab.py::test_gripper_is_a_placeholder` pins both halves: the refusal for motion, and the successful dispatch to this class under `allow_placeholder=True`.
 
-- `self.open_pos`, `self.closed_pos`, `self.grip_pos` - raw values from `actuator`, all `None` today. POS values on the actuator axis, assuming the gripper shares the `ACTUATOR_MOVE` macro (the config leaves that undecided and suggests a `macro_name` field if it does not).
-- `self.carries_labware` - `bool`, default `True`.
-- `self.held` - `Optional[str]`, initialised to `None`. **Written by nothing in the repo.**
+**Why `held` is here and not on `Machine`:** a gripper changes the deck *layout* at run time - picking a plate empties a slot and fills the effector - which a pipette never does. Naming the state now marks where that tracking will have to live. Nothing writes `held` today, and nothing reads `carries_labware`; both are declarations of intent. `gripper.json -> todo_before_use` lists what building this actually requires (measure the positions, add `grip()`/`release()`/`move_labware()` to `Machine`, teach `Simulator` to validate a gripper POS and track held labware, decide whether it drives `ACTUATOR_MOVE` or its own macro).
 
-**Raises:** nothing. Unlike `Pipette.__init__`, it validates nothing, because there is nothing valid to validate yet.
+### `Gripper.require_ready() -> None`
 
-**Why `held` is here at all:** a gripper mutates the *deck layout* at run time, which a pipette never does - picking a plate empties a slot and fills the effector. That state has to live with the effector rather than the deck, and the simulator will need it. Nothing tracks it yet; see the `carries_labware_note` in `config/effectors/gripper.json`, and note that `lab/simulate.py` validates plunger POS only for `Pipette`, so a gripper POS would today be emitted entirely unchecked.
+Raises `EffectorError` listing whichever of `open_pos`, `closed_pos`, `grip_pos` are still `None`, naming the file to measure them into. Returns `None` when all three are set.
 
-### `Gripper.require_ready(self) -> None`
-
-Refuse to proceed while the jaw positions are unmeasured.
-
-**Raises:** `EffectorError` naming the still-null fields and the file to put them in: "gripper: cannot generate motion, these are still null in config/effectors/gripper.json: ['open_pos', 'closed_pos', 'grip_pos']. Measure them first."
-
-**Why:** it is the guard the future `grip()` / `release()` / `move_labware()` primitives on `Machine` should call first. Today it is unreachable from any motion path because those primitives do not exist.
-
-**Note:** it checks only the three jaw positions. `actuator.pos_max` and `actuator.stroke_margin` are also `null` in the config and would be needed for any POS bounds check equivalent to `Pipette.check_pos`; nothing checks them.
+**Note:** no caller exists yet. It is the guard the future `grip()` / `release()` primitives are expected to call first, so that motion generation cannot begin from placeholder numbers.
 
 ---
-
-### Module-level functions
-
-### `_KINDS`
-
-`{"pipette": Pipette, "gripper": Gripper}`. Module-private dispatch table, not a function. The only thing you edit when adding a new effector kind, and `load()` quotes `sorted(_KINDS)` in its error message so an unsupported kind tells the reader exactly what to add and where.
-
-There are no private helper *functions* in this module. Every callable is public.
 
 ### `load(effector_id: str, allow_placeholder: bool = False) -> Effector`
 
-Load one end effector by id, dispatching on its `kind` to the right class.
+The only way a protocol should obtain an effector. Loads `config/effectors/<effector_id>.json` and returns an instance of the class registered for its `kind`.
 
-- `effector_id` - the filename stem under `config/effectors/`, i.e. `"p300"`, `"p125"`, `"gripper"`.
-- `allow_placeholder` - pass `True` only to *inspect* a placeholder file. Never to generate motion.
+- `effector_id` (str): the file stem, e.g. `"p300"`. Must appear in `config.available_effectors()`.
+- `allow_placeholder` (bool): permit an effector whose `status` is `"placeholder"`. **Pass `True` only to inspect the file, never to generate motion.**
 
-**Returns:** a `Pipette` or a `Gripper`, already fully validated by its own `__init__`.
+Returns a `Pipette` or `Gripper` (`_KINDS = {"pipette": Pipette, "gripper": Gripper}`). Raises `EffectorError` for an unknown id (listing what is available), an unrecognised `kind` (telling you to add a class to this module), or a placeholder without the override. Constructor validation - the calibration model, the air-gap identity - fires here too, so a bad config is caught at load rather than at the first aspirate.
 
-**Raises `EffectorError`** in three cases:
-
-1. Unknown id. The check is against `config.available_effectors()` (a glob of `config/effectors/*.json`), so a typo produces "no effector 'p3000'. Available: ['gripper', 'p125', 'p300']" instead of a `FileNotFoundError` naming a path.
-2. Unknown `kind` - "Add a class to lab/effector.py to support it."
-3. The file is a placeholder and `allow_placeholder` is `False`: "every numeric field is unmeasured and it must not be used to generate motion."
-
-Also propagates `FileNotFoundError` / `ValueError` from `lab/config.py`, and `KeyError` / `EffectorError` from the class constructor.
-
-**Why the placeholder gate is here:** it is the last chokepoint before an effector object reaches `Machine`. `Machine.__init__` calls `load_effector(effector)` with no `allow_placeholder` argument, so `Machine(effector="gripper", ...)` cannot be constructed at all - the refusal happens before any gcode object exists. That is the only thing standing between the gripper's all-null config and a run that emits unvalidated motion, given that `lab/deck.py` does not consult effectors and `lab/simulate.py` skips POS validation for non-pipettes.
-
-**Note:** `load()` never checks that `cfg.data["id"]` matches `effector_id`. A file `p999.json` containing `"id": "p300"` loads happily as an effector with `id == "p300"`, and `Machine.config_hashes()` would then write the manifest key `effectors/p300.json` against the SHA-256 of `p999.json` - a provenance record naming a file that is not the one that was read.
+**Why the placeholder gate:** the failure mode being blocked is generating a full gcode file from `null`-derived numbers and only discovering it at the machine. `tests/test_lab.py::test_unknown_effector` and `::test_gripper_is_a_placeholder` cover both refusals.
 
 ### `available() -> List[str]`
 
-Sorted list of every effector id with a JSON file on disk: `['gripper', 'p125', 'p300']`.
+Sorted ids of every effector JSON on disk - `["gripper", "p125", "p300"]` today. Discovery only; says nothing about whether an id is usable (`gripper` is listed and will not load for motion).
 
-**Raises:** nothing; returns `[]` if `config/effectors/` does not exist.
+Used as the `choices` for the `--effector` argument in `protocols/accuracy_test.py` and `protocols/centrifuge_test.py`, so adding a file to `config/effectors/` makes it selectable on the command line with no code change. That is the "one JSON per end effector" seam, pinned by `tests/test_lab.py::test_one_json_per_effector`.
 
-**Why:** `protocols/accuracy_test.py` passes it straight to `argparse` as `choices=`, so `--effector` is validated by the filesystem rather than by a hardcoded list that would go stale the moment someone adds a file. It deliberately includes placeholders - `--effector gripper` is offered by the CLI and then refused by `load()` with an explanation, which is more useful than the id simply not existing.
-
----
-
-### Why uL to mm conversion lives here and nowhere else
-
-The scripts this library replaces carried the calibration in three places at once: a comment stating the curve, a hardcoded list of displacements, and the volumes those displacements were supposed to correspond to. In `examples/300ulaccuracyprecision.py` the comment said `0.05338*V + 0.1218` while the table said `[1.722, 8.123, 12.123, 16.123]` - and the table was what the machine actually ran. The two had drifted, and nothing could detect that, because a millimetre value in a script is just a number.
-
-Concentrating the conversion in `Pipette.displacement_mm` gives four properties that no amount of care at the call site can:
-
-1. **A displacement cannot disagree with the volume it claims to be**, because it is computed from that volume at generation time. `config/effectors/p300.json` states the rule directly: "Store coefficients ONLY. Displacements are computed at runtime. No mm value is ever typed into a protocol script."
-2. **Every conversion is validated.** `displacement_mm` calls `check_volume` before it multiplies, so there is no path from a volume to a plunger position that skips the window and stroke checks. If the conversion were inline in a protocol, each protocol would have to remember.
-3. **Re-fitting the curve is a one-file edit** whose blast radius is exactly the coefficients, and the new SHA-256 lands in the next run manifest automatically.
-4. **The report and the machine cannot diverge**, since `equation`, `table()` and the emitted `ACTUATOR_MOVE` values all come out of the same two floats. Both p300 and p125 record in their configs the older curves they supersede, so the change is auditable rather than silent.
-
-The same argument is why `z_for` lives on the effector: both conversions turn an operator-meaningful quantity (a volume, a labware) into a machine coordinate, and both are only correct relative to which effector is fitted.
+Respects the `LAB_CONFIG` environment variable through `config.config_dir()`, which is how the tests point the whole library at a copied config tree.
 
 ---
 
 ## `lab/deck.py`
 
-The resolved deck. Everything about *where things are* on the machine lives here: the axis envelope, the nine slot centres, the fixed stations, the keep-out bands, the derived stage surface, and the labware placements read out of `layout.json`. `Deck.load()` joins `config/deck.json` + `config/labware.json` + `config/layout.json` into one object, and validates the joins as it goes, so a protocol can write `deck.placement("tubes").well("A1")` and never contain a coordinate literal. The module answers questions and reports problems; it never emits gcode and never moves anything. Motion planning is `lab/machine.py`, and the crash checks that consume these answers are in `lab/simulate.py`.
+The resolved deck: the machine envelope, the 3x3 slot grid, the fixed stations,
+the keep-out bands, and everything currently loaded. `Deck.load()` reads
+`config/deck.json` + `config/labware.json` + `config/layout.json`, resolves every
+placement to machine coordinates at construction time, and refuses to build a deck
+whose config contradicts itself. Everything downstream (`lab/machine.py` for
+routing, `lab/simulate.py` for checking, `lab/logbook.py` for the manifest) asks
+this object rather than carrying coordinates of its own, which is why a protocol
+can say `deck.placement("plate1").well("A1")` and never contain a literal.
 
-Two conventions run through every function below. **+Z is down**: Z=0 is home at the top, a larger commanded Z is physically lower, so "high enough to be safe" is expressed as `z < limit`. And **the X frame has already been corrected**: the X travel limit grew by 70 mm, `deck.json` stores the post-shift numbers (`stations.water.xy` X 0 -> 70, `stations.park.xy` X 350 -> 420, layout `tubes.anchor_xy` X 186 -> 256), and nothing in this module applies a shift at runtime. If you find yourself adding +70 anywhere in code, you are fixing the wrong file.
+Two things about this module are worth holding in mind before reading any single
+method. First, **+Z is DOWN**: every Z here is a commanded Z, `Z=0` is home at the
+top, and "higher" always means a *smaller* number. Second, the module makes a hard
+distinction between *derived* and *stored* geometry. The slot pitch, the stage
+region, the slot cells and the bare-nosecone edge limit are all computed from the
+slot table and from single measurements, specifically so they cannot drift out of
+step with their source. Where the config does duplicate a coordinate for human
+convenience (`slot_center` in a placement), `__init__` holds the copy to the
+original and raises if they disagree.
 
-### `DeckError`
+---
+
+### `class DeckError(LabError)`
 
 ```python
 class DeckError(LabError)
 ```
 
-Raised for a deck the config cannot describe: an unknown placement/station/slot/macro/feedrate name, a duplicate placement name, two placements claiming one slot, or a placement whose `slot_center` copy disagrees with `deck.json`. Subclasses `LabError` (defined in `lab/effector.py`), so a protocol can catch that one base class and print the message.
+Raised for a deck the config cannot describe: an unknown placement, station, slot,
+macro or feedrate name; a layout referencing labware that is not in
+`labware.json`; two placements with the same name; two placements claiming the same
+slot; a placement whose `slot_center` copy disagrees with `deck.json`.
 
-**Note:** not every failure in `Deck.__init__` is a `DeckError`. The constructor indexes `d["axes"]`, `d["feedrates"]`, `d["z"]` and `labware_cfg["labware"]` directly, so a truncated config raises bare `KeyError`; and `build_placement()` in `lab/labware.py` raises `KeyError`/`ValueError` (unknown grid model, `corners` block missing, rotation given with the `corners` model, stale `corners.solved` values) which propagate out of `Deck.load()` untouched. Catching only `DeckError` around a load will miss those.
+**Why:** it subclasses `LabError` (from `lab/effector.py`) along with
+`EffectorError`, `VolumeError`, `ProtocolError` and `SimulationError`, so a
+protocol can wrap a whole run in one `except LabError` and still get a specific
+type when it wants one. `tests/test_review_fixes.py::test_8_all_errors_share_a_base`
+pins that.
 
-### `Axis`
+Note the asymmetry that comes out of `lab/labware.py`: config errors *inside* a
+placement (a missing `corners` block, a stale `corners.solved`, an unresolvable
+A1) surface as `KeyError` / `ValueError` from `build_placement`, not as
+`DeckError`. Only the deck-level integrity checks raise `DeckError`.
+
+---
+
+### `class Axis`
 
 ```python
 @dataclass(frozen=True)
@@ -923,19 +1033,32 @@ class Axis:
     home: float
 ```
 
-One machine axis as configured, no motion semantics attached. `Deck` builds three from `deck.json` `axes`: `x` = (0.0, 420.0, home 420.0), `y` = (0.0, 580.0, home 0.0), `z` = (0.0, 270.0, home 0.0). All in mm.
+One kinematic axis, read straight from `deck.json` -> `axes`. Values in mm.
+Current deck: `x = Axis("x", 0.0, 420.0, 420.0)`, `y = Axis("y", 0.0, 580.0, 0.0)`,
+`z = Axis("z", 0.0, 270.0, 0.0)`.
 
-`home` is stored because X homes at its **maximum** (420) and counts down toward 0, which is the fact behind the whole +70 frame story: the same physical endstop used to be called 350. Nothing here validates `min < max`, and the Z max of 270 is the kinematic limit only - the real Z limit is effector- and location-dependent (see `simulate.py`).
+**Why:** X homes at its *maximum* (420) and counts down toward 0, so `home` cannot
+be assumed equal to `min`. Keeping `home` as a stored field rather than deriving it
+is what keeps that fact in the data. The Z axis here is the *kinematic* limit only
+(0-270); the real Z limit is effector-dependent and much shallower, and lives in
+`lab/simulate.py` (`effective_z_limit`) built from `z_stage_surface` and the tip
+length.
 
-### `Axis.contains`
+#### `Axis.contains(self, v: float, tol: float = 1e-6) -> bool`
 
-```python
-def contains(self, v: float, tol: float = 1e-6) -> bool
-```
+Is `v` (mm) inside `[min, max]`, allowing `tol` mm of slack at each end?
+Returns `bool`. Raises nothing.
 
-True if `v` lies within `[min - tol, max + tol]`. `v` is a coordinate in mm; `tol` is the mm slack allowed at each end. Returns a bool, raises nothing. The tolerance exists so a coordinate arrived at by arithmetic (a pitch sum, a mean of slot centres) is not rejected for landing on X 420.0000000001. Do not raise `tol` to paper over a real overrun; 1e-6 mm is float noise, anything larger is a genuine off-machine coordinate.
+**Why the tolerance:** commanded coordinates are the result of arithmetic on
+measured values (pitch solves, half-pitch expansions, rounding to 4 dp), so an
+exact endpoint like X 420 or X 0 can land a fraction of a micron outside. Without
+the slack, a legal move to the home position would intermittently read as an
+envelope violation. `Machine._route_problem` uses `deck.x.contains` /
+`deck.y.contains` to reject dogleg waypoints, so this is on the routing hot path.
 
-### `KeepOut`
+---
+
+### `class KeepOut`
 
 ```python
 @dataclass(frozen=True)
@@ -949,46 +1072,63 @@ class KeepOut:
     tipped_is_error: bool = True
 ```
 
-An X band in which one class of motion is forbidden unless the effector is high enough. There is exactly one in the current config:
+An X band in which Y motion collides with a mechanism unless the effector is high
+enough. There is exactly one on the current deck, from `deck.json` -> `keepouts`:
 
-```
-id "tip_ejector", x_range (148.0, 162.0), forbids "y_motion",
-safe_when_z_below 60.0, whitelist ("eject_tip",)
-```
+- `id` `"tip_ejector"`
+- `x_range` `(148.0, 162.0)` mm - the ejector lane X 155 plus/minus 7.0
+- `forbids` `"y_motion"`
+- `safe_when_z_below` `60.0` - a commanded Z, stated for the p300 with **no tip**
+- `whitelist` `("eject_tip",)`
 
-The band is the ejector lane X 155 plus or minus 7.0. Y motion through it collides with the ejector mechanism unless the effector is above Z 60, i.e. commanded `z < 60`. `safe_when_z_below` is a **commanded** Z, and because +Z is down a smaller number is physically higher - hence the field name and the `<` in `z_is_safe`. `whitelist` names the operations allowed to violate the band; `simulate._check_keepout` additionally requires the individual step to carry `detail["keepout_exempt"]`, so only the waypoints that actually engage the ejector are exempt and the approach/retract around them are checked like any other traverse.
+**Why the field is named `safe_when_z_below`:** because +Z is down, a *smaller*
+commanded Z is physically *higher*, so the band is safe when `z < 60.0`. The name
+is deliberately phrased in the commanded-Z direction rather than as "safe above",
+which would read correctly in English and evaluate backwards in code.
 
-The 60.0 was stated for the p300 with **no tip**. A fitted tip reaches lower, the safe Z shrinks, and that shrunken value was never measured - so `simulate` treats any *tipped* Y traverse through the band as a hard failure regardless of Z. The 14 mm band width is carried over from an older band centred on X 85 and is listed in `deck.json` `uncalibrated`; `x_range` is the single source of truth for the width, so correct it there if you measure the mechanism.
+**The physical constraint the band encodes:** the 14 mm width is carried over from
+a previously documented band centred on X 85 and is flagged in
+`deck.json` -> `uncalibrated` as unverified at this location. The lane X 155 itself
+is operator-confirmed and already in the post-`+70` frame. `x_range` is the single
+source of truth - do not re-derive it from `lane_x`.
 
-**Note:** `tipped_is_error` is dead. `Deck.__init__` never passes it (there is no such key in `deck.json`), so it is always the `True` default, and `simulate._check_keepout` hardcodes the tipped failure instead of consulting it. Either wire it up or delete it; as written it invites someone to set it in JSON and believe the setting took effect.
+**Note:** `tipped_is_error` is never populated from config (`Deck.__init__` builds
+`KeepOut` without it) and is never read anywhere in the repo. The behaviour it
+names is hard-coded in `Simulator._check_keepout`, which fails *any* tipped Y move
+through the band regardless: `safe_when_z_below` was measured bare, a fitted tip
+reaches 52.25 mm lower, and the tipped limit was never measured. The field is dead
+and a config author setting it will see no effect.
 
-### `KeepOut.contains_x`
+#### `KeepOut.contains_x(self, x: float) -> bool`
 
-```python
-def contains_x(self, x: float) -> bool
-```
+Is this single X coordinate (mm) inside the band, inclusive of both edges?
+Returns `bool`. Raises nothing.
 
-True if the single X coordinate `x` (mm) is inside the band, bounds inclusive. This is the test for "may I move Y here", because a Y move happens at one fixed X. Used by `Deck.keepouts_hit_by_y_move` and by `Machine._nearest_clear_x`.
+**Why:** this is the test for a **Y** move, because a Y move happens at one fixed
+X. `Deck.keepouts_hit_by_y_move` is the only caller.
 
-### `KeepOut.spans_x`
+#### `KeepOut.spans_x(self, x0: float, x1: float) -> bool`
 
-```python
-def spans_x(self, x0: float, x1: float) -> bool
-```
+Does a straight X move from `x0` to `x1` (mm, either order) enter the band at all?
+Returns `bool`. Raises nothing.
 
-True if a straight X move from `x0` to `x1` (mm, either order) enters the band at all - implemented as an interval overlap, so it is correct whichever direction the move runs. Returns a bool, raises nothing.
+**Why:** the interval test, as opposed to `contains_x`'s point test. It normalises
+the direction itself, so callers do not have to know whether the move is toward
+higher or lower X - relevant on a machine whose X counts down from home.
 
-It exists to keep the distinction that makes the whole keep-out scheme workable: a *pure X* move straight through the ejector band is harmless, only *Y* motion inside it collides. A protocol that needs to know "did my traverse pass over the ejector" asks this; a protocol that needs to know "may I turn here" asks `contains_x`.
+#### `KeepOut.z_is_safe(self, z: float) -> bool`
 
-### `KeepOut.z_is_safe`
+Is a commanded `z` (mm) high enough to clear this mechanism?
+Returns `z < safe_when_z_below`, and **`False` when `safe_when_z_below` is `None`**.
 
-```python
-def z_is_safe(self, z: float) -> bool
-```
+**Why the `None` case returns `False`:** an unmeasured safe height is not a pass.
+A band with no measured clearance is treated as never safe, so a missing
+measurement blocks the move instead of silently permitting it. This is the same
+rule as convention 3 in `CLAUDE.md`, applied to a boolean instead of a warning.
 
-True if commanded `z` (mm) is high enough to clear the band, i.e. `z < safe_when_z_below`. Returns `False` when `safe_when_z_below` is `None`, which is the important behaviour: an unmeasured clearance means *never safe*, not *no constraint*. Raises nothing.
+---
 
-### `Station`
+### `class Station`
 
 ```python
 @dataclass(frozen=True)
@@ -996,722 +1136,968 @@ class Station:
     name: str
     xy: Vec2
     z: Optional[float]
-    spec: Dict[str, Any]
+    spec: Dict[str, Any] = field(default_factory=dict)
 ```
 
-A fixed named position that is not a slot. `xy` is machine mm; `z` is a commanded Z or `None` when the station has no single meaningful depth; `spec` is the raw `deck.json` block, kept whole so routine-specific fields survive without this dataclass having to grow a field per station.
+A single fixed XY position on the machine that is not a slot. `xy` is mm; `z` is a
+commanded Z or `None` when the station has no single meaningful Z. `spec` is the
+whole raw `deck.json` station block, so per-station extras stay reachable without
+this dataclass having to grow a field per station.
 
-The three current stations show why `spec` matters:
+Current stations:
 
-- `water` - xy (70.0, 175.0), z `None`. Submerge depth is per-effector (`effectors/*.json` -> `z_for_labware.reservoir_water.work`), so there is no station Z.
-- `park` - xy (420.0, 0.0), z 0.0. X 420 is X home, which is what this station always meant.
-- `tip_eject` - xy (155.0, 89.0), z `None`, with the whole ejection routine in `spec`: `lane_x` 155.0, `approach_y` 83.0, `engage_y` 88.0, `retract_y` 80.0, `z_below_hook` 145.0, `z_strip` 137.0, `rehome_after` true, `validated` false. Z145 -> Z137 is an 8 mm **upward** stroke, and that stroke is the strip. `rehome_after` is not optional: the strip force can skip steps on an open-loop machine, so commanded position is untrustworthy afterward and a G28 must follow. `validated: false` means this sequence has never run on hardware and no gcode in the repo contains a reference ejection.
+| name | xy | z | notes |
+|---|---|---|---|
+| `water` | `(70.0, 175.0)` | `None` | a **dip point**, not the trough centre. Submerge depth is per-effector (`effectors/*.json` -> `z_for_labware.reservoir_water.work`). Was X 0 pre-shift; `+70` applied. |
+| `park` | `(420.0, 0.0)` | `0.0` | X 420 is X home; the station always meant "go home in X". Was X 350 pre-shift. |
+| `tip_eject` | `(155.0, 89.0)` | `None` | the whole routine lives in `spec`: `lane_x` 155.0, `approach_y` 83.0, `engage_y` 88.0, `retract_y` 80.0, `z_below_hook` 145.0, `z_strip` 137.0, `rehome_after` true, `validated` **false**. |
 
-### `Deck.__init__`
+**Why `z` is optional:** for `water` the working Z depends on which effector and
+tip is fitted, and for `tip_eject` there are two Zs (145 then 137), so a single
+number would be a lie in both cases. `park` genuinely has one: Z 0, home.
+
+**Why `spec` is kept:** `tip_eject` carries seven routine-specific values and a
+`validated: false` flag. Promoting each to a `Station` field would mean every other
+station carrying six `None`s, and `Deck.uncalibrated()` reads `validated` out of
+the raw dict anyway. `Z145 -> Z137` is an 8 mm **upward** stroke - that is the
+strip.
+
+---
+
+### `class Deck`
 
 ```python
-def __init__(self, deck_cfg: config.ConfigFile,
-             labware_cfg: config.ConfigFile,
-             layout_cfg: config.ConfigFile) -> None
+class Deck:
+    def __init__(self, deck_cfg: config.ConfigFile,
+                 labware_cfg: config.ConfigFile,
+                 layout_cfg: config.ConfigFile) -> None
 ```
 
-Resolves three loaded configs into one deck. Prefer `Deck.load()`; construct directly only to load configs from unusual places or to feed synthetic configs in a test.
+Resolves three config files into one queryable object. Parameters are
+`ConfigFile`s (from `lab/config.py`), which carry both the parsed JSON and the
+sha256 of the bytes it came from - the hashes go into the run manifest so a
+generated `.gcode` can be traced back to the exact config.
 
-What it populates: `id`, `raw` (the whole deck dict, kept for the derived Z properties), `x`/`y`/`z` axes, `feedrates` (`travel` 6000, `hold` 3000, `tip_press` 600, `wipe` 1500, mm/min, coerced to `int`), `z_home` 0.0, `z_travel` 5.0, `z_stage_surface` 114.75, `slots` (nine `str` keys -> `(x, y)`), `stations`, `keepouts`, `macros`, `catalogue` (every labware in `labware.json`, placed or not), `placements` (only what `layout.json` loads), and `open_questions` (the layout's list of things still unresolved, currently three, including whether any loaded rack stands higher than the raised location edges).
+Attributes after construction: `id`, `raw` (the whole deck dict), `x`/`y`/`z`
+(`Axis`), `feedrates` (`{"travel": 6000, "hold": 3000, "tip_press": 600,
+"wipe": 1500}`), `z_home` 0.0, `z_travel` 5.0, `z_stage_surface` 114.75,
+`slots` (`{"1": (336.0, 365.0), ...}` keyed by **string**), `stations`,
+`keepouts`, `macros`, `catalogue` (labware id -> `Labware`), `placements` (name ->
+`Placement`), `open_questions`.
+
+**Raises `DeckError`** during construction when: a layout placement names labware
+absent from `labware.json`; two placements share a name; two placements claim the
+same slot (`_check_slot_occupancy`); a placement's `slot_center` convenience copy
+disagrees with `deck.json` (`_check_recorded_slot_center`). Propagates `KeyError`
+and `ValueError` out of `lab/labware.py` for placement-level config faults.
 
-What it validates, and why each check is here rather than left to a code review:
+**Why it resolves everything up front:** a placement that cannot be resolved is a
+config bug, and the cheapest place to discover it is before a single line of gcode
+exists. Nothing reaches disk until simulation passes, and nothing gets as far as
+simulation if the deck will not build.
+
+One implementation detail worth knowing: for slot-mounted labware dimensioned from
+the location edges (`a1_from_slot_edge`, which `tube_rack_1p5` uses), `__init__`
+injects `_slot_pitch` into a **copy** of the layout entry before calling
+`build_placement`, because the cell size is the slot pitch and only the `Deck`
+knows it. `lab/labware.py` raises if that injection is missing.
 
-- A placement naming a labware absent from `labware.json` raises `DeckError` listing the known ids.
-- Two placements with the same `name` raise `DeckError`; the dict would otherwise silently keep the last one.
-- `_check_recorded_slot_center` per placement, then `_check_slot_occupancy` over the whole layout.
+#### `Deck.load(cls, layout: str = "layout.json") -> Deck`
 
-Note `z_home` (from `deck.json` `z.home`) duplicates `axes.z.home`; both are 0.0 and nothing reconciles them.
+Classmethod. Loads `deck.json`, `labware.json` and the named layout from the
+config directory (`config/`, or `$LAB_CONFIG`).
 
-### `Deck.load`
+**Parameter:** `layout` - filename; `lab/config.load_layout` appends `.json` if
+absent, so `"layout_test"` works.
 
-```python
-@classmethod
-def load(cls, layout: str = "layout.json") -> "Deck"
-```
+**Returns** a fully resolved `Deck`. **Raises** `FileNotFoundError` for a missing
+file, `ValueError` for invalid JSON, `DeckError` for the integrity failures above.
 
-The normal entry point. `layout` is a filename inside the config directory; `config.load_layout` appends `.json` if you omit it, so `Deck.load("layout")` and `Deck.load("layout.json")` are the same call. Returns a fully validated `Deck`. Raises `FileNotFoundError` if a config is missing, `ValueError` for malformed JSON, and `DeckError`/`KeyError`/`ValueError` for the integrity failures listed above.
+**Why the layout is a parameter:** `layout.json` is the per-run file - the
+operator's actual bench, which changes between runs. Tests that assert *behaviour*
+pass `layout_test.json`, a fixture holding every piece of labware at once; only the
+handful of tests that deliberately assert the shipped bench call `Deck.load()` with
+no argument. Today the shipped bench is `tips` slot 3, `big_tubes` (1.5 mL) slot 5,
+`plate1` slot 1, `plate2` slot 2, `water` at the water station near slot 9. The
+0.65 mL holder is **off** the deck, so `protocols/accuracy_test.py` refuses until
+it is put back and re-added.
 
-Config paths resolve against the package, not the working directory, and `LAB_CONFIG` overrides the directory (see `lab/config.py`). `deck.json` and `labware.json` are always the shipped ones; only the layout is selectable, which is the intended split: **edit `layout.json` for a run, not `deck.json` or `labware.json`**. Each `ConfigFile` carries the sha256 of the bytes it came from, so a generated `.gcode` can be traced to the exact config that produced it.
+---
 
-### `Deck.placement`
+#### `Deck.placement(self, name: str) -> Placement`
 
-```python
-def placement(self, name: str) -> Placement
-```
+The resolved placement with this layout name (`"tips"`, `"big_tubes"`, `"plate1"`,
+`"plate2"`, `"water"`).
 
-The resolved `Placement` (from `lab/labware.py`) for a layout name - currently `"tubes"`, `"tips"`, `"water"`. Raises `DeckError` naming every loaded placement, which is the whole point: a typo fails at load time with the valid options printed, rather than a `KeyError` mid-protocol after the machine has already moved.
+**Raises `DeckError`** listing every loaded placement name. **Why the listing:**
+the failure mode is a protocol written against a different bench - naming `"tubes"`
+when only `big_tubes` is loaded - and the fix is always "look at what is actually
+on the deck", so the error carries it.
 
-### `Deck.placement_for_labware`
+#### `Deck.placement_for_labware(self, labware_id: str) -> Placement`
 
-```python
-def placement_for_labware(self, labware_id: str) -> Placement
-```
+The single placement using this labware id (e.g. `"tiprack_300_96"`).
 
-The one placement using a given catalogue id (e.g. `"tiprack_300_96"`). For code that cares about the *kind* of labware rather than the run-specific name - the tip logic wants "the tip rack", not "the placement someone called tips this week".
-
-Raises `DeckError` if nothing in the layout uses that labware, **and also if more than one placement does**, telling you to ask by name instead. The second case is deliberate: with two tip racks loaded, returning the first match would put tips into an arbitrary one of them and look like it worked.
-
-### `Deck.station`
-
-```python
-def station(self, name: str) -> Station
-```
-
-Look up a `Station` by name (`"water"`, `"park"`, `"tip_eject"`). Raises `DeckError` listing the known stations.
-
-### `Deck.slot_center`
-
-```python
-def slot_center(self, slot: int) -> Vec2
-```
-
-Machine `(x, y)` in mm of a slot centre. `slot` is the operator's slot number 1-9 (stringified internally, since JSON object keys are strings). Raises `DeckError` if there is no such slot.
-
-The layout the numbers encode, which is worth having in front of you: slots 1-3 are the **front** row at Y 365, 4-6 the middle at Y 272, 7-9 the **back** at Y 178.5, and within each row X **descends** (336, 200, 65). So slot 1 is (336, 365) and slot 9 is (65, 178.5). Front means largest Y. Per-slot centres are stored rather than derived from a pitch because the frame is irregular by about 1 mm (X pitches 136 and 135, Y pitches 93.0 and 93.5) and deriving them would erase that.
-
-### `Deck.macro`
-
-```python
-def macro(self, name: str) -> str
-```
-
-The Klipper macro prefix declared under `klipper_macros`: `actuator_move` -> `"ACTUATOR_MOVE POS="`, `home_actuator` -> `"HOME_ACTUATOR"`, `log_temps` -> `"LOG_TEMPS TAG="`. These must exist in `printer.cfg`. Raises `DeckError` listing the known keys.
-
-There is deliberately **no default**. A fallback literal would mean that a mistyped or deleted `klipper_macros` entry silently emits the built-in string: the gcode would look right and address nothing, which on this machine means an aspirate that never happens.
-
-**Note:** `self.macros` is the raw dict, so it still contains the prose key `note`. `deck.macro("note")` returns `"These must exist in printer.cfg."` instead of raising, even though the error message filters `note` out of its "Known:" list.
-
-### `Deck.feedrate`
-
-```python
-def feedrate(self, name: str) -> int
-```
-
-A named feedrate in mm/min: `travel` 6000, `hold` 3000, `tip_press` 600, `wipe` 1500. Raises `DeckError` listing the known names. Same reasoning as `macro()` - named speeds mean the slow tip-press feedrate cannot be lost to a copy-paste of a travel move.
-
-### `Deck.in_envelope`
-
-```python
-def in_envelope(self, x: float, y: float, z: float) -> List[str]
-```
-
-Returns a list of human-readable envelope violations for one point (mm), e.g. `"Z 300 outside [0.0, 270.0]"`. **Empty list means fine** - it is a report, not a predicate, so `if deck.in_envelope(...)` reads as "if there are problems". Raises nothing.
-
-This checks the three axis limits and nothing else. It knows nothing about the stage surface, the raised location edges, the loaded labware or the fitted tip - all of which are stricter. `simulate._check_move` calls this first and then layers the physical limits on top. `tools/check_alignment.py` uses it to confirm that shifted historical coordinates still land on the machine.
-
-### `Deck.keepouts_hit_by_y_move`
-
-```python
-def keepouts_hit_by_y_move(self, x: float) -> List[KeepOut]
-```
-
-The keep-out bands that a Y move performed at this fixed `x` (mm) would enter - the ones whose `forbids == "y_motion"` and whose band contains `x`. Returns `[]` when the X is clear.
-
-This is the routing primitive. `Machine._goto_xy` calls it on both the current and target X to choose move order: X-first by default (that is what the tip box requires, and a pure X move through a band is harmless), Y-first when the *target* X is blocked, and a dogleg through `_nearest_clear_x` when both ends are blocked. With the ejector band at X 148-162, the tube rack columns at X 148 and X 160 sit inside it, so this is not a theoretical case - it fires on real dispense targets. `simulate` calls the same function to check the emitted moves.
-
-### `Deck.keepouts_crossed_by_x_move`
-
-```python
-def keepouts_crossed_by_x_move(self, x0: float, x1: float) -> List[KeepOut]
-```
-
-Every keep-out whose band a straight X move from `x0` to `x1` (mm) passes through, via `KeepOut.spans_x`. Returns `[]` if none.
-
-**Note:** nothing in the repo calls this, and unlike `keepouts_hit_by_y_move` it does not filter on `forbids` - it returns `y_motion` bands too, which a pure X move is explicitly allowed to cross. If you start using it for a future `forbids: "x_motion"` band, filter on `forbids` first, or it will report bands that do not apply.
-
-### `Deck._check_recorded_slot_center`
-
-```python
-def _check_recorded_slot_center(self, entry: Dict[str, Any], p: Placement) -> None
-```
-
-Private, called once per placement during construction. If a layout entry carries a convenience copy of its slot centre (`tubes` records `[200.0, 178.5]`, `tips` records `[65.0, 365.0]`), it must match `deck.json` to within 1e-6 mm or the load fails with a `DeckError` telling you to fix whichever is stale or drop the field. Silently returns when the entry has no `slot_center`, the placement has no slot, or the slot is unknown.
-
-A duplicated coordinate that nothing verifies will eventually disagree with its source, and the copy is the one a human reads. Protocol authors never call this.
-
-### `Deck._check_slot_occupancy`
-
-```python
-def _check_slot_occupancy(self) -> None
-```
-
-Private, called once after all placements are built. Raises `DeckError` if two placements declare the same `slot`, naming both. Physical slots hold one thing; two placements in slot 8 means one of them is not where the file says, and every coordinate derived from it is wrong. Protocol authors never call this.
-
-**Note:** slot values are compared exactly as JSON supplied them, unlike `slot_center()`/`slot_cell()` which stringify. A layout writing `"slot": 8` in one entry and `"slot": "8"` in another would pass this check while colliding physically.
-
-### `Deck.slot_seating_report`
-
-```python
-def slot_seating_report(self) -> List[str]
-```
-
-Checks whether each slot-mounted labware actually sits in the slot it claims, and returns one explanatory line per problem. Empty list means every seating claim holds. Raises nothing. Included in the run manifest by `lab/logbook.py` and printed by the simulator's preflight.
-
-For each placement with `mount == "slot"` and a slot number, it compares `Placement.grid_center()` against the slot centre and reports the offset if the distance exceeds the tolerance. `fixed` and `station` mounts are skipped by design: they carry `near_slot` as a human reference, not a seating claim - `water` is at the dip point (70, 175), which is 5.0 mm in X and 3.5 mm in Y from slot 9's centre and is not meant to be the trough centre. A placement flagged `slot_disputed` in the layout gets " (flagged disputed in the layout)" appended rather than being exempted.
-
-A slot label is a claim about physical seating, and a claim nothing checks can be wrong for months. This is also the check that caught the +70 frame error: unshifted, the tube rack spans X 78-186 and straddles the slot 8/9 seam at X 132.25, seated in neither; shifted to X 148-256 it fits entirely inside slot 8, where the operator says it is. Current offsets both pass comfortably - `tubes` grid centre (202, 187) is 8.7 mm from slot 8, `tips` grid centre (68.0, 367.35) is 3.8 mm from slot 3.
-
-**Note:** the tolerance is looser than the docstring's "half a slot pitch". The code does `hw, hh = self.slot_pitch()` - which returns the **full** pitch (135.5, 93.25), not half - then accepts any offset within `max(hw, hh) / 2.0` = 67.75 mm. That is a single circular radius taken from the X pitch, so a labware misseated by up to 67.75 mm in **Y** is not reported, even though half the Y pitch is only 46.625 mm and a 50 mm Y error puts the grid centre inside the adjacent row's cell. If you tighten this, compare `abs(dx)` against `px / 2` and `abs(dy)` against `py / 2` separately.
-
-### The stage surface trio: `slot_pitch`, `stage_region`, `point_on_stage`, `slot_cell`
-
-These four functions exist to encode one physical fact that is easy to state and easy to forget: **the stage surface only exists over the slot area.** Within that area there is a hard floor at commanded Z 114.75 (bare p300 nosecone) or Z 62.5 (with a 300 uL tip). Outside it, there is nothing under the effector at all, which is precisely what makes the ejector's Z 145 - 30 mm past the stage floor - a legal command. The ejector works at X 155, Y 80-89, and the derived stage region starts at Y 131.875, so the ejector hangs past the front edge of the stage. `simulate` asserts this rather than taking it on trust: `test_ejector_is_off_the_stage` checks `point_on_stage` is `False` at all three ejector Y waypoints, and `_check_move` downgrades the depth check to a warning only when `point_on_stage` is `False`.
-
-The region is *derived* from the slot table, not stored, so it cannot drift out of step when a slot centre is corrected. They are documented here in dependency order rather than file order.
-
-### `Deck.slot_pitch`
-
-```python
-def slot_pitch(self) -> Tuple[float, float]
-```
-
-Mean X and Y spacing between adjacent slot centres, in mm. Returns `(135.5, 93.25)` for the current nine slots: the distinct X values are {65, 200, 336} so `(336 - 65) / 2 = 135.5`, and the distinct Y values {178.5, 272, 365} give `(365 - 178.5) / 2 = 93.25`. Returns 0.0 for an axis with fewer than two distinct values, so a single-slot deck does not divide by zero.
-
-This is a **mean**, and the real frame is irregular (X pitches 136 and 135, Y pitches 93.0 and 93.5). That is fine for the purpose - sizing location cells and clearance tolerances - but do not use it to compute a well position; use the stored per-slot centre.
-
-### `Deck.stage_region`
-
-```python
-def stage_region(self) -> Optional[Tuple[float, float, float, float]]
-```
-
-Returns `(x_min, x_max, y_min, y_max)` in mm over which the stage surface exists, or `None` if the deck declares no slots. Computed as the extreme slot centres expanded by half the slot pitch, which for the current deck gives:
-
-```
-(-2.75, 403.75, 131.875, 411.625)
-```
-
-Raises nothing. The ejector at Y 80-89 is 43 mm clear of `y_min` 131.875, which is the whole reason Z 145 is reachable there. `simulate._check_raised_edges` also uses the region as a fast reject: a move whose swept bounding box misses the region entirely cannot clip a stage edge, so it returns immediately.
-
-**Note:** `x_min` comes out at -2.75, i.e. 2.75 mm outside the X envelope. Harmless as an on/off-stage test, but do not treat the region as a reachable area.
-
-### `Deck.point_on_stage`
-
-```python
-def point_on_stage(self, x: float, y: float) -> bool
-```
-
-True if `(x, y)` (mm) lies within `stage_region()`, bounds inclusive. `False` when there are no slots. Raises nothing.
-
-This is the switch between two different Z rules. On-stage, `simulate` applies the effective tip-aware Z limit and fails a move that goes below it. Off-stage, it emits an `off_stage_depth` warning instead, saying the depth is only safe if nothing is under the effector there - true for the ejector, which hangs past the front edge. Before adding any new off-stage routine that goes deep, satisfy yourself that the same "nothing underneath" argument really holds at that XY.
-
-### `Deck.slot_cell`
-
-```python
-def slot_cell(self, x: float, y: float) -> Optional[str]
-```
-
-Which stage location contains `(x, y)` (mm), as the slot key string (`"8"`), or `None` if the point is off-stage or in no cell. A cell is the slot centre plus or minus half the slot pitch, so slot 8 owns X [132.25, 267.75] and Y [131.875, 225.125]. Where cells overlap because the real pitch is irregular, the nearest centre wins. Raises nothing.
-
-This is what separates a traverse that crosses a location boundary - and so passes over a raised edge - from motion that stays inside one location and does not. The edges of each stage location stand 9.5 mm above the stage floor (62.5 - 53.0), so with a 300 uL tip fitted, boundary-crossing motion must be at commanded Z 53.0 or **less** (physically higher). Motion staying inside one cell is not over an edge, which is what keeps the wall wipe legal: it works at Z 45 and Z 41, far below the 53.0 crossing limit, but every wipe waypoint returns cell `"8"` (asserted by `test_wall_wipe_inside_one_location_is_still_allowed`), so no edge is involved.
-
-**Note:** because the cells are sized by the *mean* pitch while the real frame is irregular, there are hairline seams where `point_on_stage` is `True` but `slot_cell` returns `None` - e.g. X 268.0 at Y 272 falls 0.25 mm outside both slot 4's cell and slot 5's. `simulate` treats a `None` cell as a boundary crossing and applies the stricter edge limit, so the failure mode is conservative, not dangerous. Also note `layout.json` quotes slot 8's Y cell as [131.75, 225.25], computed from the 93.5 pitch rather than the 93.25 mean this code uses; the 0.125 mm disagreement changes nothing for the tube rack at Y 151-223, but the code is the authority.
-
-### `Deck.z_slot_edge_bare`
-
-```python
-@property
-def z_slot_edge_bare(self) -> Optional[float]
-```
-
-The **bare-nosecone** commanded Z at which the effector would strike a raised location edge: `105.25` for the current config. Returns `None` if any of the three inputs is absent. Raises nothing.
-
-The measurement was taken with a tip on (`z.slot_edge_with_p300_tip` = 53.0), so this derives the bare equivalent by adding the tip length, and it computes that tip length from the deck's own two stage measurements - `stage_surface` 114.75 minus `stage_surface_with_p300_tip` 62.5 = 52.25 - rather than reading `labware.json`. One measurement therefore covers both the tipped and bare cases and the two files cannot disagree. `simulate._check_raised_edges` starts from this bare value and subtracts the actual fitted tip length, so a shorter or longer tip is handled correctly; if the tip length is unknown it warns and skips rather than guessing.
-
-The 53.0 tipped limit is currently the **binding traverse constraint** on this machine, tighter than the stage floor and tighter than any labware rim. Travel height Z 5.0 clears it by 48.0 mm, which is why `deck.json` now calls travel height verified rather than assumed.
-
-### `Deck.near_slots`
-
-```python
-def near_slots(self) -> Dict[str, int]
-```
-
-Maps placement name -> slot number for placements carrying a `near_slot` reference instead of a real seating. Currently `{"water": 9}`. Raises nothing; goes into the run manifest.
-
-`near_slot` is documentation for a human ("the water trough is over by slot 9"), deliberately kept distinct from `slot` so that `slot_seating_report` does not try to validate it and so that `_check_slot_occupancy` does not treat it as a claim on the slot. Keeping the two in separate keys is what lets the seating check be strict about the ones that *are* claims.
-
-### `Deck.overlap_report`
-
-```python
-def overlap_report(self) -> List[str]
-```
-
-Pairwise footprint overlap between all placements, as report lines. Empty means no problems found. Raises nothing.
-
-An intersecting pair produces `OVERLAP: <a> footprint intersects <b> footprint`. A pair where either footprint is unmeasured produces an explicit `cannot check <a> vs <b>: no footprint measured for ...` line, so an unknown can never be mistaken for a pass. That distinction is the reason this returns strings rather than a bool.
-
-Right now `sbs_96_wellplate` is the only labware with a `footprint`, and it is not loaded, so all three pairs report "cannot check". Footprint bounds come from `Placement.footprint_bounds()`, which centres the measured outline on the *grid* centre - fine for a plate whose grid is centred on its footprint, approximate for a user-fabricated rack, and another reason it returns `None` rather than a guess.
-
-### `Deck.uncalibrated`
-
-```python
-def uncalibrated(self) -> List[str]
-```
-
-Every field the config itself admits was never tuned, as dotted names. Raises nothing. `Machine.uncalibrated()` concatenates this with the effector's list, and `protocols/accuracy_test.py` prints it before a run. Current output:
-
-```
-tubes(tube_rack_0p65_5x10).wipe.dx
-tubes(tube_rack_0p65_5x10).wipe.dz
-tubes(tube_rack_0p65_5x10).z.work
-tips(tiprack_300_96).grid.a1_corner
-tips(tiprack_300_96).consume_order.exit_edge
-water(reservoir_water).z.work
-deck.keepouts.tip_ejector.x_range (width unverified; lane X 155 itself is confirmed and post-shift)
-deck.stations.tip_eject (routine never validated on hardware)
-```
-
-Four sources: each placed labware's own `uncalibrated` list; `deck.z.stage_surface` if it was never measured (it now is, 114.75, so this line no longer appears); the deck's structured `uncalibrated` array; and any station whose `validated` key is present and false. The deck-level list is a **structured array, not a prose note that gets grepped** - rewording a comment must not be able to make an uncalibrated field look calibrated.
-
-**Note:** two silent gaps. Only *placed* labware contributes, so unmeasured fields on catalogue entries that this layout does not load (`sbs_96_wellplate`, `tube_rack_1p5`) are not reported - defensible, since they cannot affect the run. And a station with no `validated` key at all is never flagged: absence reads as validated. `water` and `park` have no such key.
-
-### `Deck.summary`
-
-```python
-def summary(self) -> str
-```
-
-Multi-line human-readable dump: deck id, envelope with the "(+Z is DOWN)" reminder, travel and home Z, one line per placement (labware id, slot/station/fixed, grid shape, and the X/Y span of its **well centres**, not its outline), and one line per keep-out. For eyeballing a layout before a run; `tests/smoke_geometry.py` prints it. Raises nothing, though it will propagate an `IndexError` from `Placement.xy` if a placement's grid is degenerate.
-
-Current output:
-
-```
-deck sdl_klipper_deck
-  envelope  X[0.0,420.0] Y[0.0,580.0] Z[0.0,270.0] (+Z is DOWN)
-  z_travel  5.0   z_home 0.0
-  tips     tiprack_300_96           slot 3     8x12  X[18,118] Y[335.5,399.2]
-  tubes    tube_rack_0p65_5x10      slot 8     5x10  X[148,256] Y[151,223]
-  water    reservoir_water          station water 1x1  X[70,70] Y[175,175]
-  keepout  tip_ejector: X[148.0,162.0] forbids y_motion unless Z < 60.0
-```
+**Raises `DeckError`** if nothing uses it (listing the labware ids in play), and
+also if **more than one** placement does, naming them and telling the caller to ask
+by name instead.
+
+**Why the ambiguity is an error rather than a first-match:** the shipped bench has
+two `sbs_96_wellplate` placements, `plate1` and `plate2`. Returning either one
+would put liquid in a real plate, in the right kind of well, on the wrong plate -
+exactly the class of mistake this repo exists to prevent. `Machine._tip_placement`
+uses this as a *fallback* when the effector's declared tip placement name is not in
+the layout, which is safe because only one tip rack is ever loaded.
+
+#### `Deck.station(self, name: str) -> Station`
+
+The named `Station`. **Raises `DeckError`** listing the known station names
+(`park`, `tip_eject`, `water`).
+
+#### `Deck.slot_center(self, slot: int) -> Vec2`
+
+Centre `(x, y)` in mm of slot `1`-`9`. Takes an **int** and stringifies it
+internally, because `deck.json` keys the slots as JSON strings.
+
+**Raises `DeckError`** listing the known slots.
+
+The layout that keeps reading backwards: slots **1-3 are the FRONT row** at the
+*largest* Y (365), 4-6 the middle (272), **7-9 the BACK row** at the smallest Y
+(178.5). Within each row X *descends*: 336 / 200 / 65. So slot 1 is
+`(336, 365)` and slot 9 is `(65, 178.5)`. Per-slot centres are stored rather than
+derived from a pitch because the real frame is irregular by about 1 mm (X pitch
+136 then 135; Y pitch 93.0 then 93.5) and deriving them would erase that.
+
+#### `Deck.macro(self, name: str) -> str`
+
+The Klipper macro prefix declared under `deck.json` -> `klipper_macros`:
+`actuator_move` -> `"ACTUATOR_MOVE POS="`, `home_actuator` ->
+`"HOME_ACTUATOR"`, `log_temps` -> `"LOG_TEMPS TAG="`.
+
+**Raises `DeckError`** listing the declared names, with the `"note"` key filtered
+out of the listing (it is prose, not a macro).
+
+**Why it must raise rather than default:** this is defect 13 in
+`tests/test_review_fixes.py`. The code used to fall back to a hardcoded literal, so
+a mistyped or deleted `klipper_macros` entry emitted the built-in string instead of
+failing. The generated gcode looked right and addressed nothing - the macro has to
+exist in `printer.cfg`, and the config is the only place that correspondence is
+recorded. `test_13_macros_must_be_declared` deletes the entry and asserts the
+raise.
+
+#### `Deck.feedrate(self, name: str) -> int`
+
+A deck-wide feedrate in mm/min: `travel` 6000, `hold` 3000, `tip_press` 600,
+`wipe` 1500. **Raises `DeckError`** listing the known names.
+
+**Why deck-level:** an effector may override any of these in its own JSON
+(`Effector.feedrate`), and `Machine.get_tip` reads
+`eff.feedrate("tip_press") or self.deck.feedrate("tip_press")` - effector first,
+deck fallback. That way a gentler pipette lowers its own press speed in one place
+without every effector having to restate all four.
+
+---
+
+#### `Deck.in_envelope(self, x: float, y: float, z: float) -> List[str]`
+
+Checks a commanded point (mm) against the kinematic envelope X 0-420, Y 0-580,
+Z 0-270.
+
+**Returns** a list of human-readable violation strings, e.g.
+`"Z 300.0 outside [0.0, 270.0]"`. **Empty list means fine.** Raises nothing.
+
+**Why a list rather than a bool or an exception:** the caller decides severity.
+`Simulator._check_move` turns any non-empty result into a hard failure, but it
+wants all three violations in the message, not just the first, so the operator sees
+the whole problem in one pass. Returning strings also keeps the axis bounds out of
+the simulator.
+
+**This is the loosest of the Z checks, not the operative one.** Z 270 is the
+kinematic limit; the effector strikes the stage at Z 114.75 bare and Z 62.5 with a
+300 uL tip. `Simulator.effective_z_limit` is the check that matters, and it warns
+explicitly when it cannot be evaluated.
+
+#### `Deck.no_fly_rects(self) -> List[Tuple[str, Tuple[float, float, float, float]]]`
+
+Placements a traverse must **never** cross while a tip is fitted.
+
+**Returns** `[(placement_name, (x_min, x_max, y_min, y_max))]` in mm. On the
+shipped bench: `[("tips", (13.4545, 122.5455, 330.95, 403.75))]`. Raises nothing.
+
+Selection is by the labware's `avoid_traverse` flag, read from the raw spec. Only
+`tiprack_300_96` sets it. The rectangle is `Placement.footprint_bounds()` when a
+footprint is measured; the tip rack has none, so it falls back to the outermost
+well centres (X 18-118, Y 335.5-399.2) expanded by half the solved grid pitch
+(9.0909/2 and 9.1/2), which approximates the rack body.
+
+**The physical constraint, and why this is a separate mechanism from every Z
+check:** the tips stand upright well above the rack body, and the fitted tip hangs
+52.25 mm below the nosecone. Crossing the rack with a tip fitted shears the tip off
+at **any** travel height. There is no Z you can retreat to - flying higher raises
+the nosecone and the tip with it. So this is a routing constraint, not a clearance
+constraint, and both consumers treat it as absolute: `Machine._route_xy` doglegs
+around the rectangle (`_dogleg_x_candidates` / `_dogleg_y_candidates` pad it by
+6 mm and try waypoints nearest the target first, recording `"dogleg via Y"` as a
+warning), and `Simulator._check_move` hard-fails any tipped XY step whose swept box
+intersects it. `op == "get_tip"` is exempt, because the pickup itself necessarily
+happens over the rack.
+
+Observed on hardware 2026-09-08: the water station at X 70 sits *underneath* this
+rack in X, so every unrouted approach to water from high Y went straight through
+it. That is what the routing exists for, and
+`tests/test_lab.py::test_leaving_the_tip_box_goes_toward_x_zero_then_y` and
+`test_router_doglegs_in_y_to_cross_the_tip_rack` pin it.
+
+**Note:** the fallback expansion uses only `abs(col_vec[0])/2` for X and
+`abs(row_vec[1])/2` for Y. For a rack rotated 90 degrees those components are zero,
+so the box would not be expanded at all on the axis where the pitch actually lies,
+understating the obstacle. The trailing `or 0.0` on both lines is a no-op (it can
+only replace `0.0` with `0.0`). Neither matters for the current tip rack, whose
+corner solve yields axis-aligned vectors, but a rotated no-fly labware would need
+this generalised to the full vector magnitudes.
+
+#### `Deck.segment_hits_rect(frm: Vec2, to: Vec2, rect: Tuple[float, float, float, float]) -> bool`
+
+Staticmethod. Does an axis-aligned move from `frm` to `to` (mm) sweep through
+`rect` (`x_min, x_max, y_min, y_max`)?
+
+**Returns** `bool`; touching an edge exactly counts as a hit (the comparisons are
+strict on the *separated* case, so equality is an intersection). Raises nothing.
+
+**Why the swept box is the right model:** `Machine._move_xy` emits **one axis per
+step** - X first then Y, or Y first then X, never diagonal (`deck.json` ->
+`conventions.xy_order`). So the region a single step sweeps *is* the axis-aligned
+box between its two endpoints, and this test is exact rather than conservative for
+the moves the library can actually produce. If a diagonal move ever appeared, the
+box would over-approximate it, which errs toward refusing a legal move rather than
+permitting an illegal one.
+
+**Why test the segment and not the destination:** the destination test misses the
+common case entirely. A traverse that starts over the tip rack and ends at the
+water reservoir crosses the whole rack while neither endpoint is on it. Same
+reasoning drives `Simulator._check_traverse_clearance`.
+
+#### `Deck.keepouts_hit_by_y_move(self, x: float) -> List[KeepOut]`
+
+Which keep-out bands does a Y move at this fixed X (mm) enter? Filters to
+`forbids == "y_motion"` and `contains_x(x)`. Returns a possibly-empty list; raises
+nothing.
+
+**Why X is the only argument:** a Y move happens at one X, so band membership is a
+point test on X and the Y endpoints are irrelevant. Both callers pass the move's
+*starting* X (`step.frm[0]` in the simulator, `frm[0]` in the router) - correct,
+since a single step never changes X and Y together.
+
+#### `Deck.keepouts_crossed_by_x_move(self, x0: float, x1: float) -> List[KeepOut]`
+
+Which bands does a straight X move from `x0` to `x1` (mm) pass through? Returns a
+possibly-empty list; raises nothing.
+
+**Note:** nothing in the repo calls this today, and unlike
+`keepouts_hit_by_y_move` it does **not** filter on `forbids`. That is arguably
+right - the current band forbids `y_motion`, so an X move straight through it is
+legal and this method would report it anyway - but a caller must therefore check
+`k.forbids` itself. A protocol author should not need this; the router already
+handles band avoidance.
+
+---
+
+#### `Deck.slot_seating_report(self) -> List[str]`
+
+Does each slot-mounted labware actually sit in the slot it claims?
+
+**Returns** one string per suspect placement, naming the claimed slot centre, the
+resolved grid centre, the signed offset, the distance, and whether the layout
+already flags it `slot_disputed`. **Empty means every claim checks out**, which is
+the case on both the shipped and the test layout. Raises nothing.
+
+For each placement with `slot is not None` **and** `mount == "slot"`, it compares
+`Placement.grid_center()` against `slot_center(slot)` and reports when the radial
+distance exceeds `max(px, py) / 2` = **67.75 mm** on the current frame. Placements
+mounted `fixed` or at a `station` are skipped deliberately: `water` carries
+`near_slot: 9` as a human reference, not a seating claim, because its stored
+coordinate is a dip point `(70, 175)` rather than the trough centre.
+
+**Why it exists:** a slot label is a claim about physical seating, and a claim
+nothing checks can be wrong for months. This is also the check that catches a
+coordinate-frame error. The `+70` X shift was confirmed exactly this way: the
+0.65 mL tube rack unshifted spans X 78-186, straddling the slot 8/9 cell seam at
+X 132.25 and seated in neither; shifted to X 148-256 it fits entirely inside slot
+8's cell of `[132.25, 267.75] x [131.875, 225.125]`, which is where the operator
+says it is. `Simulator` folds each line into its report as a warning prefixed
+`"slot seating: "`, and `lab/logbook.py` records the whole list in the run
+manifest.
+
+**Note:** the local names `hw, hh` hold the **full** pitches `(135.5, 93.25)`, not
+halves, and the threshold takes the larger of the two and halves it, applying
+67.75 mm to both axes. The consequence is that the Y direction is checked loosely:
+a placement misseated by up to 67.75 mm in Y passes, although the Y slot pitch is
+only 93.25 mm. Tightening it to a per-axis test (`abs(dx) <= px/2 and
+abs(dy) <= py/2`) would catch a row-off misseating that the radial test can let
+through. Neither the shipped nor the test layout is anywhere near the threshold, so
+this is latent rather than active.
+
+#### `Deck.near_slots(self) -> Dict[str, int]`
+
+Placements carrying a `near_slot` reference rather than a seating claim.
+
+**Returns** `{placement_name: slot_number}` - `{"water": 9}` on both layouts.
+Raises nothing.
+
+**Why `near_slot` is a different key from `slot`:** it is documentation for a human
+("the water trough is over by slot 9"). Keeping it separate is what lets
+`slot_seating_report` be strict about the claims that *are* claims, and stops
+`_check_slot_occupancy` treating a human note as an exclusive claim on slot 9. The
+water dip point is 5.0 mm in X and 3.5 mm in Y from slot 9's centre - close enough
+to be worth writing down, not close enough to be a seating.
+
+#### `Deck.overlap_report(self) -> List[str]`
+
+Pairwise footprint intersection between every pair of placements.
+
+**Returns** a list of strings: `"OVERLAP: a footprint intersects b footprint"` for
+a real collision, or `"cannot check a vs b: no footprint measured for ..."` naming
+the placements that lack one. Raises nothing.
+
+**Why the "cannot check" line instead of skipping:** an unmeasured footprint must
+not read as a pass. Only `sbs_96_wellplate` has a measured footprint
+(127.76 x 85.48 mm), so on the shipped bench every pair involving `tips`,
+`big_tubes` or `water` comes back as a cannot-check line and only `plate1` vs
+`plate2` is actually evaluated. `Simulator` promotes `OVERLAP` lines to errors and
+everything else to warnings.
+
+#### `Deck.uncalibrated(self) -> List[str]`
+
+Every field the config **admits** was never tuned.
+
+**Returns** dotted strings, mixing three sources: per-labware
+(`f"{placement}({labware_id}).{field}"` from each `Labware.uncalibrated`), the deck
+itself (`"deck.z.stage_surface (never measured)"` when unmeasured, plus each entry
+of `deck.json` -> `uncalibrated`), and any station with `"validated": false`
+(`"deck.stations.tip_eject (routine never validated on hardware)"`). Raises
+nothing.
+
+**Why it reads a structured list rather than grepping prose:** as the comment in
+the source says, rewording a comment must not be able to make an uncalibrated field
+silently look calibrated. The honesty of the whole system rests on these lists
+being data. This is the method behind the one-liner in `CLAUDE.md` that you run
+before treating any value as known, and `tests/smoke_geometry.py` prints it.
+
+The `tip_eject` line is the important one: `validated: false` means the ejection
+routine has **never been run on hardware**, has no working reference gcode
+anywhere in the repo, and is off by default.
+
+---
+
+#### `Deck.stage_region(self) -> Optional[Tuple[float, float, float, float]]`
+
+The `(x_min, x_max, y_min, y_max)` rectangle over which the stage surface exists,
+in mm.
+
+**Returns** `(-2.75, 403.75, 131.875, 411.625)` on the current slot table - the
+slot centres (X 65-336, Y 178.5-365) expanded by half the slot pitch
+(135.5/2 = 67.75 and 93.25/2 = 46.625). Returns `None` if the deck declares no
+slots. Raises nothing.
+
+**Why the stage surface only exists over the slot area, and why that matters:** the
+stage is the plate the nine locations are cut into. It does not extend to the front
+of the machine. Off that rectangle there is simply nothing beneath the effector at
+stage depth, so the Z 114.75 stage-contact limit does not apply. That is precisely
+what makes the tip ejector legal: it lives at X 155, Y 80-89, which is more than
+40 mm in front of the stage's front edge at Y 131.875, and so the routine can
+command **Z 145 and Z 137** - both far *below* the stage surface - without hitting
+anything. `tests/test_lab.py::test_ejector_is_off_the_stage` asserts exactly that
+for all three of `approach_y`, `engage_y` and `retract_y`, and
+`Simulator._check_move` re-derives it rather than taking it on trust: it warns
+`off_stage_depth` whenever a move goes past Z 114.75 off-stage, saying in the
+warning that this is only safe if nothing is under the effector there.
+
+**Why derived and not stored:** a stored rectangle would drift out of step with the
+slot table the first time a slot centre was corrected. Deriving it means the frame
+correction propagates.
+
+**Note:** `x_min` comes out at -2.75, outside the X envelope minimum of 0, so in
+practice every reachable X below 403.75 counts as on-stage. That is harmless and
+arguably correct (the stage plate presumably does extend past the outermost slot
+edge), but it does mean the region is a bounding box, not a measured outline: it
+cannot represent a stage with a notch, and X 420 - the park/home column - reads as
+off-stage.
+
+#### `Deck.point_on_stage(self, x: float, y: float) -> bool`
+
+Is `(x, y)` (mm) over the stage surface? Inclusive on all four bounds; **`False`
+when there are no slots** (no stage region means nothing is on it). Raises nothing.
+
+**Why:** it is the single gate on whether the stage-depth Z limits apply at all.
+`Simulator._check_move` only computes `effective_z_limit` for on-stage points, and
+only warns about off-stage depth otherwise. Getting this backwards would either
+forbid the ejector entirely or permit driving the nosecone through the stage.
+
+#### `Deck.slot_cell(self, x: float, y: float) -> Optional[str]`
+
+Which stage location contains this point?
+
+**Returns** the slot key as a **string** (`"8"`, matching `deck.json`'s keys), or
+`None` if the point is off-stage. Where a point falls in the overlap of two
+half-pitch cells - which happens because the real pitch is irregular - the
+**nearest** centre wins. Raises nothing.
+
+**Why it exists:** to tell a traverse that crosses a location boundary from motion
+that stays inside one. The edges of every location are raised, standing
+`62.5 - 53.0 = 9.5 mm` above the stage floor, so with a 300 uL tip fitted Z must be
+**53.0 or lower-numbered** (physically higher) whenever the effector passes over a
+location corner. But that limit applies only to *crossing*: the wall wipe works at
+Z 45 and Z 41, deep inside a tube, and is perfectly legal because it never leaves
+the cell the tube sits in. `Simulator._check_raised_edges` returns early exactly
+when `cell_from is not None and cell_from == cell_to`, and
+`tests/test_lab.py` asserts every wipe move resolves to cell `"8"`.
+
+#### `Deck.z_slot_edge_bare` (property)
+
+The **bare-nosecone** commanded Z at which the effector would strike a raised
+location edge.
+
+**Returns** `105.25` on the current deck; `None` if any of
+`z.slot_edge_with_p300_tip`, `z.stage_surface_with_p300_tip` or `z.stage_surface`
+is missing. Raises nothing.
+
+Computed as `slot_edge_with_p300_tip + (stage_surface - stage_surface_with_p300_tip)`
+= `53.0 + (114.75 - 62.5)` = `53.0 + 52.25` = `105.25`.
+
+**Why the indirection:** the edge was measured *with a tip on* (Z 53.0), because
+that is the configuration the operator could actually touch off. Converting it to a
+bare-nosecone reference means the same single measurement covers both cases -
+`Simulator._check_raised_edges` takes `z_slot_edge_bare` and subtracts the fitted
+tip's length to get back to 53.0 for tipped moves, and uses 105.25 unchanged for
+bare ones. That is also why the tip length is derived from the two stage
+measurements rather than guessed independently:
+`tiprack_300_96.tip.length = 52.25` comes from the same subtraction.
+`tests/test_lab.py::test_stage_surface_and_tip_length` pins 105.25 and
+`test_travel_height_is_now_verified_not_assumed` reconstructs 53.0 from it, then
+checks travel Z 5.0 clears it by 48.0 mm.
+
+**Returning `None` is not a pass.** The caller must warn: the simulator emits
+`"cannot check the raised location edges: ... unmeasured"` and skips, per convention
+3.
+
+#### `Deck.slot_pitch(self) -> Tuple[float, float]`
+
+Mean X and Y spacing between adjacent slot centres, in mm.
+
+**Returns** `(135.5, 93.25)` today: X from `(336 - 65) / 2` and Y from
+`(365 - 178.5) / 2`, over the *distinct* sorted coordinate values. Returns `0.0`
+for an axis with fewer than two distinct values. Raises nothing.
+
+**Why the mean, and the caveat it carries:** the real frame is irregular - 136 mm
+between slots 1 and 2 but 135 between 2 and 3, and 93.0 then 93.5 in Y. The mean is
+what defines the notional 135.5 x 93.25 mm **location cell**, which is what
+`stage_region`, `slot_cell`, `slot_seating_report` and `a1_from_slot_edge` all work
+against. The consequence is documented on `tube_rack_1p5.a1_from_slot_edge.caveat`:
+its insets (15.25 mm in from the high-X edge, 13.125 mm down from the high-Y edge)
+were calibrated in slot **5** against a mean-pitch cell, so a cell derived the same
+way in another slot is up to 0.5 mm out. Re-measure A1 if that holder moves rather
+than trusting the model to transfer exactly. On slot 5 the model reproduces the
+measured A1 exactly: cell high-X edge `200 + 67.75 = 267.75`, minus 15.25 =
+**252.50**; high-Y edge `272 + 46.625 = 318.625`, minus 13.125 = **305.50**.
+
+#### `Deck.summary(self) -> str`
+
+A multi-line human-readable dump: deck id, envelope (annotated `(+Z is DOWN)`),
+`z_travel` and `z_home`, one line per placement (labware id, where it is mounted,
+grid shape, and its well-centre X and Y extents), and one line per keep-out band.
+Returns a string; raises nothing.
+
+**Why:** the fastest way to see whether the config in front of you describes the
+bench in front of you. `tests/smoke_geometry.py` prints it first, then the
+displacement table, then `uncalibrated()` and `overlap_report()`. Note the
+placement extents are **well-centre** bounds (`Placement.well_bounds`), not
+footprints - the physical rim extends past them by an unmeasured amount.
+
+---
+
+### Private helpers
+
+A protocol author should never call any of these; the first two run automatically
+during `__init__` and the third is an internal ordering workaround.
+
+#### `Deck._check_recorded_slot_center(self, entry, p) -> None`
+
+Holds a placement's optional `slot_center` convenience copy to the real centre in
+`deck.json`, to within 1e-6 mm. No-ops when the placement has no `slot_center`, no
+slot, or an unknown slot. **Raises `DeckError`** naming both values and telling the
+caller to fix whichever is stale or drop the key.
+
+**Why:** a duplicated coordinate that nothing verifies will eventually disagree
+with its source, and the copy is the one a human reads. Every slot-mounted
+placement in the shipped layout carries one, so this check is live on four
+placements today.
+
+#### `Deck._check_slot_occupancy(self) -> None`
+
+**Raises `DeckError`** if two placements claim the same slot, naming both.
+Placements with `slot is None` are ignored, and `near_slot` is not consulted - so
+`water` near slot 9 does not conflict with anything genuinely seated in slot 9.
+
+#### `Deck._raw_slot_pitch(deck_raw) -> Tuple[float, float]`
+
+Staticmethod. The same computation as `slot_pitch()`, but reading the **raw**
+deck dict.
+
+**Why it is duplicated:** `__init__` needs the pitch to inject `_slot_pitch` into
+placements that use `a1_from_slot_edge`, and at that moment `self.slots` is
+populated but the method is being called from inside the constructor's placement
+loop; reading the raw config keeps the helper independent of construction order.
+If you change the pitch definition, change **both** - they must agree or a
+slot-edge-dimensioned A1 will resolve differently from the cell it is checked
+against.
 
 ---
 
 ## `lab/machine.py`
 
-`Machine` is the single object a protocol script drives. It owns the resolved `Deck`, the loaded `Effector`, a buffered `Gcode` writer and a `Simulator`, and it exposes operations at the level a procedure is written in (`get_tip`, `prewet`, `aspirate_uL`, `dispense`, `eject_tip`, `park`) rather than at the level of coordinates. Three invariants hold everywhere in this module and are the reason most of it exists:
+`Machine` is the one object a protocol drives. It owns the resolved deck, the loaded end effector, the gcode buffer, the live machine state (homed / tip fitted / fluid held / plunger POS), and the `Simulator` that checks every step as it is generated. A protocol asks for wells and microlitres; this module turns them into commanded X/Y/Z and `ACTUATOR_MOVE POS=` lines and refuses anything the geometry does not allow.
 
-- **+Z is DOWN.** Z=0 is home at the top; a larger commanded Z is physically lower. `z_travel` is 5.0, and the ejector strip from Z 145 to Z 137 is 8 mm *upward*.
-- **Volumes in, millimetres never.** Every liquid call takes microlitres. The conversion to plunger millimetres happens in `Pipette` from stored coefficients (p300: `d = 0.0533 * V + 0.122`; p125: `d = 0.1274 * V + 0.049`). No mm value is typed into a protocol.
-- **Nothing reaches disk until it has been checked.** The `Gcode` is constructed buffered (`filename=None`). Every state-changing action is recorded as a `Step` and handed to the simulator as it is generated; `finalize()` is the only thing that writes, and it refuses if the report has errors.
+Three properties hold across the whole module and are worth stating once:
 
-The module also contains one exception type: **`ProtocolError(LabError)`**, raised when the protocol asks for something the machine cannot legally do (unhomed motion, a tip when one is already fitted, dispensing with nothing aspirated). It is a subclass of `LabError`, so a protocol can catch that one class and print the message instead of a traceback.
-
----
-
-**Construction**
-
-### `Machine.__init__(self, effector: str, name: str, layout: str = "layout.json", strict: bool = True, temp_log: bool = True) -> None`
-
-Loads the deck, labware catalogue, layout and one end effector, and stands up an empty buffered gcode program plus a simulator wired to both.
-
-- `effector` - effector id, i.e. the basename of `config/effectors/<id>.json` ("p300", "p125"; "gripper" exists but is a placeholder).
-- `name` - the run name. This is the output basename: `<name>.gcode`, `<name>.manifest.json`, `<name>.balance.csv`, `<name>.toolpath.png`.
-- `layout` - layout file in the config dir; `.json` is appended if missing. This is the per-run file that says what is physically on the deck.
-- `strict` - passed to `Simulator`. True (default) means the first hard check failure raises `SimulationError` at the step that caused it, so generation stops at the offending line rather than at the end.
-- `temp_log` - if False, every `log_temps()` call becomes a no-op. Recorded in `self.toggles` either way so the manifest says which it was.
-
-Returns nothing. Raises `FileNotFoundError` if a config file is missing, `ValueError` if one is not valid JSON, `DeckError` for a layout the deck cannot describe (unknown labware id, duplicate placement name, two placements claiming one slot, a `slot_center` copy that disagrees with `deck.json`), and `EffectorError` for an unknown effector id, an unknown `kind`, or a placeholder (`Machine(effector="gripper", ...)` raises: "every numeric field is unmeasured and it must not be used to generate motion").
-
-The `Gcode` is given `home_position=(deck.x.home, deck.y.home, deck.z.home)` = `(420.0, 0.0, 0.0)`. X homes at max, which is why the home X is 420 and not 0.
-
-Two things are deliberately shouted at construction time, before any motion exists:
-
-- every string in `layout.open_questions` becomes a simulator warning (currently three, including "Which X edge of the tiprack is the post-pickup exit");
-- an effector `z_conflict` block becomes a warning naming the conflict and the action. p125 carries one: its water Z 50 is 10 mm lower than p300's 40 while its tube Z 20 is 25 mm higher than p300's 45, which a constant tip-length offset cannot explain. An unresolved conflict recorded in a config is an open crash risk, so it is repeated on every run rather than left in the file for someone to notice.
-
-Public attributes a protocol legitimately reads or sets:
-
-| attribute | meaning |
-| --- | --- |
-| `deck`, `effector`, `sim`, `g` | the resolved deck, the effector, the simulator, the gcode buffer |
-| `homed`, `tip_fitted`, `fluid_uL`, `pos` | machine state. `pos` is the plunger POS in mm, `None` until first commanded |
-| `current_tip` | `(row, col)` of the fitted tip, or `None` |
-| `steps` | every `Step` generated, in order |
-| `dispenses` | one dict per dispense; becomes the balance CSV rows |
-| `toggles` | free-form dict recorded in the manifest. `protocols/accuracy_test.py` writes its own knobs here |
-| `notes` | text from `note()` |
+- **+Z is DOWN.** `Z=0` is home at the top. `deck.z_travel` is `5.0`, the safest place the effector can be; the plate floor at `60.8` is the most dangerous. Every "lift" in this file is a move to a *smaller* Z.
+- **Nothing reaches disk until `finalize()` runs the simulator clean.** `Gcode` is constructed with `None` as its path, so the run lives in a buffer. A refused primitive is meant to emit no lines at all, which is why the validation in `_aspirate_at`, `mix` and `dispense` happens before the first motion.
+- **A precondition failure is a `ProtocolError` (subclass of `LabError`); a geometry failure is a `SimulationError` (also `LabError`).** A protocol catches `LabError` and prints the message. `tests/test_review_fixes.py::test_8_all_errors_share_a_base` pins that.
 
 ---
 
-**The recording layer**
+### Construction
 
-Every emitted action goes through `_record`, which is what makes the simulator incremental rather than a post-pass over text. A protocol author never calls anything in this group.
+#### `Machine(effector, name, layout="layout.json", strict=True, temp_log=True)`
 
-### `xyz(self) -> Tuple[float, float, float]`
+Loads the deck and the end effector, builds the simulator, and opens an in-memory gcode buffer whose home position is `(deck.x.home, deck.y.home, deck.z.home)` = `(420.0, 0.0, 0.0)`.
 
-The gcode writer's current commanded position, as `(x, y, z)`. Public and safe to call. Before homing the axes read `None`, so this can return `(None, None, None)`; the first two steps of a run legitimately carry `None` coordinates.
+- `effector` (str): effector id, i.e. `config/effectors/<id>.json`. `"p300"` or `"p125"` today. Raises `EffectorError` for an unknown id, an unknown `kind`, or a config marked `status: placeholder`.
+- `name` (str): run name. Becomes `<name>.gcode`, `<name>.manifest.json`, `<name>.balance.csv`, `<name>.toolpath.png`.
+- `layout` (str): which layout file in the config dir describes what is physically loaded. Defaults to `layout.json`; the tests pass `layout_test.json`, which is the only layout that still carries the 0.65 mL `"tubes"` placement.
+- `strict` (bool): passed to `Simulator`. `True` means the first hard violation raises `SimulationError` at the moment the offending step is recorded, so the traceback points at the protocol line that caused it. `False` collects errors into the report instead and lets `finalize()` refuse at the end.
+- `temp_log` (bool): whether `log_temps()` emits anything.
 
-### `_record(self, **kw: Any) -> Step`
+Raises `DeckError` for a layout that cannot be resolved (unknown labware id, two placements in one slot, a `slot_center` copy that disagrees with `deck.json`), `EffectorError` as above.
 
-Builds a `Step`, stamps it with the current machine state, appends it to `self.steps` and hands it to `self.sim.check(step)`.
+**Why it exists / what it prevents:** it is the only place config is read, so every number in a run is traceable to a file whose SHA-256 lands in the manifest. Two warnings are raised here rather than later, because a run that is about to be generated is the last moment anyone is looking: every entry in `layout.json -> open_questions` becomes a warning (five of them today, including plate2's *inferred* A1 at `(251, 399)`), and an effector config carrying a `z_conflict` block warns that it has an unresolved crash risk. Neither blocks the run - they are things the operator has to read in the report.
 
-Stamps `i` (a monotonic counter), `tip=self.tip_fitted`, `fluid_uL=self.fluid_uL` and `gline=self.g.line_count()`, and merges `keepout_exempt: True` into `detail` if the ejector-engagement flag is currently set. Returns the `Step`. Raises `SimulationError` (from `sim.check`, in strict mode) if the step violates a hard check.
-
-Why it matters: `tip` and `fluid_uL` are captured *at record time*, so the order in which an operation flips `self.tip_fitted` relative to its moves decides which Z envelope those moves are checked against. `get_tip` sets `tip_fitted = True` before the lift-out; `eject_tip` clears it immediately after the strip.
-
-### `_engaging_ejector(self)` (context manager)
-
-Sets `self._keepout_exempt` for the duration of the block, so `_record` tags those steps `keepout_exempt: True`.
-
-The keep-out exemption is granted per step, not per operation. The simulator only honours it when both the step carries the flag *and* `step.op` is in the band's whitelist (`["eject_tip"]`). That is what stops the ejector's approach and retract traverses, which are ordinary moves at travel height, from inheriting an exemption from the operation they belong to.
-
-### `_raw(self, line: str, op: str, **detail: Any) -> Step`
-
-Emits one verbatim line and records it as `kind="macro"` with the line text in `detail`. Used for the Klipper macros (`HOME_ACTUATOR`, `LOG_TEMPS TAG=...`). Going through this rather than `g.raw` keeps the macro visible in `steps` and in the manifest.
-
-### `_require_homed(self, what: str) -> None`
-
-Raises `ProtocolError(f"{what} before the machine was homed. Call startup().")` if `self.homed` is False. Guards `goto`, `get_tip` and `eject_tip`. Without it the first move would emit a literal `XNone` into the gcode (gcodepy's `travel_absolute` also guards this, but with a less useful message).
-
-### `_pipette(self) -> Pipette`
-
-Returns `self.effector` narrowed to `Pipette`, or raises `ProtocolError` naming the effector's `kind`. Guards `prewet`, `aspirate_uL` and `dispense` so a gripper cannot be asked to meter liquid.
+**Note:** a warning is recorded once per key (`Simulator.warn` dedupes), so nothing here can spam a loop.
 
 ---
 
-**Motion**
+### Recording layer
 
-Two rules are enforced structurally rather than by review: motion is never diagonal (one axis per gcode line, one `Step` per axis), and XY only happens at travel height. The simulator hard-fails any XY step whose start or end Z is not `z_travel` unless the op is `wall_wipe` or `eject_tip`.
+Everything that emits gcode goes through `_record`, which is what feeds the simulator. A protocol author never calls these.
 
-### `_move_z(self, z: float, feedrate: int, op: str, labware: Optional[str] = None) -> None`
+#### `xyz() -> tuple[float, float, float]`
 
-Absolute Z move, recorded as one `Step` with `axes="Z"`.
+Current commanded position `(X, Y, Z)` in mm, read back out of the gcode writer. Public and side-effect-free; useful in a protocol only for assertions.
 
-- `z` - absolute commanded Z in mm. Larger is lower.
-- `feedrate` - mm/min.
-- `op` - the operation label the step is attributed to.
-- `labware` - labware id, so the simulator can apply that labware's well-bottom check to this step.
+#### `_record(**kw) -> Step` *(private)*
 
-Returns nothing; emits nothing and records nothing if the delta rounds to zero at 6 dp. The guard duplicates gcodepy's `move_z_absolute` tolerance on purpose: without it a `Step` would exist for a move that produced no gcode line, and the step indices in a simulator error would no longer line up with the file.
+Builds a `Step` with the current tip state, held volume and gcode line number, appends it to `self.steps`, and hands it to `Simulator.check()` - which is where a `SimulationError` is raised in strict mode. If `self._keepout_exempt` is set it stamps `detail["keepout_exempt"] = True` on the step. Never call it from a protocol.
 
-### `_move_xy(self, x: float, y: float, feedrate: int, op: str, labware: Optional[str] = None, order: str = "XY") -> None`
+#### `_engaging_ejector()` *(private, context manager)*
 
-Moves the axes named in `order`, one at a time, each as its own gcode line and its own checked `Step`.
+Sets `_keepout_exempt` for the duration of the `with` block so the steps recorded inside carry `detail["keepout_exempt"]`.
 
-- `order` - a string whose characters are iterated. `"XY"` is X then Y, `"YX"` is Y then X, `"X"` moves X only and ignores `y` entirely (`_route_xy` and `_exit_tip_box` both rely on that).
+**Why it exists:** the keep-out band `tip_ejector` spans X `[148.0, 162.0]` and forbids Y motion there. The ejector lane is at X `155.0`, inside its own band - the engagement is physically required to break the rule. The exemption therefore has to be granted to *specific waypoints*, not to the operation. `Simulator._check_keepout` only honours it when **both** the step carries the flag **and** `step.op` is in the band's `whitelist` (`["eject_tip"]`). Marking by operation name alone was a confirmed defect: the approach and retract traverses around the engagement are ordinary moves and inherited the exemption, which allowed an unchecked 104 mm tipped Y traverse at X 162. `tests/test_review_fixes.py::test_1b_exemption_cannot_be_spoofed_by_op_name` pins the fix by passing `op="eject_tip"` to a hand-rolled move and requiring it to still fail.
 
-Each axis is skipped if its delta is within 1e-6. One axis per step is also what lets the simulator treat the swept region as an axis-aligned box between `frm` and `to`, which is how `_check_traverse_clearance` catches a path that sweeps over a rack without ending on it.
+#### `_raw(line, op, **detail) -> Step` *(private)*
 
-**Note:** `order` is neither validated nor upper-cased here. `order="xy"` would take the `else` branch for both characters and silently emit a single Y move and no X move at all. The public entry points are safe (`goto` upper-cases and validates `prefer`), but a new caller inside this module could hit it.
+Writes one literal gcode line and records it as `kind="macro"`. Used for the Klipper macros. A protocol should use `note()` instead; anything else it might want to emit raw belongs in `deck.json -> klipper_macros`.
 
-### `goto(self, x: float, y: float, op: str = "goto", feedrate: Optional[int] = None, prefer: Optional[str] = None) -> None`
+#### `_require_homed(what)` *(private)*
 
-Lift to travel height, then traverse. The only public way to move XY.
+Raises `ProtocolError` naming `what` if `startup()` has not run. Guards `goto()`, `get_tip()` and `eject_tip()`.
 
-- `x`, `y` - absolute machine coordinates in mm.
-- `op` - label for the resulting steps.
-- `feedrate` - mm/min; defaults to `deck.feedrate("travel")` = 6000.
-- `prefer` - `"XY"` or `"YX"`, an axis-order *preference*, normally taken from the destination labware's `approach_order`. The keep-out router overrides it when geometry demands and warns when it does.
+#### `_pipette() -> Pipette` *(private)*
 
-Returns nothing. Raises `ProtocolError` if not homed, or if `prefer` is neither "XY" nor "YX", or if the destination cannot be reached without a Y move inside a keep-out band.
-
-The lift comes first and unconditionally. A protocol that has just finished a dispense at Z 45 inside a tube would otherwise traverse the deck at tube depth; the simulator would catch it, but this makes it unrepresentable.
-
-### `goto_placement(self, placement: str, row: int, col: int, op: str = "goto") -> Tuple[float, float]`
-
-Traverse to a well by placement name and 0-indexed `(row, col)`, honouring that labware's `approach_order`. Returns the resolved `(x, y)`.
-
-Raises `DeckError` if no placement has that name, `IndexError` if the well is outside the grid.
-
-This is the one to use for a well: it is `goto_well` plus `prefer=p.labware.approach_order`. For `tube_rack_0p65_5x10` that is `"YX"`, which the labware config explains: the tube caps make Y motion across the holder difficult, so the effector must reach its Y while still clear of the holder in X and then come in along X. X motion passes between cap rows.
-
-### `_route_xy(self, x, y, feedrate, op, labware=None, prefer=None) -> None`
-
-Traverse to XY without ever moving Y inside a keep-out band. This is the routing brain and the one function in the module worth reading twice.
-
-The physical constraint: `deck.json` declares one keep-out, `tip_ejector`, spanning **X [148.0, 162.0]** (the confirmed ejector lane X 155 plus or minus 7.0). It forbids **Y motion only** - a pure X move straight through the band is harmless, because the mechanism is a hazard to the effector crossing it in Y, not to the effector passing along it in X. The band is nominally safe when the effector is above Z 60 (commanded `z < 60`, and travel height 5.0 qualifies), but that figure was stated for the bare p300, so the simulator treats **any tipped Y move in the band as a hard error**, exemption aside. Since every liquid-handling move happens with a tip on, in practice the band is absolute.
-
-Why X-first is the default: the tip box requires it. After a pickup the effector must leave the rack laterally before any Y motion, because passing over an occupied tip position shears the fresh tip off the nosecone.
-
-Why it deviates: X-first puts the Y leg at the **target** X; Y-first puts it at the **current** X. With the ejector band at X [148, 162], the tube holder in slot 8 has two columns inside it - column 8 at X 160.0 and column 9 at X 148.0 - so an X-first approach to either would perform its Y leg exactly where Y motion is forbidden. Whichever end is clear of every band decides the order; the preference only breaks the tie.
-
-The decision sequence, after `prefer` is upper-cased and validated:
-
-| condition | action |
-| --- | --- |
-| `y` unchanged (within 1e-6) | single X move, `order="X"`. `prefer` is irrelevant |
-| `prefer="YX"` and current X clear | `order="YX"`, no warning |
-| `prefer="XY"` and target X clear | `order="XY"`, no warning |
-| target X clear (preference was YX) | `order="XY"` plus an `order_override:<op>` warning naming both X values |
-| current X clear, `prefer="YX"` | `order="YX"` |
-| current X clear, `prefer="XY"` | `order="YX"` plus an `order_override:<op>` warning |
-| both blocked | dogleg |
-
-The dogleg: `via = _nearest_clear_x(x)`; if none exists, `ProtocolError` naming both X values. Otherwise a `dogleg:<via>` warning, then three moves - X to `via` at the current Y, Y to the target at `via`, X to the target at the target Y. Verified: from (155, 300) to (150, 200) it emits X 155 -> 146, Y 300 -> 200 at X 146, X 146 -> 150. Both warning keys dedupe (`order_override` per op name, `dogleg` per via X), so a loop of 50 dispenses into a blocked column warns once.
-
-**Note:** the docstring's example cites "the tube rack columns at X150 and X162". The real blocked columns are column 8 at X 160.0 and column 9 at X 148.0; X 162 is the band's upper edge, not a column. The code is right, the comment's numbers are not.
-
-### `_nearest_clear_x(self, target: float, pad: float = 2.0) -> Optional[float]`
-
-The X closest to `target` at which no band forbids Y motion, or `None`. Considers only `x_range[0] - pad` and `x_range[1] + pad` for each band containing `target`, discards candidates outside the X envelope [0, 420] or inside another band, and returns the nearest. For the single current band that is 146.0 or 164.0.
-
-**Note:** `pad` is 2.0 mm, measured off band edges that `deck.json` itself flags as unverified: "The 14 mm width is carried over from the previously documented band centred on X 85 and is still UNVERIFIED at this location." A dogleg therefore clears the mechanism by 2 mm against a boundary nobody has measured. Widening the band in config is the fix; the pad is not the place to buy margin.
-
-### `goto_station(self, name: str, op: Optional[str] = None) -> None`
-
-Traverse to a named fixed station from `deck.json` (`water` at (70.0, 175.0), `park` at (420.0, 0.0), `tip_eject` at (155.0, 89.0)). `op` defaults to `f"goto:{name}"`. Raises `DeckError` for an unknown station. Does not pass `prefer`, so stations are always approached X-first-preferred.
-
-### `goto_well(self, placement: str, row: int, col: int, op: str = "goto") -> Tuple[float, float]`
-
-Resolve a well to machine coordinates and traverse there. Returns `(x, y)`. Raises `DeckError` for an unknown placement name, `IndexError` for a well outside the grid.
-
-**Note:** identical to `goto_placement` except that it does **not** pass the labware's `approach_order`, so a `goto_well("tubes", ...)` approaches the tube holder X-first, across the caps, which is the motion `approach_order: "YX"` was added to avoid. Neither method is used by any protocol or test in the repo today. Prefer `goto_placement`, or give `goto_well` the same `prefer` and delete one of them.
+Returns `self.effector` if it is a `Pipette`, else raises `ProtocolError` naming the actual `kind`. Every liquid primitive calls it, so loading the gripper and calling `aspirate_uL` fails with a sentence rather than an `AttributeError`.
 
 ---
 
-**Actuator and annotation**
+### Motion
 
-### `actuator(self, pos: float, settle: float = 0.0, op: str = "actuator") -> float`
+#### `_move_z(z, feedrate, op, labware=None)` *(private)*
 
-Command the plunger to an absolute POS, validated, tracked and recorded.
+Absolute Z move to `z` mm at `feedrate` (mm/min). Remember `z` larger means physically lower.
 
-- `pos` - absolute plunger position in mm. For p300 the legal range is the floor `pos_min + stroke_margin` = 1.0 up to `blowout_pos` = 30.0. Larger POS is further bottomed (more dispensed).
-- `settle` - seconds to dwell afterwards; 0 emits nothing.
-- `op` - label.
+- `labware` (str or None): the labware id whose Z table this depth came from. It is passed straight through to the `Step`, and `Simulator._check_move` uses it to look up that labware's `bottom` crash limit. **Pass it whenever the depth came from `effector.z_for(...)`** - omitting it silently disables the well-floor check for that move.
 
-Returns the rounded POS actually commanded. Raises `EffectorError` via `Pipette.check_pos` if the POS is below the floor ("would put plunger POS at 0.5, below the 1.0 mm floor") or past blow-out. A non-pipette effector is not POS-validated here.
+Returns nothing. Emits nothing and records nothing when the delta rounds to zero at 6 decimal places, using the same tolerance as `gcodepy.move_z_absolute`. That match is deliberate: a mismatched tolerance recorded a `Step` for a move that emitted no line, which desynchronised step indices from gcode lines (`test_review_fixes.py::test_14_no_phantom_z_steps`).
 
-Emits `ACTUATOR_MOVE POS=` (from `deck.klipper_macros`) with the value formatted at the effector's `actuator.decimals`, which is 3 for both pipettes. The comment records why: quantizing once at fixed width avoids compounding two roundings, 2 dp would inject 0.63% error at the 10% ISO point, and 4 dp is below the actuator's step.
+#### `_move_xy(x, y, feedrate, op, labware=None, order="XY")` *(private)*
 
-### `dwell(self, seconds: float, op: str = "dwell") -> None`
+Moves to `(x, y)` mm **one axis at a time**, in the order given by the characters of `order` - `"XY"`, `"YX"`, or a single `"X"` / `"Y"` to move only that axis. Each axis is a separate `Step` and therefore separately checked; an axis whose delta is within 1e-6 is skipped.
 
-Emit `G4` for `seconds` and record it. A zero, negative or `None`-ish value is a silent no-op. gcodepy's `dwell` raises `ValueError` on a non-positive duration, so this guard is what lets callers pass a settle time straight from config without checking it first.
+**Why one axis at a time:** the simulator's swept-region checks (`Deck.segment_hits_rect`, traverse clearance) assume the swept area is the axis-aligned box between the endpoints, which is only true for single-axis legs. `deck.json -> conventions.xy_order` states the same rule ("Never diagonal. Enforced by the library."). A protocol must not call this: it does no routing and no travel-height lift, so it will happily drive Y through a keep-out band and let the simulator catch it. That is exactly how the tests provoke failures.
 
-### `wait(self) -> None`
+#### `goto(x, y, op="goto", feedrate=None, prefer=None)`
 
-Emit `M400` (wait for the move queue to drain). Used before and after anything where the next action must not start early: after arriving at a well, around the tip press, around each ejector waypoint.
+Lift to travel height, then traverse to `(x, y)`. **The only public XY move.**
 
-**Note:** this is the only emitter in the module that records no `Step`. The simulator never sees it, and `M400` lines are counted in `gcode_lines` but not in the step count.
+- `x`, `y` (mm, machine frame): envelope is X 0-420, Y 0-580.
+- `op` (str): label carried on every `Step` this produces; it appears in error messages and in the toolpath plot, and it is what `_LOW_XY_OK` and the keep-out whitelist match against.
+- `feedrate` (mm/min or None): defaults to `deck.feedrate("travel")` = 6000.
+- `prefer` (`"XY"`, `"YX"` or None): axis-order preference. `None` means `"XY"`.
 
-### `log_temps(self, tag: str) -> None`
+Raises `ProtocolError` if not homed, if `prefer` is not one of the two strings, or if no route is clear. Returns nothing.
 
-Emit `LOG_TEMPS TAG=<tag>`, or nothing at all if the machine was constructed with `temp_log=False`. Raises `DeckError` if `klipper_macros.log_temps` is missing. `tag` is a free-form label; `protocols/accuracy_test.py` uses `"start"`, `"prewet_done"`, `f"v{volume:g}_r{rep}"`, `"end"` so a temperature trace can be joined back to individual dispenses.
+**Why it exists:** it enforces the two invariants a hand-written move gets wrong. First, the lift - a traverse below travel height is the crash mode that costs a tip, and `Simulator._check_move` hard-fails any XY step whose start or end Z is not exactly `deck.z_travel` (5.0) unless `op` is in `_LOW_XY_OK` = `{"wall_wipe", "eject_tip"}`. Second, the lift is **conditional on XY actually changing**: lifting unconditionally made a dispense followed by a mix in the same well climb to Z 5 and come straight back down to Z 45 for nothing.
 
-### `note(self, text: str) -> None`
+**Note:** the lift is emitted before `_route_xy` can raise, so a `goto` that is refused for being unreachable can leave one Z line in the buffer if the effector was not already at travel height. In practice every primitive ends at travel height, which is why `test_lab.py::test_envelope` sees zero lines emitted by a refused `goto(500, 100)`.
 
-Emit `; <text>` as a gcode comment, append it to `self.notes` (which the manifest carries), and record a `kind="note"` step. The point is that a note lands in both artifacts, so a comment explaining a run cannot exist in the gcode and be absent from the manifest.
+#### `goto_placement(placement, row, col, op="goto") -> (x, y)`
+
+Traverse to a well, honouring that labware's `approach_order`.
+
+- `placement` (str): placement name from the layout - `"tips"`, `"big_tubes"`, `"plate1"`, `"plate2"`, `"water"` (and `"tubes"` in the test layout).
+- `row`, `col` (int, 0-based): `row=0, col=0` is A1.
+
+Returns the resolved `(x, y)` in mm. Raises `DeckError` for an unknown placement name and `IndexError` for a well outside the grid.
+
+**Why it exists:** it is the bridge from protocol language to coordinates, and it is where the per-labware Y-first rule gets applied. Both tube holders declare `approach_order: "YX"` because their caps make Y motion across the holder difficult - the effector must reach its Y while still clear in X. A plate declares nothing, so the default X-first applies.
+
+#### `goto_well(placement, row, col, op="goto") -> (x, y)`
+
+Alias for `goto_placement`, kept because protocols call it.
+
+**Why it exists:** it used to be a near-duplicate that did not pass `prefer`, so it silently ignored the Y-first rule both tube holders need. Two ways to reach a well is one too many. `test_lab.py::test_goto_well_honours_approach_order` pins that the legs come out `["Y", "X"]`.
+
+#### `goto_station(name, op=None)`
+
+Traverse to a fixed station's XY. `name` is a key in `deck.json -> stations`: `"water"` `(70.0, 175.0)`, `"park"` `(420.0, 0.0)`, `"tip_eject"` `(155.0, 89.0)`. Raises `DeckError` for an unknown name. `op` defaults to `"goto:<name>"`.
+
+**Note:** it does not pass a `prefer`, so a station approach always starts from the X-first preference. That is currently harmless (no station sits on labware that declares `"YX"`) and the router still overrides the preference on geometry - the tip-rack no-fly around the water station at X 70 is resolved by `_route_xy`, not by a preference.
+
+#### `_route_xy(x, y, feedrate, op, labware=None, prefer=None)` *(private, and the heart of the module)*
+
+Traverses to `(x, y)` on a path that is actually clear, emitting the legs itself via `_move_xy`. Raises `ProtocolError` naming the first obstacle if nothing works.
+
+There are two obstacle classes and **neither can be solved by travelling higher**:
+
+- **Keep-out bands** forbid *Y* motion at certain X. `tip_ejector` covers X `[148.0, 162.0]` and is safe only when commanded Z is *below* `60.0` (i.e. physically above it) - and only bare. With a tip fitted it is an unconditional error, because `safe_when_z_below` was stated for the bare nosecone and the tipped equivalent was never measured. A pure *X* move straight through a band is fine.
+- **No-fly labware** (`labware.json -> avoid_traverse`, true only for `tiprack_300_96`) forbids motion of *either* axis across it while a tip is fitted. The tips stand upright well above the rack body and the fitted tip hangs 52.25 mm below the nosecone, so crossing shears the tip off at any travel height.
+
+The algorithm is **candidate-based**: rather than reason about which single axis order survives, it builds a list of complete routes and takes the first whose *every* leg is clear.
+
+1. **Degenerate cases first.** If both axes are already at target, return. If only one axis needs to move, try that single leg on its own and take it if `_route_problem` says it is clear.
+2. **Build candidates, in order:**
+   - the **preferred order** - `[(x, cur_y), (x, y)]` for `"XY"`, `[(cur_x, y), (x, y)]` for `"YX"`;
+   - the **other order**;
+   - **X doglegs**: for each candidate X from `_dogleg_x_candidates`, the three-leg route `[(via, cur_y), (via, y), (x, y)]` - step sideways to a clear X, do the whole Y move there, come back in X;
+   - **Y doglegs**: for each candidate Y from `_dogleg_y_candidates`, `[(cur_x, via), (x, via), (x, y)]` - step out in Y, cross in X at that Y, then come back in Y.
+3. **Take the first clear candidate.** If it is not the preferred order, record a `route_override:<op>:<label>` warning quoting the preference, the problem that blocked it, and what was routed instead. Then emit the legs, deciding each leg's axis by which coordinate changed.
+4. **If nothing is clear**, raise `ProtocolError` quoting `first_problem` - the reason the *preferred* route failed, which is the most useful one to show.
+
+**Why Y doglegs are needed on their own:** an X dogleg only helps when there is a clear X to do the Y move at. It cannot help at all when both the start and the end lie *inside* the no-fly rectangle's Y span, because then every X leg between them crosses the rack no matter which X the Y move happens at. That is not a corner case - it is the normal situation straight after a tip pickup. `_exit_tip_box` leaves the effector at X 8.9, clear of the rack in X but still at the rack's Y (335.5-399.2), and plate1 D6 sits at Y 372, also inside that span, on the far side in X. The only way across is to step *out in Y* first (to `y1 + pad` = 403.75 or `y0 - pad` = 329.6), cross in X there, then come back in Y. `test_lab.py::test_router_doglegs_in_y_to_cross_the_tip_rack` pins exactly this: three legs, none crossing the box, and a `"dogleg via Y"` warning in the report. `test_lab.py::test_hand_rolled_move_over_the_tip_rack_is_refused` pins the other half - the simulator catches a bypass that skips the router.
+
+The mirror case for X doglegs is a band-to-band move: 0.65 mL tube column 2 at X 162 to column 3 at X 150, both inside `[148, 162]`. Neither axis order is safe, so the route has to step out of the band, move Y there, and come back (`test_lab.py::test_dogleg_when_both_ends_are_in_the_band`, three moves plus a `"Routed dogleg"` warning).
+
+**The preference always yields, loudly.** `approach_order` is an ease-of-motion instruction from the operator, not a safety constraint, so an obstacle overrides it - but never silently.
+
+#### `_route_problem(legs) -> str | None` *(private)*
+
+Returns a sentence explaining why a sequence of `(frm, to)` legs is unsafe, or `None` if clear. Checks, per leg: the destination is inside the envelope; the leg does not sweep a no-fly rect (only when `tip_fitted` - `no_fly_rects()` is empty otherwise); and, for any leg that changes Y, that the Y motion's X is not inside a keep-out band (an error unconditionally when tipped, and when bare only if travel Z is not safe - at Z 5.0 versus `safe_when_z_below` 60.0 it always is).
+
+It evaluates against `deck.z_travel`, not the current Z, because `goto()` guarantees the lift has already happened before routing.
+
+#### `_dogleg_x_candidates(cur_x, target_x) -> list[float]` *(private)*
+#### `_dogleg_y_candidates(cur_y, target_y) -> list[float]` *(private)*
+
+Candidate dogleg coordinates in mm, deduped, clamped to the envelope, sorted nearest the *target* first (so the shortest detour is tried first). Both use a 6.0 mm pad. The X version draws candidates from both no-fly rect edges and keep-out band edges; the Y version only from no-fly rect Y edges - correctly, since keep-outs constrain the X at which Y motion happens, which is an X-dogleg problem.
+
+**Note:** the `cur_x` / `cur_y` parameters are accepted and never used; ordering is by distance to the target only.
 
 ---
 
-**Operations**
+### Actuator
 
-### `home(self, op: str = "home") -> None`
+#### `actuator(pos, settle=0.0, op="actuator") -> float`
 
-Home Z, then XY, then the actuator. Emits `G28 Z`, `G28 X Y`, `HOME_ACTUATOR`, records a step for each, and sets `self.homed = True`. Z first is deliberate: it lifts the effector before any XY reference move. After this the writer's position is the home position `(420.0, 0.0, 0.0)`.
+Commands the plunger to an absolute POS and returns the rounded value actually emitted.
 
-### `startup(self) -> None`
+- `pos` (mm of plunger travel, in the effector's own POS frame - **not** a Z and **not** a volume): rounded to `actuator.decimals` (3 for both pipettes) and, for a `Pipette`, checked by `Pipette.check_pos`, which raises `EffectorError` if it is below the floor `pos_min + stroke_margin` (0.0 + 1.0 = 1.0 for p300) or above `blowout_pos` (30.0).
+- `settle` (seconds): a dwell emitted after the move. 0 or negative is a no-op.
 
-Home everything, reference the plunger at blow-out, lift to travel height, then `M400`.
+Emits `ACTUATOR_MOVE POS=<pos>` at fixed width, from `deck.macro("actuator_move")` - the macro string is never defaulted, so a mistyped `klipper_macros` entry raises `DeckError` instead of emitting a plausible-looking line that addresses nothing (`test_review_fixes.py::test_13_macros_must_be_declared`). Updates `self.pos`.
 
-The plunger goes to `blowout_pos` (30.0 for p300) **before** anything else moves, and the comment gives the reason: bottomed first means no vacuum while pressing onto a tip. A plunger left mid-stroke would aspirate air through the tip during the press and the first real aspiration would be wrong by an unknown amount.
+**Why the fixed-width format matters:** the value is quantized exactly once, at `decimals`. Rounding into a variable and then subtracting from it compounds two quantizations; the comment records that 2 dp would inject 0.63 percent error at the 10 percent ISO point, and 4 dp is below the actuator's step size.
 
-Raises whatever `home`, `actuator` or `_move_z` raise. Non-pipette effectors skip the plunger reference.
+Protocols normally reach this through `aspirate_uL`, `dispense`, `mix` and `prewet` rather than calling it directly - those are the paths that convert microlitres to a POS through the calibration.
 
-### `park(self) -> None`
+#### `dwell(seconds, op="dwell")`
 
-Traverse to the `park` station and retract Z. Uses the station's own `z` if it has one (0.0, which is Z home, the top) and `deck.z_home` otherwise.
+Emits a dwell of `seconds`. Guarded: a zero or negative settle is a no-op, not an exception, so callers can pass a config value straight through without checking it.
 
-`park` at (420.0, 0.0) is X home and Y home, which is what that station has always meant; `deck.json` records that it was X 350 in the pre-shift frame and gained the +70 X correction, and that "park at X350 in a 0-350 machine WAS 'go to X home'" is part of the evidence for the frame shift itself.
+#### `wait()`
 
-**Note:** because `goto` lifts to travel height first, parking straight after the post-ejection `G28` emits `G0 F6000 Z5` followed immediately by `G0 F6000 Z0` - down 5 mm and back up. Harmless, but it looks like a bug in the output and is worth recognising as not one.
+Emits `wait_finish` (Klipper `M400`). Records no `Step`. Used after every motion that must physically complete before the next one starts - descents into liquid, the tip press, every leg of the ejection.
 
-### `get_tip(self, row: int = 0, col: Optional[int] = None, placement: str = "tips") -> Tuple[int, int]`
+#### `log_temps(tag)`
 
-Press the nosecone into a tip, lift it out, and leave the rack in X before any Y motion. Returns the `(row, col)` actually picked.
+Emits `LOG_TEMPS TAG=<tag>`, or nothing at all when the machine was constructed with `temp_log=False`. `tag` is a free-text label that lands in the Klipper log so a temperature reading can be tied back to a step. The macro name comes from config; `DeckError` if it is missing.
 
-- `row` - 0-indexed rack row. Default 0.
-- `col` - 0-indexed column, or `None` to let `_next_free_tip_col` choose the first unused column working inward from the exit edge.
-- `placement` - layout placement name, cross-checked against the effector's own `tips.labware`.
+#### `note(text)`
 
-Raises `ProtocolError` if not homed; if the effector's `tips.required` is false ("p125 does not use tips ... so get_tip() is meaningless"); if a tip is already fitted; if the named placement holds the wrong labware; if the requested position was already consumed this run; or if the row is exhausted. Raises `IndexError` for a position outside the grid, and `EffectorError` if the effector has no `pick` Z for that rack.
-
-The sequence, for p300 on the rack in slot 3 (grid solved from three measured well centres, X 18.0 to 118.0, Y 335.5 to 399.2, real pitch 9.0909 by 9.1):
-
-1. `goto(x, y, prefer=p.labware.approach_order)` - the tiprack declares no `approach_order`, so X-first. `M400`.
-2. Descend to the `approach` Z if the effector declares one (p300: 47.0), otherwise stay at travel height. The fallback is why `_has_z` exists: an effector without an approach entry gets a no-op, not a crash.
-3. Descend to the `pick` Z (p300: 59.0) at `tip_press` feedrate 600, then `M400`, then dwell 1 s. `pick=59.0` came from a direct rack measurement and supersedes the `Z_TIP_PICK=57.5` in the old script.
-4. Set `tip_fitted = True`, `current_tip = (row, col)`, and register the position as consumed so it can never be picked twice.
-5. Lift to travel height at 600. This is the first step recorded with `tip=True`, so from here the simulator uses the tipped Z envelope: the deepest legal commanded Z on-stage drops from 114.75 to 62.5.
-6. `_exit_tip_box(...)` - leave the rack in X.
-
-The consumed-position check is the sharpest guard here, and its message says why: "Pressing into an empty rack hole drives the bare nosecone down to the pick depth with nothing to stop it." Z 59.0 was calibrated with a tip in the hole to stop the descent.
-
-**Note:** `exit_edge, exit_col = self._tip_exit(p)` unpacks `exit_col` and never uses it. Harmless, but it reads as though the default column comes from there when it actually comes from `_next_free_tip_col`.
-
-### `_tip_placement(self, placement: str) -> Placement`
-
-Resolves which rack this effector takes tips from. If the named placement exists, its labware id must equal the effector's `tips.labware` or `ProtocolError` names both and points at the config field to change. If the name does not exist and the effector declares a tip labware, it falls back to `deck.placement_for_labware(want)`.
-
-Prevents a specific misdiagnosis: routing by placement name alone would send a second effector that declares a different rack to the wrong rack, and the resulting `EffectorError` would then tell the operator to add the *wrong* rack to that effector's Z table. Not for protocol authors.
-
-### `_next_free_tip_col(self, p: Placement, row: int, exit_edge: str) -> int`
-
-First unused column in `row`, ordered from the exit edge inward (ascending X for `low_x`, descending for `high_x`). Raises `ProtocolError` when the row is exhausted, suggesting a reload or a different row.
-
-This encodes the physical constraint, not a convenience: the effector exits across every column between the one it picked and the edge, so the edge column must be consumed first and the box must empty toward the middle. Verified consumption order on the current rack: columns 0, 1, 2, 3. Not for protocol authors, but reading it explains why you cannot pick an arbitrary column on a full rack.
-
-### `_has_z(self, labware_id: str, key: str) -> bool`
-
-True if the effector's `z_for_labware[labware_id][key]` exists and is not null. Distinguishes "no approach height configured" from "configured as null, meaning never measured" - `Effector.z_for` raises on the latter, so `get_tip` has to ask before it asks for the value.
-
-### `_tip_exit(self, p: Placement) -> Tuple[str, int]`
-
-Returns `("low_x"|"high_x", column_index)` from the labware's `consume_order.exit_edge`, accepting `low_x`/`min_x` and `high_x`/`max_x`.
-
-For anything else - and `tiprack_300_96` currently says `"unconfirmed"` - it assumes the low-X edge and emits a warning naming the assumed column and X ("assuming the low-X edge (column 0, X 18.0) ... if it is the high-X edge, every tip pickup in this run exits the wrong way"). Guessing is acceptable only because `check_tip_exit` independently fails if the chosen exit path crosses an occupied position, whichever edge turns out to be right. Not for protocol authors.
-
-### `_exit_tip_box(self, p: Placement, row: int, col: int, edge: str) -> None`
-
-Moves X to one column pitch beyond the outermost well centre on the exit side, clamped into the X envelope, at travel feedrate. On the current rack that is `18.0 - 9.0909 = 8.909`.
-
-Before moving, it builds a `Step` by hand (bypassing `_record`) and calls `sim.check_tip_exit(step, row, col, crossed)` with the list of positions the X path crosses. That check hard-fails if any of them still holds a tip.
-
-One pitch beyond the outermost centre clears every tip *position* without requiring the rack's physical outline, which has never been measured (the three corners are well centres, not the box). And the move is not redundant with the next `goto`: it guarantees the effector is out of the box before `_route_xy` makes any decision that could put Y first. Not for protocol authors.
-
-### `eject_tip(self) -> None`
-
-Hook the tip collar on the ejector and pull UP to strip it, then re-home.
-
-Takes no arguments. Raises `ProtocolError` if not homed, if the effector's `tips.eject_supported` is false, or if no tip is fitted. All geometry comes from `deck.stations.tip_eject`: `lane_x` 155.0, `approach_y` 83.0, `engage_y` 88.0, `retract_y` 80.0, `z_below_hook` 145.0, `z_strip` 137.0, `rehome_after` true, `validated` **false**.
-
-Because `validated` is false, every call warns: the routine has never been validated on hardware, no gcode file in the repo contains an ejection sequence, so it has no working reference. Dry-run it, then step it through manually at reduced feedrate.
-
-The choreography, with Z direction spelled out at every step (feedrate 6000 unless noted; `slow` is 600):
-
-1. **Lift to travel height**, Z 5.0. No-op if already there.
-2. **Approach through the router**, `_route_xy(155.0, 83.0)`, at Z 5. Hand-ordering was rejected here: the lane X 155 is itself inside the keep-out band [148, 162], so the Y leg cannot happen at the target X. The router works that out from geometry and does Y first at the current X, then X in. Verified from the tip-box exit: `Y 399.2 -> 83.0` at X 8.909, then `X 8.909 -> 155.0` at Y 83.0. Then `M400`.
-3. **Descend below the hook**, Z 5.0 -> **145.0** at feedrate 600. That is 140 mm **DOWN**. Legal only because Y 83 is off the front of the stage region (which starts at Y 131.875), so the stage surface at 114.75 is not there to hit; the simulator warns exactly that, and `Deck.point_on_stage` is the test rather than an assumption. `M400`.
-4. **Engage** (exempt), `Y 83.0 -> 88.0` at X 155, Z 145. 5 mm of Y, laterally bringing the collar under the hook. This is precisely the motion the keep-out band forbids, at precisely the X the band exists for, which is why the exemption is scoped to these steps and nothing else. `M400`.
-5. **Strip** (exempt), `Z 145.0 -> 137.0` at 600. **+Z is down, so this is 8 mm UPWARD** - the tip collar is held by the hook and the machine pulls the nosecone up out of the tip. `tip_fitted` and `current_tip` are cleared immediately after. `M400`.
-6. **Back down clear of the hook** (exempt), `Z 137.0 -> 145.0`, 8 mm **DOWN**. Recorded with `tip=False`, since the tip is gone by now.
-7. **Retract out of the lane** (exempt), `Y 88.0 -> 80.0` at X 155, Z 145. 8 mm of Y, still inside the band, still exempt.
-8. **Lift**, `Z 145.0 -> 5.0`, 140 mm **UP**, at travel feedrate, outside the exemption block (a Z-only move, so no keep-out check applies anyway). `M400`. Then a `kind="note"` step with `detail={"final": True}`, which is what arms the simulator's must-re-home rule. Placing that marker *after* the lift is deliberate: if it came first, the lift itself would be the move that trips "an ejection was not followed by G28".
-9. **Re-home**, `G28` (all axes), if `rehome_after`. Mandatory, not tidy-up: the strip force can skip steps on an open-loop machine, so the commanded position afterwards is untrustworthy. The simulator enforces it in both directions - the first `move` or `actuator` step after the ejection marker without an intervening home is a hard failure, and a run that *ends* on an ejection with no `G28` is a whole-run error that makes `finalize` refuse.
-
-**Note:** the approach at step 2 does not pass `prefer="YX"`, so `prefer` defaults to "XY" and the router logs `eject_tip: prefers XY but the target X 155.0 is inside a keep-out band, so the Y leg was done first`. The routing is correct; the warning is misleading, because Y-first is the required order here rather than an override of a preference. Passing `prefer="YX"` would silence it and document the intent.
-
-### `goto_reservoir(self, station: str = "water") -> None`
-
-Traverse to a reservoir station (default `water` at (70.0, 175.0)) with `op="reservoir"`. A thin alias over `goto_station`.
-
-### `prewet(self, cycles: Optional[int] = None, station: str = "water") -> None`
-
-Wet the tip wall so the first real aspiration is not wetting dry plastic, which otherwise costs a few uL on the first draw only and shows up as a single outlier.
-
-- `cycles` - number of aspirate/blow-out cycles, or `None` for the effector's configured `prewet.cycles` (3 for p300).
-- `station` - station name whose placement supplies the working Z.
-
-Raises `ProtocolError` if the effector is not a pipette, if `prewet.enabled` is false ("p125 has prewet disabled in its config; enable it there rather than calling prewet() anyway"), or if `cycles` is below the configured `min_cycles` (3). Raises `EffectorError` if the reservoir's `work` Z is null.
-
-Sequence: traverse to the station, `M400`, plunger to `blowout_pos` 30.0 with a 0.5 s settle, descend to the reservoir `work` Z (40.0 for p300, tip submerged), `M400`, then `n` times `[asp_pos 10.0, settle 1 s, blowout 30.0, settle 1 s]`, then lift to travel height. Records the count in `self.toggles["prewet_cycles"]`, so the manifest states how much prewetting the run actually did. Note `prewet.asp_pos` is measured from bottomed, not from `gap_pos`.
-
-### `_station_labware(self, station: str) -> str`
-
-The labware id of the placement mounted at a station name. Raises `ProtocolError` if no placement sits there: "the library cannot know what is there". Prevents the alternative, which is defaulting to some assumed reservoir and descending to a Z calibrated for a different vessel.
-
-**Note:** `prewet` resolves the same id the long way round, `deck.placement_for_labware(self._station_labware(station)).labware.id`, which is the identity function on the result. Harmless, except that `placement_for_labware` raises `DeckError` if two placements ever share that labware, so the redundant hop adds a failure mode `aspirate_uL` (which calls `_station_labware` directly) does not have.
-
-### `aspirate_uL(self, volume_uL: float, station: str = "water") -> float`
-
-One independent aspiration. Returns the plunger POS used for the draw.
-
-- `volume_uL` - **microlitres**, always. Converted to mm inside the pipette from the stored calibration.
-- `station` - source station name, default `water`.
-
-Raises `ProtocolError` if the effector is not a pipette, if it requires a tip and none is fitted, or if the machine is already holding fluid. Raises `VolumeError` if the volume is outside the calibration window (p300: [8.0, 320.0] uL - "The curve was never fitted there; the displacement would be an extrapolation") or beyond the stroke available. Raises `EffectorError` if a POS in the stroke would breach the plunger limits, or if the reservoir has no `work` Z.
-
-The "already holding" check encodes the experimental design, not a mechanical limit: every tube gets its own independent aspiration, so carrying fluid across two dispenses would silently turn a set of independent measurements into a serial dispense.
-
-`displacement_mm`, `aspirate_pos` **and** `backoff_pos` are all computed before a single line is emitted. The reason is stated in the code: discovering at the backoff that the plunger has run out of travel would leave a half-finished aspiration in the buffer with the state claiming it completed. The backoff is a real position the machine visits, so validating only the aspirate POS would validate a position it never reaches.
-
-Sequence, for 150.0 uL on p300 (`d = 8.117 mm`, `asp = 25 - 8.117 = 16.883`, `backoff = 15.883`): clear `_last_aspirate`, traverse to the station, `M400`, plunger to `gap_pos` 25.0 with a 1 s settle **in air** (the 5 mm air gap must be armed before the tip is in liquid or it draws water instead), descend to Z 40.0, `M400`, plunger to 16.883 and settle 1 s, lift to travel height, then if `post_asp_backoff` is nonzero retract a further 1.0 mm to POS 15.883 as anti-drip - in air, after leaving the water. Finally record `{volume_uL, displacement_mm, aspirate_pos, backoff_pos}` in `_last_aspirate` for the dispense to consume.
-
-### `dispense(self, placement: str, row: int, col: int, wall_wipe: Optional[bool] = None) -> Dict[str, Any]`
-
-Full dispense to blow-out, optionally wipe the droplet off the tip, and return the manifest row.
-
-- `placement` - layout placement name, e.g. `"tubes"`.
-- `row`, `col` - 0-indexed. On `tube_rack_0p65_5x10` (slot 8) increasing col moves toward **lower** X at 12.0 mm pitch (X 256.0 down to 148.0) and increasing row toward lower Y at 18.0 mm (Y 223.0 down to 151.0). That is the opposite column sense from the tiprack; do not carry one convention across both.
-- `wall_wipe` - `True`/`False` to force, `None` to wipe if the labware has a `wipe` block (the tube holder does: `dx` 3.2, `dz` 4.0, `feed` 1500, all three flagged uncalibrated).
-
-Returns a dict with `order_index`, `placement`, `labware`, `slot`, `well` (an "A10"-style name), `row`, `col`, `x`, `y`, `z`, `target_volume_uL`, the four fields carried over from the aspiration, and `mass_dry_mg` / `mass_wet_mg` / `temp_C` set to `None` for the balance to fill in. Also appended to `self.dispenses`, which becomes `<name>.balance.csv`.
-
-Raises `ProtocolError` if the effector is not a pipette, if nothing is aspirated, or if `wall_wipe=True` on labware with no wipe block. Raises `DeckError` for an unknown placement, `IndexError` for a well outside the grid (row 9 of a 5 x 10 rack raises here, not a `ProtocolError`), and `EffectorError` if the labware's `work` Z is null.
-
-The wipe decision is settled before any motion. The comment gives the reason and it is a good one: raising after the blow-out would leave a complete, irreversible dispense in the buffer with no manifest row to account for it, so the gcode and the balance sheet would disagree about how many dispenses happened.
-
-Sequence: `goto` with `prefer=p.labware.approach_order` (`"YX"` for the tube holder), descend to the `work` Z (45.0 for p300 on the tube rack, **flagged uncalibrated** - "was marked `<-- TUNE` in the source and was never tuned"), `M400`, plunger to `blowout_pos` 30.0 with a 1 s settle, zero `fluid_uL`, optionally wipe, lift to travel height, `M400`. `_last_aspirate` is then cleared: one aspiration feeds exactly one dispense.
-
-### `_wall_wipe(self, p: Placement, x: float, y: float) -> None`
-
-Step sideways to the inner wall, drag the droplet UP, then pull back off the wall. Uses `dx`, `dz` and `feed` from the labware's `wipe` block.
-
-Emits three moves at well depth: X to `x + dx` (148.0 -> 151.2 for column 9), Z to `z_work - dz` (45.0 -> 41.0, and **subtracting is UP**), then X back to `x`. It does not restore Z; the caller's lift to travel height does.
-
-Before moving it asserts its own starting pose and raises `ProtocolError` if the effector is not exactly at `(x, y, z_work)`. That guard is load-bearing: `wall_wipe` is one of only two ops the simulator exempts from the travel-height rule, so calling it from anywhere else would traverse the deck at tube depth with the check that would normally catch it switched off. `dx` must stay under the tube's inner radius, and the whole wipe stays inside one stage location, which is what keeps it clear of the raised-edge rule (that rule applies to motion crossing a location boundary, not motion inside one). Never call this from a protocol.
+Writes `; <text>` into the gcode, appends to `self.notes`, and records a `Step`. The manifest carries the same list, so a note is the intended way for a protocol to leave a human-readable marker in both artefacts at once.
 
 ---
 
-**Finalize**
+### Operations
 
-### `simulate(self) -> Report`
+#### `home(op="home")`
 
-Run the whole-run checks and return the `Report`. Idempotent: `Simulator.finish` returns the same object on every subsequent call, so inspecting the report and then calling `finalize` does not duplicate every whole-run line into the manifest.
+Homes Z first, then XY, then the actuator via `deck.macro("home_actuator")`, and sets `self.homed = True`. Two separate `Step`s for the axis groups.
 
-The whole-run layer adds what per-step checks cannot see: a run ending on an ejection with no `G28` (error), footprint overlap between placements (error), fluid still held at the end (warning), a tip still fitted and never ejected (warning), and the slot-seating report.
+**Why Z first:** the effector must be at the top before X or Y move, and X homes at max (420) - a long traverse.
 
-### `finalize(self, outdir: str = ".", plot: bool = True) -> Dict[str, Any]`
+#### `startup()`
 
-Run the whole-run checks, then write the gcode, manifest and balance CSV - or refuse.
+Home everything, reference the plunger at blow-out, lift to travel height, wait.
 
-- `outdir` - output directory, created if needed.
-- `plot` - also render `<name>.toolpath.png` (XY path coloured by Z plus an inverted Z-vs-step trace). Returns `None` for `plot` if matplotlib is not installed.
+Calls `home()`, then for a pipette commands `actuator(blowout_pos)` (30.0 for p300), then `_move_z(deck.z_travel)` = 5.0, then `wait()`.
 
-Returns `{"gcode", "manifest", "plot", "report", "lines", "dispenses"}` - the first three are paths (`plot` may be `None`), `report` is the `Report`, `lines` is the gcode line count, `dispenses` is the count.
+**Why blow-out first:** bottomed means no vacuum in the tip cone. Referencing the plunger anywhere else would leave the pipette holding a partial vacuum while the nosecone is later pressed onto a tip, which draws air (or liquid) past the seal as the tip seats.
 
-Raises `ProtocolError` with the full report text if `report.ok` is false. In strict mode most failures have already raised `SimulationError` during generation, so the errors that surface *here* are the whole-run ones, which are appended without raising. Verified: with `rehome_after` disabled, `finalize` raises "simulation failed; refusing to write gcode" and no file is written.
+#### `park()`
 
-This is the only function in the module that touches the filesystem, which is the whole point of constructing the `Gcode` buffered.
+Traverse to the `park` station `(420.0, 0.0)` - X home - then move Z to the station's `z` (0.0, i.e. fully up) or `deck.z_home` if the station declares none, then wait. Call it at the end of a run so the deck is clear for the operator.
 
-**Note:** `outdir` is created before the `report.ok` check, so a refused run still leaves an empty directory behind.
+#### `get_tip(row=0, col=None, placement="tips") -> (row, col)`
+
+Press the nosecone into a tip, lift it out, then leave the box in X. Returns the `(row, col)` actually picked.
+
+- `row` (int, 0-based): rack row. 8 rows in `tiprack_300_96`.
+- `col` (int, 0-based, or None): `None` means "the next unused column working inward from the configured exit edge" via `_next_free_tip_col` - the only choice whose X exit path is guaranteed clear.
+- `placement` (str): placement name to take tips from, cross-checked against the effector's own `tips.labware` by `_tip_placement`.
+
+Raises `ProtocolError` if not homed, if the effector's `tips.required` is false (p125), if a tip is already fitted, if the named placement holds the wrong labware, if the requested position was already consumed this run, or if every column in the row is used. Raises `IndexError` for a position outside the grid. Raises `SimulationError` if the exit path crosses an occupied position.
+
+Sequence: `goto` the well honouring the rack's `approach_order`; wait; descend to the rack's `approach` Z (47.0 for p300, or travel height if the effector declares none) at the tip-press feedrate 600; descend to `pick` Z 59.0; wait; dwell 1 s; set `tip_fitted` and `current_tip` and record the pickup with the simulator; lift back to travel Z 5.0; wait; `_exit_tip_box`.
+
+**Why the already-consumed check is a hard refusal:** pressing into an empty rack hole drives the *bare* nosecone down to Z 59.0 with nothing to stop it. This was a confirmed defect - `get_tip` ignored `consumed_tips`, so a second pickup did exactly that and then set `tip_fitted = True` anyway. `test_review_fixes.py` tests 2, 2b and 2c pin the fix.
+
+**Note:** `pick` 59.0 comes from a direct rack measurement and supersedes `Z_TIP_PICK = 57.5` in `examples/300ulaccuracyprecision.py`; the effector config keeps 57.5 under `superseded` with an open question about whether it was a different tip type.
+
+#### `_tip_placement(placement) -> Placement` *(private)*
+
+Resolves the rack to use, preferring the effector's own `tips.labware` (`"tiprack_300_96"` for p300) over the caller's placement name. If the named placement does not exist it falls back to `deck.placement_for_labware(want)`; if it exists but holds different labware, it raises `ProtocolError` telling the operator to name the right placement or fix `tips.labware`.
+
+**Why:** routing by placement name alone would send a second effector that declares a different rack to the wrong rack, and the resulting error would then tell the operator to add the wrong rack to its Z table.
+
+#### `_next_free_tip_col(p, row, exit_edge) -> int` *(private)*
+
+First unused column, working inward from the exit edge (columns sorted by their X value, reversed when the edge is `high_x`). Raises `ProtocolError` when the row is exhausted.
+
+**Why that order:** the effector leaves the box across every column between the one it picked and the edge, so the edge column has to go first and the box must empty toward the middle. `test_review_fixes.py::test_2c_consumption_works_inward_from_the_exit_edge` picks four tips and asserts their X values come out sorted.
+
+#### `_has_z(labware_id, key) -> bool` *(private)*
+
+Whether the effector's `z_for_labware[labware_id][key]` is present and non-null. Used only so `get_tip` can skip the approach move when no `approach` Z is configured, without going through `z_for` (which raises on a missing key by design).
+
+#### `_tip_exit(p) -> (edge, col)` *(private)*
+
+Reads `labware.json -> tiprack_300_96.consume_order.exit_edge` and returns the edge name plus the column index at that edge. Accepts `"low_x"`/`"min_x"` and `"high_x"`/`"max_x"`.
+
+The shipped value is `"unconfirmed"`. In that case it assumes the low-X edge (column 0 at X 18.0) **and warns**, saying that if the real exit is the high-X edge then every pickup in the run exits the wrong way. It does not refuse, because the exit-path check in `_exit_tip_box` is what actually keeps this safe - that check fails loudly whichever edge turns out to be right.
+
+#### `_exit_tip_box(p, row, col, edge)` *(private)*
+
+Records a note-kind `Step` listing the positions the X exit will cross, hands it to `Simulator.check_tip_exit` (which fails on any crossed position not already consumed), then moves X one full column pitch beyond the outermost well centre - clamped into the envelope - and waits.
+
+One pitch beyond the outermost centre clears every tip *position* (the nearest is a full pitch away) without needing the rack's physical outline, which is not measured. With `col_pitch` 9.0909 mm and the box spanning X 18-118, the low-X target is 8.909.
+
+**Why it is not redundant with the following `goto`:** it guarantees the effector is out of the box *before* `_route_xy` makes any decision that could put Y first. `test_lab.py::test_leaving_the_tip_box_goes_toward_x_zero_then_y` asserts the first tipped leg is an X move that ends below the box's low-X edge, and that the next `goto` then starts with Y at that cleared X.
+
+#### `eject_tip()`
+
+Hook the tip collar on the ejector and pull **up** to strip it, then re-home. Raises `ProtocolError` if not homed, if the effector's `tips.eject_supported` is false, or if no tip is fitted.
+
+All values come from `deck.json -> stations.tip_eject`: `lane_x` 155.0, `approach_y` 83.0, `engage_y` 88.0, `retract_y` 80.0, `z_below_hook` 145.0, `z_strip` 137.0, `rehome_after` true, `validated` **false**.
+
+The choreography, with Z directions spelled out:
+
+1. **Warn.** `validated` is false, so a warning says the routine has never been run on hardware and must be dry-run and then stepped through manually at reduced feedrate.
+2. **Lift to travel height** (Z 5.0). Physically the top.
+3. **Route to `(155.0, 83.0)`** through `_route_xy` at travel feedrate, then wait. Deliberately *routed*, not hand-ordered: the lane X 155 is itself inside the keep-out band `[148, 162]`, so the Y leg cannot happen at the lane X. The router works that out from the geometry and picks Y-first or a dogleg, which is exactly the required "Y first, then X". Hand-ordering this was the original defect.
+4. **Descend to Z 145.0** at the tip-press feedrate 600, then wait. That is 140 mm *lower* than travel, below the hook. It is legal only because `(155, 89)` is off the stage region - the stage surface exists only over the slot area, and the ejector hangs past the front edge. The simulator asserts this rather than taking it on trust, and warns that the depth is past the stage surface at an off-stage point. `test_lab.py::test_ejector_is_off_the_stage` pins it for all three Y values.
+5. **Enter `_engaging_ejector()`.** Only the steps inside carry the keep-out exemption.
+6. **Y 83.0 -> 88.0** at Z 145, slow, `order="Y"`. This is the lateral move that brings the tip collar *under* the hook. It is a Y move at X 155, inside the band, at Z 145 - illegal for any other step, which is the whole point of the exemption.
+7. **Z 145.0 -> 137.0**, slow, then wait. **This is the strip: 8 mm UPWARD**, because +Z is down and 137 is a smaller number than 145. The collar is trapped under the hook and the nosecone pulls out from under the tip. `tip_fitted` and `current_tip` are cleared immediately after.
+8. **Z 137.0 -> 145.0** - back *down*, clear of the hook - then **Y 88.0 -> 80.0** to retract out of the lane, both still exempt.
+9. **Exit the exemption. Lift to travel height** (Z 5.0) and wait. Then record a `kind="note"` step with `detail={"final": True}`.
+10. **Mandatory re-home** when `rehome_after` is true: `G28 ALL`, recorded with `reason: "post-ejection"`, then wait.
+
+**Why the "ejection complete" marker goes after the lift rather than at the strip:** `Simulator.check` arms `_pending_eject_home` when it sees that final marker, and then hard-fails the *next* `move` or `actuator` step that is not a home. Marking earlier would make the lift itself trip the check.
+
+**Why the re-home is not optional:** the strip force can skip steps on an open-loop machine, so the commanded position is no longer trustworthy afterward. `Simulator.finish` also errors if the whole run ends on an ejection with no `G28` after it. `test_lab.py::test_eject_is_followed_by_home` and `test_ejection_passes_the_envelope_checks` pin both halves.
+
+**Why the exemption rides on the step, not the operation name:** see `_engaging_ejector` above. Steps 3 and 9 use `op="eject_tip"` too, but carry no flag, so they are checked as the ordinary traverses they are. `test_review_fixes.py::test_1_eject_approach_is_routed_and_checked` asserts that every exempt Y move happens at exactly X 155.0 and that no unexempt Y move happens inside the band at all.
+
+#### `goto_reservoir(station="water")`
+
+Traverse to a reservoir station's XY. Thin wrapper on `goto_station` with `op="reservoir"`.
+
+#### `prewet(cycles=None, station="water")`
+
+Wet the tip wall so the first real aspiration is not wetting dry plastic.
+
+- `cycles` (int or None): `None` uses the effector's configured `prewet.cycles` (3 for p300). A value below `prewet.min_cycles` (also 3) raises `ProtocolError` - the minimum exists because a partial prewet is worse than none: it leaves the wall unevenly wetted.
+- `station` (str): station name; the labware id behind it is resolved through `_station_labware` and `placement_for_labware`.
+
+Raises `ProtocolError` if the effector is not a pipette or has `prewet.enabled` false (p125), and `EffectorError` if the reservoir's `work` Z is unmeasured.
+
+Sequence: `goto_station`; wait; bottom the plunger at `blowout_pos` with a 0.5 s settle; descend to the reservoir `work` Z (40.0 for p300, tip submerged); wait; then `cycles` times draw to `prewet.asp_pos` (10.0 = `blowout_pos` 30.0 minus `prewet.displacement_mm` 20.0, measured **from bottomed**, not from `gap_pos`) with a 1 s settle and push back to `blowout_pos` with a 1 s settle; lift to travel Z; wait. Records `toggles["prewet_cycles"]` for the manifest.
+
+#### `_station_labware(station) -> str` *(private)*
+
+Reverse-maps a station name to the labware id of the placement sitting there. Raises `ProtocolError` if no placement claims that station - the library genuinely cannot know what is at a station nobody declared.
+
+#### `_require_empty_tip(what) -> Pipette` *(private)*
+
+Shared preconditions for anything that draws liquid: the effector is a pipette; a tip is fitted if the effector requires one; and `fluid_uL` is zero.
+
+**Why holding fluid is a refusal, not a top-up:** every destination gets its own independent aspiration. Stacking two draws into one tip would mean the second dispense's volume is not the one the calibration was fitted for, and the balance reading would still look plausible. `what` is the caller's name, so the message says which primitive refused.
+
+#### `_aspirate_at(x, y, labware_id, volume_uL, op="aspirate", prefer=None, z_key="work")` *(private)*
+
+The aspiration sequence itself, shared by both public forms. Returns the aspirate POS.
+
+Every ordering guarantee lives here, which is why the station and well forms delegate instead of each repeating it:
+
+1. **Validate the whole stroke before emitting anything.** `displacement_mm(volume_uL)` (raises `VolumeError` outside the calibration window - p300 `[8.0, 320.0]` uL - or if the stroke exceeds `max_volume_uL`), `aspirate_pos`, `backoff_pos`, and `z_for(labware_id, z_key)` (raises `EffectorError` if that depth is null). Discovering at the backoff that the plunger has run out of travel would leave a half-finished aspiration in the buffer with the state claiming it completed. `test_review_fixes.py::test_6_failed_aspirate_emits_nothing_and_leaves_no_stale_record` pins zero lines emitted, `fluid_uL` still 0, and `_last_aspirate` still `None` after a refusal.
+2. Clear `_last_aspirate`, so a stale record from an earlier aspiration can never survive into the next dispense.
+3. `goto(x, y, prefer=prefer)`; wait.
+4. **Arm the air gap in air**, before descending: `actuator(gap_pos)` = 25.0 for p300, which is `blowout_pos` 30.0 minus `air_gap` 5.0, with `settle_s` = 1.0 s.
+5. Descend to the work Z; wait.
+6. `actuator(aspirate_pos)` with the settle, then set `fluid_uL`.
+7. Lift to travel Z.
+8. **Only now**, if `post_asp_backoff` is non-zero (1.0 mm for p300), `actuator(backoff_pos)` - the anti-drip retract, which must happen after the tip is clear of the liquid or it just draws more water.
+9. Wait, then store `_last_aspirate` with the volume, displacement, both POS values and the source labware id, for the dispense to fold into its manifest row.
+
+#### `aspirate_uL(volume_uL, station="water") -> float`
+
+One independent aspiration from a **station**. Returns the plunger POS used.
+
+- `volume_uL` (microlitres, always - never millimetres): converted by `Pipette.displacement_mm` from `slope` 0.0533 and `intercept` 0.122 for p300, `0.1274` / `0.049` for p125.
+- `station` (str): defaults to `"water"` at `(70.0, 175.0)`.
+
+Raises `ProtocolError` (not a pipette / no tip / already holding fluid / no placement at that station), `VolumeError` (outside the window or beyond the stroke), `EffectorError` (unmeasured depth or an illegal POS).
+
+#### `aspirate_from(placement, row, col, volume_uL) -> float`
+
+One independent aspiration from a **well**. Returns the plunger POS used. Honours the placement's `approach_order`, so drawing from `"big_tubes"` approaches Y-first.
+
+**Why both forms exist:** the station form reverse-maps a station name to labware, and a slot-mounted rack has no station. `test_lab.py::test_aspirate_from_reaches_the_well` pins the descent to the tube's work Z, the `["Y", "X"]` approach, and that `_last_aspirate["source"]` names the labware.
+
+#### `mix(placement, row, col, cycles, volume_uL, z_key="mix")`
+
+Homogenise a well by cycling the plunger deep in it. Returns nothing.
+
+- `cycles` (int): number of draw/push pairs. Below 1 raises `ProtocolError`.
+- `volume_uL` (microlitres): the stroke per cycle, converted through the calibration.
+- `z_key` (str): which per-labware depth to cycle at. Defaults to `"mix"`.
+
+Raises `ProtocolError` (not a pipette / no tip / already holding fluid / `cycles < 1`), `VolumeError`, `EffectorError` (illegal top-of-stroke POS, or a null `mix` depth).
+
+**The three depths, and why they are three separate numbers.** Per effector, per labware, shallowest first: `work` is the dispense/aspirate depth, `mix` is deeper so the stroke reaches *under* the liquid rather than skimming its surface, and `bottom` is the vessel floor - **a crash limit the machine must never reach, so it is the wrong thing to aim at.** For p300: the 1.5 mL tube is `work` 35.0 / `mix` 45.0 (10 mm deeper) / `bottom` still null; the plate is `work` 53.5 / `bottom` 60.8, which puts a dispense 7.3 mm above the floor. Larger is lower throughout. `test_lab.py::test_mix_cycles_at_the_mix_depth` asserts the mix descends to the `mix` Z and that the `bottom` Z appears in no move at all.
+
+Sequence: `goto` honouring `approach_order`; wait; **bottom the plunger** at `blowout_pos` with a 0.5 s settle, *skipped* when `self.pos` is already there (the common dispense-then-mix case, where emitting a move to where the plunger already is would be noise); descend to the mix Z; wait; then `cycles` times draw up to `top` and push back to `blowout_pos`, each with `settle_s`; lift to travel Z; wait. `toggles["mix_cycles"]` and `toggles["mix_volume_uL"]` are recorded.
+
+`top` is `blowout_pos - displacement_mm(volume_uL)`, checked by `check_pos` before anything is emitted: the plunger draws *up* from bottomed, so the top of the stroke is the position that can run out of travel.
+
+**Why it starts and ends bottomed:** the tip holds no liquid between cycles and carries none away, so a mix is volume-neutral and `fluid_uL` stays 0 throughout.
+
+#### `dispense(placement, row, col, wall_wipe=None, retract=True) -> dict`
+
+Full dispense to blow-out, then optionally wipe the droplet off the wall. Returns the manifest row for this dispense.
+
+- `placement`, `row`, `col`: the destination well.
+- `wall_wipe` (bool or None): `None` means "wipe if this labware has a `wipe` block". `True` on labware with no `wipe` block raises `ProtocolError`. Only `tube_rack_0p65_5x10` has one today (`dx` 3.2 mm, `dz` 4.0 mm, feed 1500 - both marked uncalibrated).
+- `retract` (bool): when `True` (default) the tip lifts to travel height after the dispense. **`retract=False` leaves the tip at the working depth.** Use it only when the very next operation is in the *same* well - a mix, typically - where lifting to Z 5 and descending again is pure wasted motion. It stays safe either way, because `goto()` lifts to travel height before any XY move, so the tip cannot be dragged sideways while down.
+
+Raises `ProtocolError` if `fluid_uL` is zero (nothing aspirated), if the effector is not a pipette, or on the wipe-config mismatch; `EffectorError` for an unmeasured `work` depth; `IndexError` for a bad well.
+
+Sequence: settle the wipe question **before any motion**; `goto` honouring `approach_order`; descend to the `work` Z; wait; `actuator(blowout_pos)` with the settle - a full blow-out, so the tip is empty; zero `fluid_uL`; optional `_wall_wipe`; optional lift; wait; build the record.
+
+**Why the wipe check happens first:** raising after the blow-out would leave a complete dispense in the buffer with no manifest row to account for it - the mass would be on the balance and absent from the data. `test_review_fixes.py::test_10_dispense_checks_wipe_config_before_moving` pins zero lines emitted and `fluid_uL` still 150.0 after a refused dispense.
+
+The returned dict is appended to `self.dispenses` and becomes one row of the manifest and one row of `<name>.balance.csv`: `order_index`, `placement`, `labware`, `slot`, `well` (`well_name(row, col)`, e.g. `"D6"`), `row`, `col`, `x`, `y`, `z`, `target_volume_uL`, everything from `_last_aspirate` (`volume_uL`, `displacement_mm`, `aspirate_pos`, `backoff_pos`, `source`), and `mass_dry_mg` / `mass_wet_mg` / `temp_C` left `None` for the operator to fill in from the balance. `_last_aspirate` is then cleared - **one aspiration feeds exactly one dispense** (`test_review_fixes.py::test_6b_dispense_clears_the_aspirate_record`).
+
+#### `_wall_wipe(p, x, y)` *(private)*
+
+Step to the inner wall, drag the droplet **up**, then pull back off. `dx`, `dz` and `feed` come from the labware's `wipe` block.
+
+It first asserts its starting pose: if the effector is not at exactly `(x, y, z_work)` it raises `ProtocolError` quoting both poses. Then `X -> x + dx` (3.2 mm sideways, less than the tube inner radius, to contact the wall), `Z -> z_work - dz` (**`-dz` is UP** - that is the drag that pulls the droplet off), then `X -> x` back off the wall.
+
+**Private, and it must stay private.** This is the one place that moves XY below travel height, which is why `"wall_wipe"` is in `_LOW_XY_OK` and so exempt from the travel-height check. Calling it from anywhere but the bottom of a dispense would traverse the deck at well depth with that check suppressed. The pose assertion is what makes that unreachable. `test_review_fixes.py::test_11_wall_wipe_requires_the_dispense_pose` pins both the refusal and the absence of any public `wall_wipe` attribute.
+
+It stays legal against the raised-edge rule (Z 53.0 tipped) only because it never leaves the stage location the tube sits in - the edge check compares `slot_cell` at both endpoints and returns early when they match. `test_lab.py::test_wall_wipe_inside_one_location_is_still_allowed` asserts every wipe leg stays inside slot 8.
 
 ---
 
-**Provenance**
+### Finalize
 
-These exist so a `.gcode` file found on disk in six months can be traced to the exact inputs that produced it. `logbook.build_manifest` calls all four.
+#### `simulate() -> Report`
 
-### `config_hashes(self) -> Dict[str, str]`
+Runs the whole-run checks and returns the `Report`: `errors`, `warnings`, `steps`, `path`, and `ok` (no errors). Whole-run checks are the ones that can only be evaluated at the end - an ejection with no `G28` after it (error), fluid still held (warning), a tip still fitted and never ejected (warning), slot-seating offsets, and footprint overlaps (`OVERLAP` is an error, "cannot check" a warning).
 
-SHA-256 of the bytes of every config consumed, keyed by a readable name: `deck.json`, `labware.json`, the layout file's own basename, and `effectors/<id>.json`. Hashing the bytes rather than recording a version field means an edit cannot be silently unrecorded.
+Idempotent: `Simulator.finish` returns the same `Report` on every call after the first. It used to append into the same report each time, so an inspect-then-finalize caller tripled every whole-run line and the manifest recorded the pile-up (`test_review_fixes.py::test_7_simulate_is_idempotent`).
 
-### `git_commit(self) -> Optional[str]`
+#### `finalize(outdir=".", plot=True) -> dict`
 
-`git rev-parse HEAD` run in `config.repo_root()`, stripped. Returns `None` on empty output or any failure (including the 10 s timeout) rather than raising - provenance that is unavailable must not be able to stop a run from being written.
+Run the whole-run checks, then write the artefacts. **Or refuse to.**
 
-### `git_dirty(self) -> Optional[bool]`
+- `outdir` (str): directory, resolved and created if absent.
+- `plot` (bool): whether to render `<name>.toolpath.png`. Returns `None` for the plot path when matplotlib is not installed, rather than failing the run.
 
-True if `git status --porcelain` in the repo root produces any output, i.e. there are uncommitted or untracked changes anywhere in the repo. `None` if git could not be run. A `git_commit` recorded with `git_dirty: true` in the manifest means the commit hash does not fully describe the code that generated the file.
+Raises `ProtocolError` carrying the full report text if `report.ok` is false - **and writes nothing**. That is the seam the whole library is built around: a run that fails simulation never becomes a `.gcode` file, so a bad number cannot reach the hardware through this path. `test_lab.py::test_simulation_failure_writes_nothing` pins it by injecting an error into a non-strict run.
 
-### `uncalibrated(self) -> List[str]`
+On success it dumps the buffered gcode to `<outdir>/<name>.gcode`, writes the manifest and balance CSV via `lab.logbook.write_manifest`, optionally renders the plot, and returns `{"gcode", "manifest", "plot", "report", "lines", "dispenses"}` - paths as strings, `lines` the gcode line count, `dispenses` the count of manifest rows.
 
-Every field the configs admit was never tuned, deck entries followed by effector entries, as dotted strings. On the current configs this returns nine entries, among them `tubes(tube_rack_0p65_5x10).wipe.dx`, `tips(tiprack_300_96).consume_order.exit_edge`, `deck.keepouts.tip_ejector.x_range`, `deck.stations.tip_eject (routine never validated on hardware)` and `p300.z_for_labware.tube_rack_0p65_5x10.work`.
+**Note:** the check order means `outdir` is created even when the run is then refused, so a failed run can leave an empty directory behind.
 
-The list is assembled from structured `uncalibrated` arrays and explicit `validated: false` flags, never grepped out of prose notes, so rewording a comment cannot make an uncalibrated field look calibrated. `protocols/accuracy_test.py` prints it at the end of every run.
+---
+
+### Provenance
+
+These exist so a `.gcode` file can be traced back to the exact configuration and commit that produced it. `lab.logbook` calls all four when building the manifest.
+
+#### `config_hashes() -> dict[str, str]`
+
+SHA-256 of each config file actually used, keyed by name: `deck.json`, `labware.json`, the layout file's own basename (so `layout_test.json` is not silently reported as `layout.json`), and `effectors/<id>.json`. `test_lab.py::test_full_protocol_and_manifest` asserts all four are present.
+
+#### `git_commit() -> str | None`
+
+`git rev-parse HEAD` in the repo root, 10 s timeout. Returns `None` on any failure - not installed, not a repo, timed out. Provenance must never be able to break a run.
+
+#### `git_dirty() -> bool | None`
+
+`True` if `git status --porcelain` produced any output, `False` if clean, `None` if it could not be determined. A `True` here means the committed config is not the config that generated the file, which is the one thing that makes a hash misleading.
+
+#### `uncalibrated() -> list[str]`
+
+Every field the config itself admits was never tuned - the deck's list concatenated with the effector's. Today that includes `keepouts.tip_ejector.x_range` (the 14 mm band width is carried over from a different location and is still unverified), `stations.tip_eject` (routine never validated on hardware), `z_for_labware.tube_rack_0p65_5x10.work`, `z_for_labware.tube_rack_1p5.bottom`, and the plate's unmeasured `height_mm`.
+
+**Why it is structured rather than grepped:** these come from explicit `uncalibrated` arrays in the JSON, not from parsing prose notes, so rewording a comment cannot make an uncalibrated field silently look calibrated. The list goes into the manifest, so a data file always carries the caveats of the run that produced it.
 
 ---
 
 ## `lab/simulate.py`
 
-Dry-run checking. The simulator is fed every action as `Machine` generates it, and it either stays quiet, records a warning, or raises `SimulationError` on the first hard violation. Nothing reaches disk until the run has passed: `Machine.finalize()` calls `Simulator.finish()` and refuses to write the `.gcode` if `Report.ok` is false. The module holds no hardware or Moonraker code at all - it is pure geometry against `config/deck.json`, `config/labware.json`, `config/layout.json` and the effector spec.
+Dry-run checking. Nothing here talks to hardware or Moonraker, and nothing here writes a file: the `Simulator` is fed every `Step` as `Machine._record` creates it, and raises `SimulationError` on the first hard violation before the gcode buffer ever reaches disk (`Machine.finalize` refuses to dump when `Report.ok` is false - pinned by `test_simulation_failure_writes_nothing`).
 
-Two conventions govern every number below. **+Z is DOWN**: Z=0 is home at the top, a larger commanded Z is physically lower, and "above Z 60" means `z < 60`. The ejector's Z 145 -> Z 137 is an 8 mm *upward* stroke. And **a check that cannot be evaluated is not a pass**: where a required measurement is absent - a tip length, the stage surface, a labware rim, a footprint - the simulator emits an explicit `cannot check ...` warning naming the missing config field instead of silently skipping the comparison. This matters because the failure mode of a missing measurement is not "no check ran", it is "a human read a clean report". The p300 run in `out/p300_accuracy.manifest.json` currently carries 14 warnings, 9 of which are `cannot check` lines, and that is the honest state of the deck.
+Two conventions govern every comparison in the module:
+
+* **+Z is DOWN.** A larger commanded Z is physically lower, so "must stay above the rim" is written `z < rim` and a *limit* is exceeded when `z > limit`.
+* **A check that cannot be evaluated is not a pass.** Where a needed measurement is missing (tip length, `deck z.stage_surface`, a labware height, a footprint, a well bottom), the simulator records an explicit `cannot check ...` warning naming the missing field and skips only that check. It never returns silently. This is why a clean run still prints warnings, and why the operator is told to read them and not just the pass line.
+
+The related distinction, which shows up in two different places:
+
+* A **commanded depth** that is null stops the run. `Effector.z_for("tube_rack_1p5", "work")` raises `EffectorError` if the value is `None`, because the machine is about to be told to go somewhere and there is no number to send.
+* A **crash limit** that is null only warns. `Simulator._effector_z` returns `None` instead of raising, so `tube_rack_1p5.bottom: null` in `config/effectors/p300.json` produces `cannot check well-bottom crash for tube_rack_1p5` and the run continues. Not knowing where the floor is does not make the dispense wrong; refusing to run because a limit is unmeasured would just stop work on labware whose floor nobody has probed yet.
 
 ### `class SimulationError(LabError)`
 
@@ -1719,80 +2105,53 @@ Two conventions govern every number below. **+Z is DOWN**: Z=0 is home at the to
 SimulationError(step: Step, message: str)
 ```
 
-Raised the moment a hard check fails; a run that raises this must never become a `.gcode` file.
+Raised by `Simulator.fail` when `strict=True`. Carries `.step` (the offending `Step`) and `.message`, and formats itself with everything needed to find the fault without re-running:
 
-- `step` - the `Step` being checked. Stored as `.step`.
-- `message` - what is physically wrong, in operator-facing terms. Stored as `.message`.
+```
+step 41 [dispense/move]: Z 61.0 is past the plate1 well bottom 60.8 for p300
+  at (387.0, 399.0, 5.0) -> (387.0, 399.0, 61.0)  POS 25.0 -> 25.0  tip=True  fluid=100.0 uL
+```
 
-The formatted `str()` is three lines: `step {i} [{op}/{kind}]: {message}`, then the motion (`at {frm} -> {to}`), then the plunger and payload state (`POS {pos_before} -> {pos_after}  tip={tip}  fluid={fluid_uL} uL`). It exists so that the operator gets the machine state that made the move illegal, not just a coordinate. Subclasses `LabError`, so a protocol's single `except LabError` catches it alongside `DeckError`, `EffectorError`, `VolumeError` and `ProtocolError` (`tests/test_review_fixes.py:test_8_all_errors_share_a_base`).
-
-Note that `step.gline` (the gcode line number at the time of recording) is on the step but is *not* printed in the message; read it off `err.step.gline` when you need to find the emitted line.
+Subclasses `LabError`, so a protocol can catch that one class and print the message instead of a traceback (`test_8_all_errors_share_a_base` pins this for all five error types). Why it exists: an exception that only said "crash" would send the operator back through a 2000-line gcode file; the step index, op, both endpoints, plunger POS, tip state and held fluid identify the generating call site directly.
 
 ### `@dataclass class Step`
 
-```python
-Step(i: int, op: str, kind: str, frm: Optional[XYZ] = None, to: Optional[XYZ] = None,
-     axes: str = "", pos_before: Optional[float] = None, pos_after: Optional[float] = None,
-     tip: bool = False, fluid_uL: float = 0.0, feedrate: Optional[int] = None,
-     labware: Optional[str] = None, detail: Dict[str, Any] = {}, gline: int = 0)
-```
+One generated action plus the machine state it produced. Fields:
 
-One generated action plus the machine state it produced. Constructed by `Machine._record()`, never by a protocol.
+- `i` (int) - step index, monotonic per run, used in every error message.
+- `op` (str) - the protocol-level operation that produced it (`"dispense"`, `"get_tip"`, `"eject_tip"`, `"wall_wipe"`, `"probe"`, ...). Checks key off this, so it is load-bearing, not a label.
+- `kind` (str) - one of `move | actuator | home | dwell | macro | note`. Selects which checks run.
+- `frm`, `to` (`(x, y, z)` in mm, or `None`) - commanded start and end. Both are needed: the swept-segment checks are exactly the ones that endpoint-only checking got wrong.
+- `axes` (str) - which axis letters this step commands, e.g. `"X"`, `"Y"`, `"Z"`. Drives `moves_y` / `moves_xy`.
+- `pos_before`, `pos_after` (mm) - plunger POS, for actuator steps.
+- `tip` (bool) - was a tip fitted at this step. Every absolute Z limit in the module shrinks by the tip length when this is true.
+- `fluid_uL` (uL) - fluid held, for the end-of-run check and error context.
+- `feedrate` (mm/min), `labware` (labware id, not placement name), `gline` (gcode line number at emission).
+- `detail` (dict) - per-step flags. Only `keepout_exempt` (set by `Machine._engaging_ejector`) and `final` (set on the last ejector step) are read.
 
-- `i` - 0-based step index, unique within a run. Appears in every error message.
-- `op` - the operation that produced it (`"get_tip"`, `"aspirate"`, `"dispense"`, `"eject_tip"`, `"wall_wipe"`, `"startup"`, `"park"`, ...). Checks are keyed on this for whitelists, so a new operation name that needs an exemption must be added to the relevant set explicitly.
-- `kind` - one of `move`, `actuator`, `home`, `dwell`, `macro`, `note`. Selects which checks run: only `move` gets geometry, only `actuator` gets plunger limits, `home` clears the post-ejection flag, and `dwell`/`macro`/`note` are recorded but geometrically inert.
-- `frm`, `to` - `(x, y, z)` in machine mm before and after. `None` for steps that are not motion.
-- `axes` - which axes this single step commanded, as a string such as `"X"`, `"Y"` or `"Z"`. `Machine._move_xy` emits one axis per step, which is what lets the swept path be treated as an axis-aligned box.
-- `pos_before`, `pos_after` - plunger POS in mm, actuator steps only.
-- `tip` - whether a tip was fitted when this step was emitted. Every Z limit in this module depends on it.
-- `fluid_uL` - held volume in uL at emission time.
-- `feedrate` - mm/min, as commanded.
-- `labware` - the *labware id* (for example `"tube_rack_0p65_5x10"`), not the placement name, when the step is working at a specific vessel. Drives the well-bottom check.
-- `detail` - per-step flags. Two are load-bearing: `detail["keepout_exempt"]` (set by `Machine._engaging_ejector()`) and `detail["final"]` on the marker that says an ejection has completed. `detail["crossed"]` carries the tip positions an exit path sweeps over.
-- `gline` - `Gcode.line_count()` at the time of recording, for mapping a step back to an emitted line.
+Why `detail["keepout_exempt"]` is per-step and not per-op: see `_LOW_XY_OK` below.
 
-It exists because the checks are physical, and physics depends on state that a G-code line does not carry. `G1 Z62.5` is legal bare and a crash with a tip on; only the step knows which.
+#### `Step.moves_y` / `Step.moves_xy` (properties)
 
-#### `Step.moves_y` / `Step.moves_xy`
-
-`bool` properties: `"Y" in axes`, and `"X" in axes or "Y" in axes`. Used to decide whether the travel-height rule, the keep-out rule and the raised-edge rule apply. Note they read `axes`, so `home` steps (which have `axes == ""` and record their axes under `detail["axes"]`) are never treated as XY motion - homing is not geometrically checked at all.
+`"Y" in self.axes` and `"X" in self.axes or "Y" in self.axes`. Return bool. They exist so the checks read off what the step actually commands rather than comparing coordinates, which would treat a zero-length X leg as an XY traverse.
 
 ### `_LOW_XY_OK` (module constant)
 
-```python
-_LOW_XY_OK = {"wall_wipe", "eject_tip"}
-```
-
-The only two operations allowed to move X or Y at something other than the travel height (Z 5.0). The wall wipe works inside a tube at `z_work` and steps 3.2 mm sideways to the inner wall; the ejector engagement moves Y at Z 145. Everything else that moves XY off travel height is a hard error.
-
-This set grants an exemption from the travel-height rule *only*. Keep-out exemption is deliberately **not** granted here - it is granted per step through `detail["keepout_exempt"]`, so the approach and retract moves that surround an ejector engagement cannot inherit the exemption from the operation name they share with it.
+`{"wall_wipe", "eject_tip"}` - the only operations permitted to move XY somewhere other than travel height, exempting them from the travel-height rule and from `_check_traverse_clearance`. `wall_wipe` works inside a well by definition; the ejector engagement happens around Z 137-145, 140 mm down. Note what is *not* in this exemption: the keep-out band. That exemption is granted per step through `detail["keepout_exempt"]`, so the approach and retract moves that surround an ejection cannot inherit it from the operation name they share. `test_1` (in `test_review_fixes.py`) pins this: a step merely *named* `eject_tip` without the flag is still refused a keep-out crossing.
 
 ### `@dataclass class Report`
 
-```python
-Report(errors: List[str] = [], warnings: List[str] = [], steps: int = 0,
-       path: List[Tuple[float, float, float, str]] = [])
-```
+Accumulated result. `errors` (list of str), `warnings` (list of str), `steps` (int, highest step index + 1), and `path` - a list of `(x, y, z, op)` tuples for every step with a fully resolved `to`, which is what `plot_path` draws.
 
-The accumulated result of a run. Lives on `Simulator.report`, is returned by `finish()`, is embedded whole into the manifest under `"simulation"`, and is what `Machine.finalize()` consults before writing.
+#### `Report.ok` (property)
 
-- `errors` - hard violations, as `"step {i} [{op}]: {message}"` strings. Non-empty means no gcode.
-- `warnings` - everything else, including every `cannot check` line. De-duplicated by key (see `warn`).
-- `steps` - highest step index seen, plus one.
-- `path` - `(x, y, z, op)` for every step whose `to` is fully known. Feeds `plot_path`.
+`not self.errors`. `Machine.finalize` writes gcode only when this is true. Warnings never block.
 
-#### `Report.ok`
+#### `Report.text() -> str`
 
-`bool` property: `not self.errors`. Warnings never block a run - by design, since most of them are missing measurements rather than known violations, and blocking on them would stop the machine being used at all.
+One header line (`simulation: N steps, E error(s), W warning(s)`) then every error prefixed `ERROR` and every warning prefixed `warning`. Raises nothing. It is the body of the `ProtocolError` that `finalize` raises on refusal, so the operator sees the whole picture rather than the first failure only.
 
-#### `Report.text()`
-
-```python
-text() -> str
-```
-
-Renders the report as a header line (`simulation: N steps, E error(s), W warning(s)`) followed by one indented line per error (`  ERROR   ...`) then per warning (`  warning ...`). Returns the string; raises nothing. Used verbatim in the `ProtocolError` that `Machine.finalize()` raises when it refuses to write.
+---
 
 ### `class Simulator`
 
@@ -1800,373 +2159,192 @@ Renders the report as a header line (`simulation: N steps, E error(s), W warning
 Simulator(deck: Deck, effector: Effector, strict: bool = True)
 ```
 
-Incremental checker. `Machine` constructs exactly one and calls `check()` on every step as it is generated.
+Incremental checker. `deck` supplies geometry, `effector` supplies the per-labware Z table and plunger limits. `strict=True` (the default, and what `Machine` uses unless told otherwise) makes `fail` raise immediately; `strict=False` collects errors and keeps going, which is how tests exercise several failures in one run. Either way the errors land in `report.errors` and gate the write.
 
-- `deck` - resolved `Deck`. Source of the envelope, `z_travel`, `z_stage_surface`, the slot table, the keep-out bands and the loaded placements.
-- `effector` - the loaded `Effector`. Source of `tip_labware`, `can_eject_tip` and, for a `Pipette`, the plunger limits.
-- `strict` - when `True` (the default), `fail()` raises `SimulationError` immediately, so generation stops at the first violation and the traceback points at the protocol line that caused it. When `False`, failures are only appended to `report.errors` and generation continues, which is how you collect *all* violations in one pass; `Machine.finalize()` still refuses to write. Non-strict mode is what `tools/` and several tests use to compare error counts before and after a move.
+State it keeps: `report`, `_warned` (dedup keys), `consumed_tips` (set of `(row, col)` positions already taken from the rack), `_pending_eject_home` / `_eject_step` (the post-ejection G28 obligation), and `_finished` (makes `finish` idempotent).
 
-Public state a protocol or tool may read:
+### `Simulator.warn(key: str, message: str) -> None`
 
-- `report` - the live `Report`.
-- `consumed_tips: Set[Tuple[int, int]]` - `(row, col)` of every tip picked this run. `Machine.get_tip` reads it to refuse a second press into an already-emptied hole (pressing into an empty rack hole drives the bare nosecone to the pick depth, Z 59.0, with nothing to stop it) and `Machine._next_free_tip_col` reads it to pick the next column working inward from the exit edge.
+Records `message` in `report.warnings` the first time `key` is seen and does nothing thereafter. Returns `None`, raises nothing. Why: every warning in this module fires from inside a per-step check, so a 20-dispense loop would emit the same "the 0.65 mL holder height is the EMPTY holder" line 200 times and bury the other findings. Choosing the key is the real design decision - see `_check_move`, where the Z-envelope key includes the tip state (`z_limit:tipped` vs `z_limit:bare`) because the tipped case can be unresolvable while the bare case is fine, and collapsing them would swallow the more dangerous one as a duplicate.
 
-#### `Simulator.warn(key, message)`
+Protocol authors do call this: `Machine.startup` forwards layout `open_questions` through it.
 
-```python
-warn(key: str, message: str) -> None
-```
+### `Simulator.fail(step: Step, message: str) -> None`
 
-Records a warning the first time a given `key` is seen and ignores it thereafter.
+Appends `step N [op]: message` to `report.errors` and raises `SimulationError(step, message)` if `strict`. Returns `None` in non-strict mode. Every hard check funnels through here so that strict and non-strict runs cannot diverge in what they consider a failure.
 
-- `key` - the de-duplication identity. Choose it to distinguish physically different cases, not textually different messages.
-- `message` - the operator-facing text appended to `report.warnings`.
+### `Simulator.tip_length() -> Optional[float]`
 
-Returns `None`, raises nothing. It exists because a protocol loops: the accuracy test emits 418 steps over 20 tubes, and an unkeyed "z.top is unmeasured" would appear hundreds of times and bury the one warning that mattered. The keying is subtle in one place worth copying: the Z-envelope gap is keyed `z_limit:tipped` / `z_limit:bare` precisely because the tipped case can be unresolvable while the bare case is fine, and collapsing them would swallow the more dangerous of the two as a duplicate.
+Tip length in mm, or `None` if it cannot be resolved. Looks up `effector.tip_labware` (`"tiprack_300_96"` for p300) in `deck.catalogue` and reads `spec["tip"]["length"]`. Currently 52.25 mm, itself derived in `labware.json` from `deck z.stage_surface` 114.75 minus `stage_surface_with_p300_tip` 62.5 - measured once, not guessed twice. Raises nothing; `None` is the signal that the tipped variant of every absolute Z check is unevaluable. Pinned at 52.25 by `test_3c_limits_are_now_actually_enforced`.
 
-#### `Simulator.fail(step, message)`
+### `Simulator.effective_z_limit(tip_fitted: bool, clearance: float = 0.0) -> Tuple[Optional[float], List[str]]`
 
-```python
-fail(step: Step, message: str) -> None
-```
+The deepest legal commanded Z over the stage, plus a list of the measurements missing if it cannot be computed.
 
-Records a hard violation and, in strict mode, raises.
+- `tip_fitted` (bool) - whether a tip is on. With +Z down a fitted tip extends the reference point downward, so the maximum commanded Z **shrinks** by the tip length the instant a tip goes on: 114.75 bare, 62.5 tipped for p300 (`test_3c`).
+- `clearance` (mm) - optional safety margin subtracted from the limit. No caller passes a non-zero value today.
+- Returns `(limit_mm, [])` when resolvable, or `(None, ["deck z.stage_surface", "tiprack_300_96 tip.length"])` when not. Raises nothing.
 
-- `step` - the offending step (or, for the post-ejection rule, the step being blamed).
-- `message` - what is physically wrong.
+Why the `missing` list is returned rather than logged: measuring `z.stage_surface` alone would switch the check on for bare moves and leave it off for the deeper, more dangerous tipped ones with nothing saying so. That was a real defect, and `test_3b_limit_returns_what_is_missing` pins the two cases separately (bare reports one missing field, tipped reports two).
 
-Raises `SimulationError` when `self.strict`; otherwise returns after appending to `report.errors`.
+It also emits the `stage_ref:<id>` warning when `deck z.stage_surface_reference` (`"p300"`) is not the loaded effector's id: a different pipette body sits at a different height, so every absolute Z limit derived from 114.75 is borrowed rather than measured, and the run is told to measure that effector's own stage contact.
 
-#### `Simulator.tip_length()`
+### `Simulator.check(step: Step) -> None`
 
-```python
-tip_length() -> Optional[float]
-```
+The single entry point. `Machine._record` calls it on every step. Dispatches by `step.kind` to `_check_move` or `_check_actuator`, maintains the post-ejection homing obligation, and appends fully-resolved destinations to `report.path`. Raises `SimulationError` (via `fail`) on the first hard violation in strict mode.
 
-Length in mm from the nosecone reference to the tip orifice, looked up as `deck.catalogue[effector.tip_labware].spec["tip"]["length"]`.
+The post-ejection rule, in order: a `home` step clears the obligation; any `move` or `actuator` step while the obligation stands is a hard failure ("a tip ejection was not followed by G28"); and a step whose `op` is `eject_tip` with `detail["final"]` sets it. The physical failure: the strip force can skip steps on an open-loop machine, so after an ejection the commanded position is no longer trustworthy and every subsequent coordinate is fiction. `deck.json` states this as `rehome_after: true`, `"G28 is mandatory, not optional"`.
 
-Returns `52.25` for the p300 today, or `None` if the effector declares no tip labware (the p125 has `tips.labware: null`) or the labware is not in the catalogue or carries no `tip.length`. Raises nothing - a missing value is returned as `None` so callers can turn it into a `cannot check` warning rather than a crash or a false pass.
+`report.path` only takes steps whose `to` has no `None` component - `home("Z")` used to record `(None, None, 0.0)` and poison the plot (`test_12_no_none_coordinates_in_the_path`).
 
-The 52.25 is itself derived, not guessed: `deck.z.stage_surface` 114.75 (bare p300 nosecone touching the stage) minus `deck.z.stage_surface_with_p300_tip` 62.5.
+### `Simulator._check_move(step: Step) -> None` (private)
 
-#### `Simulator.effective_z_limit(tip_fitted, clearance=0.0)`
+All geometric checks for a `move` step, in the order they run. A protocol author never calls this; it is reached through `check`.
 
-```python
-effective_z_limit(tip_fitted: bool, clearance: float = 0.0) -> Tuple[Optional[float], List[str]]
-```
+1. **Envelope.** `deck.in_envelope(x, y, z)` against X 0-420, Y 0-580, Z 0-270. Prevents commanding a coordinate the kinematics cannot reach, which on Klipper is a mid-run abort with the tip somewhere unknown.
+2. **Off-stage depth (warning).** The stage surface exists only over the slot area (`deck.stage_region()`, derived as the slot centres expanded by half the slot pitch). Off it there is nothing to hit at stage depth, which is exactly what makes the ejector's Z 145 at Y 89 legal - it hangs past the front edge. When a step commands a Z past `z_stage_surface` at a point outside the region, this records the `off_stage_depth` warning stating the assumption rather than staying quiet, so anything *other* than the ejector doing it shows up in the report. `test_ejector_is_off_the_stage` pins the ejector's three Y waypoints (83 / 88 / 80 at X 155) as genuinely off-stage instead of taking it on trust.
+3. **Raised location edges** - `_check_raised_edges`, below.
+4. **Tip-aware absolute Z.** When the destination is on the stage, `effective_z_limit(step.tip)` is compared against `z`: deeper than the limit is a hard failure naming the tip state. Prevents driving the nosecone or the tip into the stage floor. Unresolvable means the `z_limit:tipped` / `z_limit:bare` warning, which states plainly that only the kinematic limit and the per-labware Z were checked.
+5. **Travel-height rule.** For any XY-moving step whose `op` is not in `_LOW_XY_OK`, both `frm[2]` and `to[2]` must equal `deck.z_travel` (5.0). Anything else is a hard failure: "Every traverse must be at travel height; this is the crash mode that costs a tip." A traverse at well depth drags the tip through rims, caps and edge pieces for the whole length of the move.
+6. **No-fly labware crossing.** For any XY-moving step with a tip fitted whose `op` is not `get_tip`, `deck.segment_hits_rect` is tested against every `deck.no_fly_rects()` entry (labware flagged `avoid_traverse: true` - the 300 uL tip rack). Crossing one is a hard failure, deliberately *not* a Z comparison: the tips stand upright above the rack body and the fitted tip hangs below the nosecone, so the tip shears off at any travel height and flying higher does not help. The only fix is to route around, which `Machine._route_xy` does. `labware.json` records the hardware observation behind this: the water station at X 70 sits underneath the rack in X, so every unrouted approach to water from high Y went straight through it.
+7. **Keep-out bands.** For a step that moves Y, `deck.keepouts_hit_by_y_move(step.frm[0])` gives the bands that X sits inside, and each goes to `_check_keepout`.
+8. **Swept-segment traverse clearance** - `_check_traverse_clearance`, below.
+9. **Well bottom from the effector table.** When the step names a labware, `_effector_z(labware, "bottom")` is the crash limit and `z` deeper than it is a hard failure ("Z 61.0 is past the plate1 well bottom 60.8 for p300"). The limit lives in the *effector* file, not `labware.json`, because the commanded Z at which a tip touches a floor depends on the tip: the same plate bottoms out at a different number bare than with a 300 uL tip fitted. For `sbs_96_wellplate`, p300 records `work: 53.5` and `bottom: 60.8`, so a dispense sits 7.3 mm off the floor. A labware in the catalogue with no measured `bottom` gets the `bottom:<labware>` warning naming the file to add it to - the null-crash-limit case.
 
-The deepest legal commanded Z over the stage, together with a list of whatever is missing if it cannot be computed.
+### `Simulator._check_raised_edges(step: Step) -> None` (private)
 
-- `tip_fitted` - whether a tip is on. This is the whole point of the function.
-- `clearance` - mm of extra safety margin to subtract from the limit. Nothing in the repo passes it today; it is the hook for "never come within N mm of the floor".
+The edges of each stage location stand about 9.5 mm above the stage floor (`62.5 - 53.0`). The limit is `deck.z_slot_edge_bare`, which is the stored with-tip measurement `slot_edge_with_p300_tip: 53.0` plus the tip length, so 105.25 bare and back to 53.0 with a tip fitted. Exceeding it is a hard failure naming both cells.
 
-Returns `(limit_mm, [])` when computable, otherwise `(None, missing)` where `missing` names config fields such as `"deck z.stage_surface"` or `"tiprack_300_96 tip.length"`. Raises nothing. May emit the `stage_ref:<effector id>` warning: `deck.z.stage_surface_reference` records that 114.75 was measured with the **p300** bare nosecone, so running a p125 borrows a number that was never measured for that pipette body, and the warning says so.
+Two exemptions, both physical rather than cosmetic:
 
-With the current config: bare limit **114.75**, tipped limit **114.75 - 52.25 = 62.5** (`tests/test_review_fixes.py:test_3c`). Because +Z is down, fitting a tip extends the reference point downward and the maximum commanded Z *shrinks* by the tip length - the number goes down as the danger goes up, which is the sign error this function exists to contain.
+- **Nothing on the stage was swept.** If the axis-aligned box between `frm` and `to` misses `deck.stage_region()` entirely, no stage feature is in reach. This is what makes the ejector legal at Y 80-89.
+- **Motion stayed inside one location.** `deck.slot_cell` for `frm` and `to` returning the same cell means no boundary was crossed, and it is boundaries the raised edges sit on. This is what keeps the wall wipe legal: it works at tube depth but never leaves the cell the tube sits in. The same reasoning is why plate `work` 53.5 being 0.5 mm deeper than the 53.0 edge limit is fine - the rule forbids crossing a boundary at that depth, not being there.
 
-Returning `missing` alongside the limit is the second reason it exists. Measuring `z.stage_surface` alone would switch the check on for bare moves and leave it off for the deeper, more dangerous tipped ones, with nothing in the report saying which case was actually verified.
+Unmeasured inputs warn under `slot_edge` (the deck fields) or `slot_edge_tip` (tip length) and skip.
 
-#### `Simulator.check(step)`
+### `Simulator._check_keepout(step: Step, k: KeepOut, z: float) -> None` (private)
 
-```python
-check(step: Step) -> None
-```
+Applies one keep-out band to a Y-moving step. The shipped band is `tip_ejector`, X[148, 162] (the lane at X 155 plus or minus 7), safe only when commanded `Z < 60` - that is, physically above the mechanism.
 
-The single entry point: dispatches one step through every applicable check and updates the report.
+Order matters:
 
-- `step` - the step just generated.
+1. `detail["keepout_exempt"]` **and** `op` in the band's `whitelist` returns early. Both are required. The flag is set only by `Machine._engaging_ejector` around the waypoints that actually engage the ejector, so the surrounding approach and retract are checked like any other traverse.
+2. **A tip fitted is an unconditional failure.** `safe_when_z_below: 60.0` was stated for the bare effector; a fitted tip reaches 52.25 mm lower and the real limit was never measured, so a tipped traverse through the band is an error rather than a comparison against a number that does not apply.
+3. Otherwise `k.z_is_safe(z)` must hold. Note `KeepOut.z_is_safe` returns `False` when `safe_when_z_below` is `None`, so an undeclared limit forbids the motion rather than permitting it.
 
-Returns `None`. Raises `SimulationError` in strict mode via any check it dispatches to. In order, it:
+**Note:** the band's `x_range` width is itself flagged in `deck.json -> uncalibrated` ("width unverified; lane X 155 itself is confirmed and post-shift"), so this check is only as wide as an unverified 14 mm carried over from the old X 85 location.
 
-1. Advances `report.steps` to `max(report.steps, step.i + 1)`.
-2. **Post-ejection re-home check.** A `home` step clears the pending flag. Any `move` or `actuator` step while the flag is still set is a hard failure: *"a tip ejection was not followed by G28"*. Physical failure prevented: the strip force can skip steps on an open-loop machine, so after an ejection the commanded position no longer describes where the gantry is, and the next move is computed from a lie. `deck.json` states this as `stations.tip_eject.rehome_after: true` with `rehome_note` calling G28 mandatory. Note the error blames `self._eject_step`, not the step that tripped it, so the message points at the ejection that owed a G28 rather than at the innocent move after it.
-3. Runs `_check_move` for `kind == "move"`, or `_check_actuator` for `kind == "actuator"`.
-4. Arms the flag when it sees the ejection-complete marker (`op == "eject_tip"` and `detail["final"]`). `Machine.eject_tip` records that marker *after* the final lift to travel height, so the lift itself is not what trips the rule.
-5. Appends `(*step.to, step.op)` to `report.path`, but only when every component of `to` is non-`None` - otherwise a `home("Z")` step would inject `None` coordinates into the plot data (`tests/test_review_fixes.py:test_12`).
+**Note:** `KeepOut.tipped_is_error` is never read - neither `Deck.__init__` (which does not populate it from config) nor this method consults it. The tipped-is-an-error behaviour is hardcoded here. Harmless today, misleading if someone sets it in config expecting an effect.
 
-#### `Simulator._check_move(step)` (private)
+### `Simulator._check_traverse_clearance(step: Step) -> None` (private)
 
-Runs the five geometric checks that apply to a motion step. Protocol authors never call it; `check()` does. In order:
+Does the whole swept segment clear every loaded placement? For each placement it computes `labware_top_z(p, step.tip)` and tests the axis-aligned box between `frm` and `to` for overlap with the placement's bounds; overlap at a Z at or below the top is a hard failure.
 
-- **Envelope.** `deck.in_envelope(x, y, z)` against X [0, 420], Y [0, 580], Z [0, 270] from `deck.json`. Any violation is a hard failure. Prevents commanding past the kinematic limits, where Klipper aborts the run mid-protocol - which, halfway through 20 tubes with a wet tip, is itself a lost experiment.
-- **Off-stage depth warning.** If the target XY is outside `deck.stage_region()` and Z is deeper than `z_stage_surface` (114.75), a one-time `off_stage_depth` warning fires. This is not an error, because the stage surface only exists over the slot area: the derived region today is X [-2.75, 403.75], Y [131.875, 411.625], and the ejector lane at (155, 89) is 43 mm clear of the front edge in Y, which is exactly what makes its Z 145 reachable. The warning exists so that "we are below the stage floor" is never silent, even when it is legal.
-- **Absolute crash depth.** On-stage only, via `effective_z_limit(step.tip)`. `z > limit` is a hard failure. Prevents driving the nosecone or the tip into the stage: 62.5 with a tip, 114.75 bare (`test_tipped_stage_crash_is_blocked`, `test_bare_stage_crash_is_blocked`). If the limit cannot be computed the `z_limit:tipped` / `z_limit:bare` warning states plainly that only the kinematic limit and the per-labware Z were checked.
-- **Travel-height rule.** Any step with X or Y in `axes` whose `op` is not in `_LOW_XY_OK` must have both `frm[2]` and `to[2]` equal to `deck.z_travel` (5.0) within 1e-6, or it is a hard failure worded *"this is the crash mode that costs a tip"*. Prevents the ordinary case of dragging a fitted tip sideways at working depth across a tube rim or a rack. Travel height is verified rather than assumed: at Z 5.0 a fitted 300 uL tip clears the raised location edges by 48.0 mm and the stage floor by 57.5 mm.
-- **Keep-out bands.** For a Y move, every band returned by `deck.keepouts_hit_by_y_move(step.frm[0])` is passed to `_check_keepout`. Using `frm[0]` is sound only because `Machine._move_xy` emits one axis per step, so X is constant across a Y step.
-- **Traverse clearance** over loaded labware, via `_check_traverse_clearance`, subject to the same `_LOW_XY_OK` exemption.
-- **Well bottom.** When the step names a `labware`, `z > labware.z("bottom")` is a hard failure (*"Z {z} is past the {labware} well bottom"*). Prevents a dispense driving the tip into the bottom of a 0.65 mL tube, which blocks the orifice and makes the dispensed mass meaningless. Every `z.bottom` in `labware.json` is `null` today, so what this actually produces is three `bottom:<labware id>` warnings - the check is off, and says so.
+Why the swept segment and not the destination: a traverse that starts over the rack and ends at the reservoir crosses the whole rack, and labware that is never a move endpoint would never be checked at all. That was a real defect; `test_4_traverse_clearance_uses_the_swept_segment` reproduces it by giving the tube rack a 60 mm contents height (commanded top `114.75 - 60 - 52.25 = 2.5`, above travel height 5.0) and asserting the Y leg from the tip rack down into the rack is refused - and that a move which misses the rack is not. `Machine._move_xy` emits one axis per step, which is what makes the box a valid model of the sweep.
 
-#### `Simulator._check_raised_edges(step)` (private)
+Bounds preference: `p.footprint_bounds()` (the measured physical outline) if available, else `p.well_bounds()` plus the `footprint:<name>` warning, because a rim extends past the outermost well centres and well centres alone would miss a path that clips the edge of the rack.
 
-The edges of each stage location are raised, and an XY move that crosses a location boundary passes over one. `deck.z_slot_edge_bare` derives the bare-nosecone reference as `slot_edge_with_p300_tip` 53.0 plus the tip length 52.25 = **105.25**, so the limit in force is 105.25 bare and 53.0 with a tip. The compared value is `max(frm[2], to[2])`, the deeper end of the move. Deeper than the limit is a hard failure. Physical failure prevented: the tip strikes an edge piece on the way over. The edges stand `62.5 - 53.0 = 9.5` mm above the stage floor.
+Two warnings alongside:
 
-Three early exits, each of which is load-bearing:
+- `ztop:<name>` when the top is unknown, carrying the reason from `labware_top_z`.
+- `contents:<name>` when `p.labware.height_is_empty_only` - the stored `height_mm` is the empty holder and the real height with tubes and caps in it is greater by an unmeasured amount. The message quotes `max_labware_height()` as the threshold above which travel height is struck with a tip on. `test_empty_height_is_flagged_as_incomplete` pins that a run over the 0.65 mL holder produces it.
 
-- No measurement (`z_slot_edge_bare is None`): a `slot_edge` warning naming `slot_edge_with_p300_tip` / `stage_surface_with_p300_tip`, then return.
-- The swept box does not touch `deck.stage_region()`: return. This is what makes the ejector legal - it works at Y 80 to 89, clear of the front of the stage, at a depth no stage feature reaches.
-- `slot_cell(frm)` equals `slot_cell(to)` and is not `None`: return, because motion staying inside one location never goes over an edge. This is precisely what keeps the wall wipe legal - it works at tube depth (Z 45.0 for the tube rack) but never leaves the cell the tube sits in.
+### `Simulator._effector_z(labware_id: str, key: str) -> Optional[float]` (private)
 
-For a tipped move with no known tip length, a `slot_edge_tip` warning fires and the check is skipped rather than run against the bare limit.
+Reads `effector.spec["z_for_labware"][labware_id][key]` as a float, or returns `None` if the labware, the key, or the value is absent. Raises nothing - and that is the whole point. `Effector.z_for` raises `EffectorError` on a null because it is being asked for a depth to command; this returns `None` because it is being asked for a crash limit to compare against, and an unknown limit becomes a `cannot check` warning instead of stopping the run. Not for protocol use; ask `Effector.z_for` for a target.
 
-**Note:** `Deck.slot_cell` builds cells from the *mean* slot pitch (135.5 x 93.25) while the stored centres are irregular (X pitch 136/135, Y pitch 93.0/93.5, as `deck.json:slot_pitch_note` records). The half-pitch cells therefore do not tile exactly: they overlap by 0.5 mm in X, and in Y they leave a 0.25 mm seam between 225.125 and 225.375. A point in that seam is on-stage but has no cell, so `slot_cell` returns `None` and any move through it is treated as crossing a boundary. That direction is conservative, so it is safe - but it means an error message can say `off-stage -> 8` for a point that is physically on the stage.
+### `Simulator.labware_top_z(p, tip_fitted: bool) -> Tuple[Optional[float], str]`
 
-#### `Simulator._check_keepout(step, k, z)` (private)
+Commanded Z at which the effector would touch this placement's top.
 
-Applies one `KeepOut` band to one Y move. The only band configured today is `tip_ejector`, X [148.0, 162.0], `forbids: y_motion`, `safe_when_z_below: 60.0`, `whitelist: ["eject_tip"]`.
+- `p` (`Placement`) - a resolved placement.
+- `tip_fitted` (bool).
+- Returns `(z_mm, "")`, rounded to 4 dp, or `(None, reason)` where `reason` is the ready-made `cannot check ...` warning text. Raises nothing.
 
-- Exempt and returns early only if **both** `step.detail["keepout_exempt"]` is set **and** `step.op` is in the band's whitelist. Two conditions, not one, because the flag alone would let any operation buy an exemption and the op name alone would hand it to every approach and retract move in `eject_tip`.
-- If a tip is fitted, that is an unconditional hard failure regardless of Z. `safe_when_z_below: 60.0` was stated for the bare 300 uL effector; a fitted tip reaches 52.25 mm lower and the real limit was never measured, so the honest answer is refusal rather than an unmeasured comparison. This is the "cannot be evaluated is not a pass" rule applied to a *hard* check rather than a warning.
-- Otherwise `k.z_is_safe(z)` requires `z < 60.0`, i.e. physically above the mechanism. `z_is_safe` returns `False` when `safe_when_z_below` is `None`, so a band with no measured safe height forbids Y motion outright.
+Computed as `z_stage_surface - height_mm`, minus the tip length when tipped. Derived from a physical height above the stage rather than stored as a Z because a stored Z is wrong the moment a tip goes on: the 35 mm 0.65 mL holder tops out at commanded Z **79.75** bare and **27.5** with a 300 uL tip (`test_holder_heights_convert_to_commanded_z`, which also checks travel height 5.0 clears 27.5). A height is frame- and effector-independent; a commanded Z is neither.
 
-Physical failure prevented: Y-axis motion through X 148-162 collides with the ejector mechanism. `deck.json` flags the 14 mm band width as still unverified at this location (it was carried over from a previously documented band centred on X 85), and that admission is in `deck.uncalibrated`, so it reaches the manifest on every run.
+Public because tests and tools use it; a protocol has no reason to.
 
-#### `Simulator._check_traverse_clearance(step)` (private)
+### `Simulator.max_labware_height() -> float`
 
-Does the whole swept segment clear the rim of every loaded placement? Because `Machine._move_xy` emits one axis per step, the swept region is the axis-aligned box between `frm` and `to`, and a placement is implicated when that box overlaps its bounds. Overlap plus `z > top - 1e-6` (at or below the rim) is a hard failure.
+Tallest anything can be, in mm above the stage, and still clear travel height with a tip fitted: `z_stage_surface - tip_length - z_travel` = `114.75 - 52.25 - 5.0` = **57.5 mm**, pinned by `test_holder_heights_convert_to_commanded_z`. Used in the `contents:<name>` warning to tell the operator the number the unmeasured contents height must not exceed.
 
-Per placement it prefers `footprint_bounds()` - the physical outline - and falls back to `well_bounds()` (outermost well centres) with a `footprint:<name>` warning saying the check will not catch a path that clips the rim. A missing `z.top` produces a `ztop:<name>` warning and the placement is skipped.
+**Note:** the `or 0.0` fallbacks mean an unmeasured `stage_surface` or tip length silently yields a nonsense figure (`-5.0` with neither measured) rather than `None`. It is only ever interpolated into a warning string, so nothing acts on it, but the message would be quietly wrong in exactly the configuration where the reader most needs to distrust it.
 
-It checks the swept box rather than the destination for two reasons, both of which were real bugs (`tests/test_review_fixes.py:test_4`): a traverse that starts over the rack and ends at the reservoir crosses the whole rack in between, and labware that is never a move endpoint would otherwise never be checked at all. With `z.top` unmeasured on all four labware definitions, this check is currently reporting three `cannot check` warnings and enforcing nothing - which is exactly the third layout open question ("Do any of the loaded racks stand HIGHER than the raised location edges?").
+### `Simulator._check_actuator(step: Step) -> None` (private)
 
-#### `Simulator._check_actuator(step)` (private)
+Plunger POS bounds for a `Pipette`. `pos_after` below `pos_min + stroke_margin` (0.0 + 1.0 = 1.0 mm for p300) is a hard failure - that margin keeps the plunger off the POS=0 hard stop, which it would otherwise ram. Above `blowout_pos` (30.0) is a hard failure - past full dispense plus blow-out there is no stroke left. These duplicate `Pipette.check_pos` on purpose: the effector validates when asked to compute a POS, and the simulator validates the POS that was actually commanded, whatever path produced it.
 
-For a `Pipette`, checks `step.pos_after` against the floor `pos_min + stroke_margin` (0.0 + 1.0 = **1.0** mm for the p300) and the ceiling `blowout_pos` (**30.0** mm). Either side is a hard failure. Returns immediately if `pos_after` is `None`.
+**Note:** the method returns silently when `pos_after` is `None` and when the effector is not a `Pipette`. The first is benign (non-actuator steps carry no POS), but the second means a `Gripper`'s actuator steps have no bound checked at all and no `cannot check` warning is recorded - the one place in the module that departs from the stated principle. A `Gripper` is not built yet, so nothing is at risk today.
 
-Physical failure prevented: driving the plunger into its hard stop, or past blow-out, both of which mean the volume actually delivered is not the volume requested - and on the accuracy bench a silently clipped stroke looks like a calibration result. This duplicates `Pipette.check_pos`, which `Machine.actuator` already calls before emitting; the point of the copy is that the simulator sees the recorded state of every step, including any produced by a path that bypassed `Machine.actuator`.
+### `Simulator.record_tip_pickup(step: Step, row: int, col: int) -> None`
 
-**Note:** the check is inside `isinstance(eff, Pipette)`, so a `Gripper`'s actuator positions are not range-checked anywhere. That is consistent with `Gripper.require_ready()` refusing to generate motion at all while `open_pos` / `closed_pos` / `grip_pos` are null, but it is a gap to close when the gripper is built.
+Adds `(row, col)` to `consumed_tips`. `row`/`col` are zero-based rack indices. Returns `None`, raises nothing. It is the bookkeeping that makes `check_tip_exit` and `Machine.get_tip`'s refusal to reuse a hole possible: without it a second pickup drove the bare nosecone into an already-empty hole and then set `tip_fitted = True` anyway (`test_2_second_pickup_does_not_reuse_a_hole`, `test_2b_explicit_reuse_is_refused`).
 
-#### `Simulator.record_tip_pickup(step, row, col)`
+### `Simulator.check_tip_exit(step, row: int, col: int, crossed: Sequence[Tuple[int, int]]) -> None`
 
-```python
-record_tip_pickup(step: Step, row: int, col: int) -> None
-```
+After a pickup, the X exit must cross only positions already consumed.
 
-Marks a tip position as consumed.
+- `step` - the recording step, for the error message.
+- `row`, `col` (int) - the position just picked.
+- `crossed` - the `(row, col)` positions the exit path passes over, computed by `Machine`.
 
-- `step` - the pickup step. Currently unused by the body; kept for symmetry with `check_tip_exit` and for future error messages.
-- `row`, `col` - 0-based grid indices in the tip rack.
+Hard failure if any crossed position still holds a tip. The physical failure: passing over an occupied position shears the fresh tip straight off the nosecone. The remedy is in the message - consume columns starting at the exit edge and work inward, which `test_2c_consumption_works_inward_from_the_exit_edge` pins.
 
-Returns `None`, raises nothing. The resulting `consumed_tips` set drives three separate safety behaviours: the exit-path check below, `Machine.get_tip`'s refusal to press into an already-used hole, and `Machine._next_free_tip_col`'s inward-from-the-exit-edge consumption order.
+### `Simulator.finish(held_fluid: float, tip_fitted: bool) -> Report`
 
-#### `Simulator.check_tip_exit(step, row, col, crossed)`
+Whole-run checks, then the finished `Report`. `held_fluid` in uL and `tip_fitted` are the end-of-run machine state (`Machine.simulate` passes its own). Raises nothing - `finish` never raises even in strict mode, because these are conditions of the finished run and the caller is about to inspect the report.
 
-```python
-check_tip_exit(step: Step, row: int, col: int, crossed: Sequence[Tuple[int, int]]) -> None
-```
+- Errors: an unfulfilled post-ejection G28 obligation ("the run ends on a tip ejection with no G28 after it"), and every `OVERLAP` line from `deck.overlap_report()` - two placements whose measured footprints intersect means the bench cannot physically be as the layout describes.
+- Warnings: fluid still held at the end; a tip still fitted and never ejected when the effector supports ejection; every line from `deck.slot_seating_report()` (a labware whose resolved grid centre is more than half a slot pitch from the slot it claims); and the non-`OVERLAP` lines from `overlap_report()`, which are its own `cannot check X vs Y: no footprint measured` entries.
 
-After a pickup, the X exit path may cross only positions whose tips have already been consumed.
+Idempotent via `_finished`: a caller that inspects the report and then calls `finalize()` would otherwise get every whole-run line duplicated, and the manifest would record the pile-up. `test_7_simulate_is_idempotent` calls `simulate()` three times and asserts the warning count does not move.
 
-- `step` - the exit step (recorded by `Machine._exit_tip_box` with `kind="note"`).
-- `row`, `col` - the position just picked, for the message.
-- `crossed` - every `(row, col)` the X exit sweeps over, computed by the caller from the column X values and the chosen exit edge.
+### `plot_path(report: Report, out_path: str, title: str = "toolpath") -> Optional[str]`
 
-Raises `SimulationError` in strict mode if any crossed position is not in `consumed_tips`, with the remedy in the message: *"Consume columns starting at the exit edge and work inward."* Physical failure prevented: passing over an occupied tip position shears the freshly fitted tip straight off the nosecone. `tests/test_lab.py:test_tip_exit_path_over_occupied_positions` asks for column 5 on a full rack and expects the refusal.
+Renders the toolpath to a PNG and returns the path written, or `None` if matplotlib is not installed or `report.path` is empty. `out_path` is a filesystem path; `title` labels the figure. Raises nothing on the missing-dependency route - plotting is a convenience and must never be the reason a run fails to produce gcode, which is why `Machine.finalize` treats the `None` as a normal outcome (and every protocol offers `--no-plot`).
 
-This check is the reason the unresolved `consume_order.exit_edge: "unconfirmed"` in `labware.json` is survivable. `Machine._tip_exit` assumes the low-X edge and warns loudly; if that assumption is wrong, this check fails the run rather than letting 20 pickups exit the wrong way.
+Two panels, both fighting the sign convention so a human can read them:
 
-#### `Simulator.finish(held_fluid, tip_fitted)`
+- XY path with points coloured by Z, equal aspect, colourbar labelled `Z (mm, +Z down)` and a title saying "larger Z is LOWER".
+- Z against step index with the Y axis **inverted**, so down on the plot is down in space.
 
-```python
-finish(held_fluid: float, tip_fitted: bool) -> Report
-```
+Forces the `Agg` backend before importing pyplot, so it works headless.
 
-Runs the checks that can only be evaluated once the whole run exists, then returns the completed report. Called by `Machine.simulate()`, which passes its own end state.
-
-- `held_fluid` - uL still in the tip at the end of the run.
-- `tip_fitted` - whether a tip is still on at the end.
-
-Returns the `Report`. Raises nothing - even the pending-ejection failure is appended straight to `report.errors` rather than going through `fail()`, so `finish()` never raises in strict mode and `Machine.finalize()` is what refuses to write.
-
-The four whole-run checks:
-
-- Run ends on an ejection with no G28 after it: **error**. Same reasoning as the per-step version; a run that hands back an untrusted position is not finished.
-- Run ends still holding fluid: **warning**, quoting the volume. Usually a protocol bug - a missing final dispense means one tube never got its aliquot and the balance sheet has a row that will never be filled.
-- Run ends with a tip fitted and never ejects it, but only when `effector.can_eject_tip`: **warning**. The p300 accuracy run trips this deliberately, because the ISO protocol wants a fresh tip fitted by hand between the three repeats.
-- `deck.slot_seating_report()` lines: **warnings**, prefixed `"slot seating: "`. Each says a slot-mounted placement's grid centre is more than half a slot pitch from the centre of the slot it claims, i.e. either the slot number or the slot frame is wrong. Empty on the current layout.
-- `deck.overlap_report()` lines: lines starting `OVERLAP` become **errors** (two placements physically intersect, so one of them is not where the layout says), everything else becomes a **warning**. Today all three pairs come back as `cannot check ...: no footprint measured`, because no footprint is measured for the tube rack, the tip rack or the reservoir.
-
-`finish()` is idempotent, guarded by `self._finished`. Without that, a caller that inspects the report and then calls `finalize()` would get every whole-run line two or three times, and the manifest would record the pile-up (`tests/test_review_fixes.py:test_7_simulate_is_idempotent`).
-
-### `plot_path(report, out_path, title="toolpath")`
-
-```python
-plot_path(report: Report, out_path: str, title: str = "toolpath") -> Optional[str]
-```
-
-Renders the run as a PNG: an equal-aspect XY scatter coloured by Z over a grey path line, above a Z-versus-step trace.
-
-- `report` - a `Report` with a populated `path`.
-- `out_path` - where to write the PNG. Written at dpi 130 with the Agg backend.
-- `title` - figure title; `Machine.finalize` passes the protocol name.
-
-Returns `out_path` on success, or `None` if matplotlib is not installed or `report.path` is empty. Raises nothing for the missing-dependency case - matplotlib is deliberately optional, and `finalize()` simply reports `"plot": None`.
-
-Two details exist to keep the sign convention readable: the XY subplot title says *"colour = Z (larger Z is LOWER)"*, and the Z-versus-step axis is inverted (`ax2.invert_yaxis()`) so that lower on the plot means lower in space. Reading a toolpath plot with the axis the natural way round is how a maintainer talks themselves into a crash.
-
-Be aware that `report.path` contains a point for *every* step with known coordinates, including `home` steps and zero-length `note` markers (the ejection-complete marker records `frm == to`), so the trace includes stationary points and jumps to the home position.
+---
 
 ## `lab/logbook.py`
 
-The run manifest: a JSON sidecar plus a balance-entry CSV, written next to every generated `.gcode`. The purpose is gravimetric traceability. `mass_dry_mg`, `mass_wet_mg` and `temp_C` are written out **empty** so the operator fills them in at the balance and the readings join back to the generated positions on tube identity, instead of being transcribed by hand into a separate spreadsheet. Everything needed to reproduce the run goes in the JSON: the git commit of the generating code, the SHA-256 of every config file consumed, the calibration coefficients actually used, and every field the config admits was never calibrated.
+The run manifest: a JSON sidecar written next to every generated `.gcode`, plus a balance-entry CSV. Two jobs. First, **gravimetric traceability** - `mass_dry_mg`, `mass_wet_mg` and `temp_C` are written out empty, one row per dispense, so balance readings join to the run on tube ID at the balance instead of being transcribed by hand into a spreadsheet nobody can later tie to a specific gcode file. Second, **reproducibility** - the git commit of the generating code, the SHA-256 of every config file consumed, the calibration coefficients actually used, and every field the config admits is uncalibrated, all captured at generation time. The simulator's warnings are copied in too, so the file records what could not be checked and not just what passed.
 
-### `build_manifest(machine, report)`
+### `build_manifest(machine: "Machine", report: Report) -> Dict[str, Any]`
 
-```python
-build_manifest(machine: "Machine", report: Report) -> Dict[str, Any]
-```
+Assembles the manifest as a plain dict. `machine` is a `Machine` after the run is generated; `report` is the finished `Report` from `Simulator.finish`. Returns a JSON-serialisable dict; raises nothing of its own (it will propagate a `KeyError` if an effector spec is missing `calibration`, which `Pipette.__init__` would already have rejected). Separated from the writing so tests and tools can inspect the structure without touching disk.
 
-Assembles the manifest as a plain JSON-serialisable dict. Pure: it reads `machine` and `report` and mutates nothing.
+Contents worth knowing:
 
-- `machine` - the `Machine` after the protocol has run. Typed as a string to avoid a circular import; `Machine` imports `write_manifest` lazily inside `finalize()` for the same reason.
-- `report` - the `Report` from `Simulator.finish()`.
-
-Returns the dict. Raises whatever the underlying accessors raise; in practice nothing, since `Pipette.__init__` has already required `spec["calibration"]` and validated `model == "linear_mm_per_uL"` before this point.
-
-Top-level keys, and why each is there:
-
-- `schema_version` (1) and `generated_utc` - ISO-8601 UTC to the second.
-- `protocol` - `machine.name`, which is also the filename stem.
-- `effector` - `id`, `kind`, `display_name`, `nominal_uL`.
-- `calibration` - for a `Pipette` only, otherwise `{}`. Carries `equation` (from `Pipette.equation`, **derived** from `slope` and `intercept` rather than copied from the config's free-text `equation` string, so the reported curve cannot drift from the coefficients that produced the millimetres), `slope_mm_per_uL`, `intercept_mm`, `window_uL`, the gravimetric context (`method`, `temperature_C`, `water_density_g_per_mL`, `z_factor_uL_per_mg`, `pressure_kPa`) that any mass-to-volume conversion at the balance needs, and the plunger constants (`blowout_pos`, `air_gap`, `gap_pos`, `post_asp_backoff`, `stroke_margin`, `max_volume_uL`). For the p300 that is `d_mm = 0.0533 * V_uL + 0.122` over an 8.0 to 320.0 uL window.
-- `provenance` - `config_dir`, `git_commit`, `git_dirty`, and `config_sha256` for `deck.json`, `labware.json`, the layout file by its own name, and `effectors/<id>.json`. This is the block that answers "which numbers produced this mass?" six months later. `git_dirty: true` in the committed example manifest is the block doing its job.
-- `deck` - `id`, `z_travel` (5.0), `z_home` (0.0), `z_stage_surface` (114.75), `feedrates`.
-- `layout` - the layout `id` plus, per placement, the fully resolved geometry: `origin`, `col_vec`, `row_vec`, `rows`, `cols`, `mount`, `slot`, `station`, `rotation`. Recording the solved vectors rather than the input corners means the manifest states where the wells actually were, not what the config was asked to solve.
-- `open_questions` - straight from `layout.json`. These are also warned about on every run by `Machine.__init__`.
-- `near_slots` - placements carrying a `near_slot` human reference rather than a seating claim (`{"water": 9}` today).
-- `slot_seating` - `deck.slot_seating_report()`.
-- `toggles`, `notes` - whatever the protocol recorded, so the experimental design (replicates, fractions, volumes, whether prewet and wipe ran) is on the record with the numbers.
-- `uncalibrated` - `machine.uncalibrated()`, which is `deck.uncalibrated() + effector.uncalibrated()`. The example run lists nine entries, including `tubes(tube_rack_0p65_5x10).z.work` and `deck.stations.tip_eject (routine never validated on hardware)`. This is the manifest half of "a check that cannot be evaluated is not a pass": every unmeasured number travels with the data it influenced, so a suspicious result can be checked against what was never actually known.
-- `simulation` - `steps`, `errors`, `warnings` verbatim. The `cannot check` warnings end up here, attached permanently to the run they applied to.
-- `gcode_lines`, `dispenses` - line count and the full dispense records, the same rows the CSV gets.
-
-**Note:** `Machine.finalize()` calls `write_manifest` only after `report.ok`, so `simulation.errors` in a manifest on disk is always empty. A non-empty `errors` list can only appear if something calls `build_manifest`/`write_manifest` directly, bypassing that gate.
+- `schema_version` (1) and `generated_utc` (ISO 8601, seconds precision).
+- `effector` - id, kind, display name, `nominal_uL`.
+- `calibration` - populated only for a `Pipette`, otherwise `{}`. Carries `equation` from `Pipette.equation`, which is **derived from the coefficients in use**, not the free-text `equation` string in the JSON: that duplicate is exactly the kind that drifted from its own table in the scripts this library replaces (`test_9_equation_is_derived_from_the_coefficients`). Also `slope_mm_per_uL` (0.0533 for p300), `intercept_mm` (0.122), `window_uL` ([8.0, 320.0]), the gravimetric conditions (`method`, `temperature_C`, `water_density_g_per_mL`, `z_factor_uL_per_mg`, `pressure_kPa`), and every plunger constant that shaped the run (`blowout_pos`, `air_gap`, `gap_pos`, `post_asp_backoff`, `stroke_margin`, `max_volume_uL`).
+- `provenance` - `config_dir`, `git_commit`, `git_dirty`, and `config_sha256` for all four files consumed (`deck.json`, `labware.json`, the layout by its real filename, and `effectors/<id>.json`). `test_full_protocol_and_manifest` asserts all four are hashed. `git_commit` and `git_dirty` are `None` when git cannot be reached, so a manifest is still written outside a checkout - but a `git_dirty: true` is the flag that the commit alone does not describe the code that ran.
+- `deck` - id, `z_travel`, `z_home`, `z_stage_surface`, feedrates.
+- `layout` - one entry per placement with the resolved geometry (`origin`, `col_vec`, `row_vec`, `rows`, `cols`) as well as the labels (`slot`, `station`, `mount`, `rotation`). The vectors are what actually produced the coordinates, so a well can be recomputed from the manifest without re-resolving the config.
+- `open_questions`, `near_slots`, `slot_seating` - the deck's own admissions of what is unresolved or is a human reference rather than a seating claim.
+- `toggles` (`temp_log`, and `prewet_cycles` / `mix_cycles` / `mix_volume_uL` if those ran), `notes`, `uncalibrated` (deck plus effector).
+- `simulation` - step count, errors, warnings verbatim.
+- `gcode_lines` and `dispenses` - the full dispense records, each already carrying `x`, `y`, `z`, `target_volume_uL`, the aspirate record, and the three empty balance columns.
 
 ### `_CSV_COLUMNS` (module constant)
 
-The 18 balance-sheet columns, in order: `order_index`, `placement`, `labware`, `slot`, `well`, `row`, `col`, `x`, `y`, `z`, `target_volume_uL`, `displacement_mm`, `aspirate_pos`, `backoff_pos`, `mass_dry_mg`, `mass_wet_mg`, `temp_C`.
+The balance CSV's column order: `order_index, placement, labware, slot, well, row, col, x, y, z, target_volume_uL, displacement_mm, aspirate_pos, backoff_pos, mass_dry_mg, mass_wet_mg, temp_C`. Fixed and explicit so the file the operator types into keeps the same shape between runs, and so `extrasaction="ignore"` can drop any extra key a dispense record grows without breaking the writer.
 
-The first fourteen are generated; the last three are blank for hand entry. `displacement_mm`, `aspirate_pos` and `backoff_pos` come from the aspiration that fed that specific dispense, so a suspect mass can be traced to the exact plunger stroke that produced it rather than to a nominal volume.
+### `write_manifest(machine: "Machine", report: Report, outdir: Path) -> Path`
 
-**Note:** the writer uses `extrasaction="ignore"`, so a field added to `Machine.dispense`'s record but not to this list is silently dropped from the CSV. It still appears under `dispenses` in the JSON, which makes the omission easy to miss. Add to both.
+Writes `<name>.manifest.json` and, when there are dispenses, `<name>.balance.csv` into `outdir`, creating it (with parents) if needed. Returns the path of the JSON. Raises `OSError` on an unwritable directory.
 
-### `write_manifest(machine, report, outdir)`
+- JSON: `indent=2`, `encoding="utf-8"` explicit. Note the project trap about `write_text` truncating before it encodes on a `cp1252` default - the explicit encoding here is what keeps a non-ASCII character in a config note from producing a zero-byte manifest.
+- CSV: `newline=""` (so `csv` controls line endings on Windows rather than doubling them), `utf-8`, header row, then one row per `machine.dispenses` entry. The three balance columns are written as empty cells, ready to fill in - `test_full_protocol_and_manifest` checks both files appear for a 20-dispense run and that every dispense carries `mass_dry_mg`.
 
-```python
-write_manifest(machine: "Machine", report: Report, outdir: Path) -> Path
-```
-
-Writes `<name>.manifest.json` and, when there is at least one dispense, `<name>.balance.csv` beside it.
-
-- `machine`, `report` - as for `build_manifest`.
-- `outdir` - directory to write into. Coerced with `Path()` and created with `mkdir(parents=True, exist_ok=True)`, so a caller may pass a string.
-
-Returns the `Path` to the JSON file. Raises whatever the filesystem raises. Both files are written UTF-8; the CSV is opened with `newline=""` as `csv` requires, and the JSON is indented 2.
-
-The two files are named from `machine.name` so the whole run is one stem: `p300_accuracy.gcode`, `p300_accuracy.manifest.json`, `p300_accuracy.balance.csv`, `p300_accuracy.toolpath.png`. A run with no dispenses (a tip-handling or ejector dry run, say) gets a JSON and no CSV.
-
-**Note:** the CSV path is not returned and is not in `Machine.finalize()`'s result dict either, so a caller that wants it must reconstruct `outdir / f"{machine.name}.balance.csv"`.
+Called only from `Machine.finalize`, and only **after** `report.ok` has been confirmed, so a manifest never describes a run whose gcode was refused.
 
 ---
-
-
----
-
-## Added after the bulk of this reference was written
-
-These landed after the sections above were drafted, so they are collected here.
-
-### `Labware.height_mm`
-
-Physical height above the stage, contents included when known
-(`height_with_contents_mm` wins over `height_mm`). Stored as a height rather
-than a commanded Z because a Z is wrong the moment a tip goes on: the 35 mm
-0.65 mL holder tops out at commanded Z 79.75 bare and 27.5 with a 300 uL tip.
-Returns `None` when unmeasured.
-
-### `Labware.height_is_empty_only`
-
-True when only the empty height is known, so tubes and caps are unaccounted
-for. Both tube holders return True today, and a run that traverses over one
-warns about it. The number that matters is **57.5 mm** - stage 114.75 minus tip
-52.25 minus travel 5.0 - the tallest anything can be and still clear travel
-height with a tip. That leaves 22.5 mm of headroom on the 0.65 mL holder and
-12.5 mm on the 1.5 mL one.
-
-### `Labware.approach_order`
-
-`"YX"`, `"XY"` or `None`. A labware asking for `"YX"` wants the effector to
-reach its Y position while still clear in X, then come in along X. Both tube
-holders ask for it: the caps make Y motion across a holder difficult, while X
-motion passes between cap rows. The keep-out router still overrides it when
-geometry demands and warns when it does, because a band is a collision and the
-order is an ease-of-motion choice.
-
-### `Machine.goto_placement(placement, row, col, op="goto")`
-
-Traverse to a well, honouring that labware's `approach_order`. Returns the
-`(x, y)` it went to. `dispense` and `get_tip` already do this internally; use
-this when writing a protocol that moves somewhere without dispensing.
-
-### `Machine.goto(..., prefer=None)`
-
-`prefer` is `"XY"` or `"YX"`; anything else raises `ProtocolError`. Omit it and
-the default is X-first, which is what the tip box requires.
-
-### `Simulator.labware_top_z(placement, tip_fitted)`
-
-Returns `(commanded_z, reason_if_unknown)` for the top of a placement's
-labware, converted from its physical height for the current tip state. The
-reason string is what the `cannot check` warning quotes.
-
-### `Simulator.max_labware_height()`
-
-`z_stage_surface - tip_length - z_travel`, i.e. 57.5 mm today. Anything taller
-is struck at travel height with a tip fitted.
-
-### `a1_from_slot_edge` (placement model, `lab/labware.py`)
-
-For slot-mounted labware dimensioned from the *location edges* rather than from
-a measured machine coordinate. Names which edge each inset is taken from:
-
-```json
-"a1_from_slot_edge": {
-  "x_edge": "high", "x_inset": 14.0,
-  "y_edge": "high", "y_inset": 13.0
-}
-```
-
-The location cell is the slot centre expanded by half the slot pitch, so
-135.5 x 93.25 mm here. `Deck.__init__` passes the pitch in; a placement using
-this model outside a slot raises `ValueError`. The 1.5 mL tube holder uses it:
-13 mm down from the top of the location, 14 mm in from the left, which resolves
-A1 in slot 5 to (253.75, 305.625).
-
-### `Deck.stage_region()`, `Deck.point_on_stage(x, y)`, `Deck.slot_cell(x, y)`
-
-The stage surface only exists over the slot area. `stage_region()` derives it
-from the slot centres expanded by half the slot pitch - X[-2.75, 403.75],
-Y[131.88, 411.62] - so it cannot drift out of step with the slot table.
-`slot_cell` returns which location a point is in, or `None` off-stage, and that
-is what distinguishes a traverse crossing a location boundary (over a raised
-edge) from motion staying inside one location (the wall wipe, inside a tube).
-
-### `Deck.z_slot_edge_bare`
-
-Bare-nosecone Z at which the effector would strike a raised location edge:
-105.25, derived as the measured with-tip limit 53.0 plus the tip length 52.25.
-One measurement, both cases.
-
-### `Deck.slot_seating_report()`, `Deck.near_slots()`
-
-`slot_seating_report()` returns a line per slot-mounted placement whose grid
-centre sits more than half a slot pitch from its slot centre - meaning either
-the slot number or the slot frame is wrong. `near_slots()` returns placements
-carrying a `near_slot` human reference rather than a seating claim.
-
-### `Deck.macro(name)`
-
-A Klipper macro prefix, and it raises `DeckError` rather than defaulting.
-Falling back to a hardcoded literal would mean a mistyped `klipper_macros` entry
-silently emits the built-in string, and the gcode would look right while
-addressing nothing.
