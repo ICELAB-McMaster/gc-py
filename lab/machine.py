@@ -179,7 +179,11 @@ class Machine:
         """
         self._require_homed("goto()")
         f = feedrate or self.deck.feedrate("travel")
-        self._move_z(self.deck.z_travel, f, op)
+        # Only lift if XY is actually going to move. Lifting unconditionally
+        # made a dispense followed by a mix in the SAME well climb to travel
+        # height and come straight back down for nothing.
+        if (abs(x - self.g.get_x()) > 1e-6 or abs(y - self.g.get_y()) > 1e-6):
+            self._move_z(self.deck.z_travel, f, op)
         self._route_xy(x, y, f, op, prefer=prefer)
 
     def goto_placement(self, placement: str, row: int, col: int,
@@ -193,91 +197,135 @@ class Machine:
     def _route_xy(self, x: float, y: float, feedrate: int, op: str,
                   labware: Optional[str] = None,
                   prefer: Optional[str] = None) -> None:
-        """Traverse to XY without ever moving Y inside a keep-out band.
+        """Traverse to XY on a path that is actually clear.
 
-        X-first is the default: it is what the tip box requires, and a pure X
-        move through a band is harmless because the band only forbids Y motion.
+        Two obstacle classes, and neither can be solved by travelling higher:
 
-        A destination labware can prefer "YX" instead. Both tube holders do:
-        their caps make Y motion across the holder difficult, so the effector
-        has to reach its Y while still clear in X and then come in along X.
+        * **Keep-out bands** forbid Y motion at certain X. A pure X move
+          through one is fine.
+        * **No-fly labware** forbids motion of either axis across it while a
+          tip is fitted. The tip rack is the case: its tips stand upright above
+          the rack body, and the fitted tip hangs below the nosecone, so
+          crossing it shears the tip off at any travel height.
 
-        Either way the keep-out rule wins, because it is a hard collision and
-        the preference is an ease-of-motion choice. X-first puts the Y leg at
-        the TARGET X; Y-first puts it at the CURRENT X. Whichever end is clear
-        of every band decides; if both are blocked, dogleg through a clear X.
+        Rather than reason about which single axis order survives, this builds
+        candidate routes - the preferred order, the other order, then doglegs
+        through a clear X - and takes the first one whose every leg is clear.
+        The preference is an ease-of-motion choice and always yields to an
+        obstacle, with a warning saying so.
         """
         cur_x, cur_y = self.g.get_x(), self.g.get_y()
         prefer = (prefer or "XY").upper()
         if prefer not in ("XY", "YX"):
             raise ProtocolError(f"prefer must be 'XY' or 'YX', got {prefer!r}")
 
+        if abs(y - cur_y) <= 1e-6 and abs(x - cur_x) <= 1e-6:
+            return
         if abs(y - cur_y) <= 1e-6:
-            self._move_xy(x, y, feedrate, op, labware, order="X")
-            return
-
-        dst_blocked = bool(self.deck.keepouts_hit_by_y_move(x))
-        src_blocked = bool(self.deck.keepouts_hit_by_y_move(cur_x))
-
-        # The preferred order first, if the band it would put the Y leg in is clear.
-        if prefer == "YX" and not src_blocked:
-            self._move_xy(x, y, feedrate, op, labware, order="YX")
-            return
-        if prefer == "XY" and not dst_blocked:
-            self._move_xy(x, y, feedrate, op, labware, order="XY")
-            return
-
-        if not dst_blocked:
-            self.sim.warn(
-                f"order_override:{op}",
-                f"{op}: {labware or 'this move'} prefers {prefer} but the current X "
-                f"{cur_x} is inside a keep-out band, so the Y leg was moved to the "
-                f"target X {x} instead.",
-            )
-            self._move_xy(x, y, feedrate, op, labware, order="XY")
-            return
-        if not src_blocked:
-            if prefer == "YX":
-                self._move_xy(x, y, feedrate, op, labware, order="YX")
+            legs = [((cur_x, cur_y), (x, y))]
+            if self._route_problem(legs) is None:
+                self._move_xy(x, y, feedrate, op, labware, order="X")
                 return
-            self.sim.warn(
-                f"order_override:{op}",
-                f"{op}: prefers XY but the target X {x} is inside a keep-out band, "
-                f"so the Y leg was done first at X {cur_x}.",
-            )
-            self._move_xy(x, y, feedrate, op, labware, order="YX")
-            return
+        if abs(x - cur_x) <= 1e-6:
+            legs = [((cur_x, cur_y), (x, y))]
+            if self._route_problem(legs) is None:
+                self._move_xy(x, y, feedrate, op, labware, order="Y")
+                return
 
-        via = self._nearest_clear_x(x)
-        if via is None:
-            raise ProtocolError(
-                f"cannot reach ({x}, {y}): both the current X {cur_x} and the "
-                f"target X {x} sit inside a keep-out band, and no clear X was "
-                f"found to dogleg through"
-            )
-        self.sim.warn(
-            f"dogleg:{round(via, 1)}",
-            f"routing Y motion via X {via} to stay out of the keep-out band "
-            f"(both {cur_x} and {x} are inside it)",
+        def as_legs(waypoints):
+            pts = [(cur_x, cur_y)] + waypoints
+            return [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+
+        xy = [(x, cur_y), (x, y)]
+        yx = [(cur_x, y), (x, y)]
+        candidates = [(prefer, xy if prefer == "XY" else yx),
+                      ("YX" if prefer == "XY" else "XY",
+                       yx if prefer == "XY" else xy)]
+        for via in self._dogleg_x_candidates(cur_x, x):
+            candidates.append((f"dogleg via X {via:g}",
+                               [(via, cur_y), (via, y), (x, y)]))
+        # A Y dogleg is the only way across a no-fly rect when both ends lie
+        # inside its Y span: leaving the box at X 8.9 and dispensing into a
+        # plate at Y 372 is exactly that case.
+        for via in self._dogleg_y_candidates(cur_y, y):
+            candidates.append((f"dogleg via Y {via:g}",
+                               [(cur_x, via), (x, via), (x, y)]))
+
+        first_problem = None
+        for label, waypoints in candidates:
+            problem = self._route_problem(as_legs(waypoints))
+            if problem is None:
+                if label not in (prefer,):
+                    self.sim.warn(
+                        f"route_override:{op}:{label}",
+                        f"{op}: {labware or 'this move'} prefers {prefer}, but "
+                        f"that path is blocked ({first_problem}). Routed "
+                        f"{label} instead.",
+                    )
+                prev = (cur_x, cur_y)
+                for wx, wy in waypoints:
+                    axis = "X" if abs(wx - prev[0]) > 1e-6 else "Y"
+                    self._move_xy(wx, wy, feedrate, op, labware, order=axis)
+                    prev = (wx, wy)
+                return
+            if first_problem is None:
+                first_problem = problem
+
+        raise ProtocolError(
+            f"cannot reach ({x}, {y}) from ({cur_x}, {cur_y}) on any route: "
+            f"{first_problem}. Every axis order and dogleg tried crosses an "
+            f"obstacle."
         )
-        self._move_xy(via, cur_y, feedrate, op, labware, order="X")
-        self._move_xy(via, y, feedrate, op, labware, order="Y")
-        self._move_xy(x, y, feedrate, op, labware, order="X")
 
-    def _nearest_clear_x(self, target: float, pad: float = 2.0) -> Optional[float]:
-        """Closest X to `target` that no keep-out band forbids Y motion at."""
-        best: Optional[float] = None
-        for k in self.deck.keepouts:
-            if k.forbids != "y_motion" or not k.contains_x(target):
+    def _route_problem(self, legs) -> Optional[str]:
+        """Why this leg sequence is unsafe, or None if it is clear."""
+        no_fly = self.deck.no_fly_rects() if self.tip_fitted else []
+        z = self.deck.z_travel
+        for frm, to in legs:
+            if not self.deck.x.contains(to[0]) or not self.deck.y.contains(to[1]):
+                return f"({to[0]}, {to[1]}) is outside the envelope"
+            for name, rect in no_fly:
+                if self.deck.segment_hits_rect(frm, to, rect):
+                    return (f"the leg {frm} -> {to} crosses {name}, which a "
+                            f"fitted tip must never pass over")
+            if abs(to[1] - frm[1]) > 1e-6:          # a Y leg
+                for k in self.deck.keepouts_hit_by_y_move(frm[0]):
+                    if self.tip_fitted or not k.z_is_safe(z):
+                        return (f"Y motion at X {frm[0]} is inside keep-out "
+                                f"band {k.id}")
+        return None
+
+    def _dogleg_y_candidates(self, cur_y: float, target_y: float) -> List[float]:
+        """Y values worth trying a dogleg through, nearest the target first."""
+        pad = 6.0
+        cands: List[float] = []
+        for _, (_, _, y0, y1) in self.deck.no_fly_rects():
+            cands += [y0 - pad, y1 + pad]
+        seen, out = set(), []
+        for c in sorted(cands, key=lambda v: abs(v - target_y)):
+            c = round(c, 4)
+            if c in seen or not self.deck.y.contains(c):
                 continue
-            for cand in (k.x_range[0] - pad, k.x_range[1] + pad):
-                if not self.deck.x.contains(cand):
-                    continue
-                if self.deck.keepouts_hit_by_y_move(cand):
-                    continue
-                if best is None or abs(cand - target) < abs(best - target):
-                    best = cand
-        return best
+            seen.add(c)
+            out.append(c)
+        return out
+
+    def _dogleg_x_candidates(self, cur_x: float, target_x: float) -> List[float]:
+        """X values worth trying a dogleg through, nearest the target first."""
+        pad = 6.0
+        cands = []
+        for _, (x0, x1, _, _) in self.deck.no_fly_rects():
+            cands += [x0 - pad, x1 + pad]
+        for k in self.deck.keepouts:
+            cands += [k.x_range[0] - pad, k.x_range[1] + pad]
+        seen, out = set(), []
+        for c in sorted(cands, key=lambda v: abs(v - target_x)):
+            c = round(c, 4)
+            if c in seen or not self.deck.x.contains(c):
+                continue
+            seen.add(c)
+            out.append(c)
+        return out
 
     def goto_station(self, name: str, op: Optional[str] = None) -> None:
         st = self.deck.station(name)
@@ -747,7 +795,10 @@ class Machine:
 
         self.goto(x, y, op="mix", prefer=p.labware.approach_order)
         self.wait()
-        self.actuator(eff.blowout_pos, settle=0.5, op="mix")  # bottomed, in air
+        if self.pos is None or abs(self.pos - eff.blowout_pos) > 1e-9:
+            # Start bottomed. Skipped when a preceding full dispense already
+            # left it there, which is the common dispense-then-mix case.
+            self.actuator(eff.blowout_pos, settle=0.5, op="mix")
         self._move_z(z, f, "mix", labware=lid)
         self.wait()
         for _ in range(cycles):
@@ -760,8 +811,16 @@ class Machine:
         self.toggles["mix_volume_uL"] = volume_uL
 
     def dispense(self, placement: str, row: int, col: int,
-                 wall_wipe: Optional[bool] = None) -> Dict[str, Any]:
-        """Full dispense to blow-out, then optionally wipe the droplet off."""
+                 wall_wipe: Optional[bool] = None,
+                 retract: bool = True) -> Dict[str, Any]:
+        """Full dispense to blow-out, then optionally wipe the droplet off.
+
+        `retract=False` leaves the tip at the working depth instead of lifting
+        to travel height. Use it only when the very next operation is in the
+        SAME well - a mix, typically - where lifting and descending again is
+        pure wasted motion. It stays safe either way: goto() lifts to travel
+        before any XY move, so the tip cannot be dragged sideways while down.
+        """
         eff = self._pipette()
         if self.fluid_uL <= 1e-9:
             raise ProtocolError(
@@ -792,7 +851,8 @@ class Machine:
 
         if do_wipe:
             self._wall_wipe(p, x, y)
-        self._move_z(self.deck.z_travel, f, "dispense", labware=lid)
+        if retract:
+            self._move_z(self.deck.z_travel, f, "dispense", labware=lid)
         self.wait()
 
         asp_record = self._last_aspirate or {}

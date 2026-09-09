@@ -88,7 +88,9 @@
       "uncalibrated": [
         "grid.a1_corner",
         "consume_order.exit_edge"
-      ]
+      ],
+      "avoid_traverse": true,
+      "avoid_traverse_note": "NEVER route a traverse across this rack while a tip is fitted. The tips stand upright well above the rack body and the fitted tip hangs below the nosecone, so crossing shears it off at any travel height - it is not a Z problem you can solve by flying higher. Machine._route_xy routes around it and Simulator fails any move that crosses it. Observed on hardware 2026-09-08: the water station at X 70 sits underneath this rack in X, so every unrouted approach to water from high Y went straight through it."
     },
     "sbs_96_wellplate": {
       "display_name": "Standard SBS 96-well plate",

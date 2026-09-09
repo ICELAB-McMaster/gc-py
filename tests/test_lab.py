@@ -343,10 +343,21 @@ def test_xy_traverse_must_be_at_travel_height():
 
 
 def test_envelope():
+    """Off-envelope is refused by the router before anything is emitted.
+
+    It used to be emitted and then caught by the simulator. Refusing up front
+    is better - nothing enters the buffer - but it means the exception is a
+    ProtocolError from the router rather than a SimulationError. Both are
+    LabError, which is what a protocol catches.
+    """
+    from lab.effector import LabError
     m = _machine()
     m.startup()
-    raises(SimulationError, lambda: m.goto(500.0, 100.0),
+    n = m.g.line_count()
+    raises(LabError, lambda: m.goto(500.0, 100.0),
            "X 500 is outside the 0-420 envelope and should be blocked")
+    check(m.g.line_count() == n,
+          f"the refused move emitted {m.g.line_count() - n} gcode line(s)")
 
 
 def test_tip_exit_path_over_occupied_positions():
@@ -743,6 +754,107 @@ def test_plates_resolve_in_slots_1_and_2():
           f"plate2's banded columns should be [10, 11], got {inband}")
 
 
+def test_a_tipped_traverse_never_crosses_the_tip_rack():
+    """The tips stand above the rack; a fitted tip shears on them.
+
+    Not a Z problem - the fitted tip hangs below the nosecone, so travelling
+    higher does not help. Observed on hardware 2026-09-08: the water station
+    at X 70 sits underneath the rack in X, so every unrouted approach to water
+    from high Y went straight through it.
+    """
+    import accuracy_test  # noqa: F401  (keeps the protocols path warm)
+    import importlib
+    import centrifuge_test
+    importlib.reload(centrifuge_test)
+
+    with _WithConfig(_p300_with_z()):
+        with tempfile.TemporaryDirectory() as td:
+            m, _ = centrifuge_test.build(layout=TEST_LAYOUT, outdir=td,
+                                         plot=False)
+
+    d = m.deck
+    rects = d.no_fly_rects()
+    check(rects, "the tip rack should be a no-fly zone")
+    names = [n for n, _ in rects]
+    check(names == ["tips"], f"only the tip rack should be no-fly, got {names}")
+
+    bad = [
+        (s.i, s.op, s.axes, s.frm[:2], s.to[:2])
+        for s in m.steps
+        if s.kind == "move" and s.axes in ("X", "Y") and s.tip
+        and s.op != "get_tip"
+        for _, rect in rects
+        if d.segment_hits_rect(s.frm[:2], s.to[:2], rect)
+    ]
+    check(not bad, f"{len(bad)} tipped leg(s) cross the tip rack: {bad[:3]}")
+
+
+def test_leaving_the_tip_box_goes_toward_x_zero_then_y():
+    """Exit in X clear of the box, and only then move Y."""
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    box = m.deck.no_fly_rects()[0][1]
+    exit_legs = [s for s in m.steps
+                 if s.op == "get_tip" and s.kind == "move" and s.tip
+                 and s.axes in ("X", "Y")]
+    check(exit_legs, "the pickup should be followed by an exit move")
+    first = exit_legs[0]
+    check(first.axes == "X" and first.to[0] < first.frm[0],
+          f"the exit must move X toward 0, got {first.axes} "
+          f"{first.frm[:2]} -> {first.to[:2]}")
+    check(first.to[0] < box[0],
+          f"the exit must clear the box's low-X edge {box[0]}, "
+          f"stopped at {first.to[0]}")
+
+    # The next leg must be the Y move, taken at that cleared X.
+    n = len(m.steps)
+    m.goto(70.0, 175.0, op="probe")
+    legs = [s for s in m.steps[n:] if s.kind == "move" and s.axes in ("X", "Y")]
+    check(legs and legs[0].axes == "Y",
+          f"the move off the box should start with Y, got "
+          f"{[s.axes for s in legs]}")
+    check(legs[0].frm[0] < box[0],
+          f"that Y leg must happen clear of the box, at X {legs[0].frm[0]}")
+
+
+def test_hand_rolled_move_over_the_tip_rack_is_refused():
+    """The router avoids it; the simulator must also catch a bypass.
+
+    Straight after a pickup the effector sits clear of the box in X but still
+    inside its Y span, so a bare X move across is the exact mistake.
+    """
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    box = m.deck.no_fly_rects()[0][1]
+    here = m.xyz()
+    check(here[0] < box[0] and box[2] <= here[1] <= box[3],
+          f"expected to be clear in X and inside the box in Y, at {here[:2]}")
+
+    raises(SimulationError,
+           lambda: m._move_xy(box[1] + 20.0, here[1], 6000, "probe", order="X"),
+           "an X leg straight across the tip rack with a tip on should fail")
+
+
+def test_router_doglegs_in_y_to_cross_the_tip_rack():
+    """Both ends inside the box's Y span: only a Y dogleg gets there."""
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    box = m.deck.no_fly_rects()[0][1]
+    n = len(m.steps)
+    # plate1 D6 sits at Y 372, inside the box's Y span, on the far side in X.
+    m.goto_placement("plate1", 3, 5, op="probe")
+    legs = [s for s in m.steps[n:] if s.kind == "move" and s.axes in ("X", "Y")]
+    check(len(legs) == 3, f"expected a 3-leg dogleg, got {[s.axes for s in legs]}")
+    crossing = [(s.axes, s.frm[:2], s.to[:2]) for s in legs
+                if m.deck.segment_hits_rect(s.frm[:2], s.to[:2], box)]
+    check(not crossing, f"no leg may cross the box, these do: {crossing}")
+    check(any("dogleg via Y" in w for w in m.sim.report.warnings),
+          f"the Y dogleg should be recorded: {m.sim.report.warnings}")
+
+
 def test_a_null_commanded_depth_refuses_rather_than_guessing():
     """A null COMMANDED depth must stop the run; a null crash LIMIT must warn.
 
@@ -879,9 +991,13 @@ def test_mix_cycles_at_the_mix_depth():
         e = eff_mod.load("p300")
         top = round(e.blowout_pos - e.displacement_mm(200.0), e.decimals)
         acts = [s.pos_after for s in m.steps[n:] if s.kind == "actuator"]
-        # one priming blowout, then a draw/push pair per cycle
-        check(acts == [e.blowout_pos] + [top, e.blowout_pos] * 5,
-              f"expected a prime then 5 draw/push pairs, got {acts}")
+        # Five draw/push pairs. The priming blowout only appears when the
+        # plunger is not already bottomed - here startup() left it there, and
+        # emitting a move to where it already is would be noise.
+        check(acts == [top, e.blowout_pos] * 5,
+              f"expected 5 draw/push pairs, got {acts}")
+        check(m.pos == e.blowout_pos,
+              f"a mix must end bottomed, got {m.pos}")
         check(m.fluid_uL == 0.0,
               f"a mix must not leave fluid held, got {m.fluid_uL}")
 
@@ -1001,8 +1117,9 @@ def test_dogleg_when_both_ends_are_in_the_band():
     check(not offenders,
           f"the dogleg still moved Y inside the band: "
           f"{[(s.axes, s.frm) for s in offenders]}")
-    check(any("stay out of the keep-out band" in w for w in m.sim.report.warnings),
-          "the dogleg should be recorded as a warning")
+    check(any("Routed dogleg" in w for w in m.sim.report.warnings),
+          f"the dogleg should be recorded as a warning, got "
+          f"{m.sim.report.warnings}")
 
 
 def test_full_protocol_and_manifest():

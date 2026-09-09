@@ -260,6 +260,21 @@ class Simulator:
                     f"crash mode that costs a tip.",
                 )
 
+        # No-fly labware: a tip rack's tips stand above its body and the
+        # fitted tip hangs below the nosecone, so crossing one shears the tip
+        # at ANY travel height. Travelling higher does not help, which is why
+        # this is a hard failure rather than a Z comparison.
+        if step.moves_xy and step.tip and step.op != "get_tip":
+            for name, rect in self.deck.no_fly_rects():
+                if self.deck.segment_hits_rect(step.frm[:2], step.to[:2], rect):
+                    self.fail(
+                        step,
+                        f"the path from {step.frm[:2]} to {step.to[:2]} crosses "
+                        f"{name} with a tip fitted. A fitted tip must never "
+                        f"pass over a tip rack - it shears off. Route around "
+                        f"it; Machine._route_xy does this automatically.",
+                    )
+
         # Keep-out bands forbid Y motion unless the effector is high enough.
         if step.moves_y:
             for k in self.deck.keepouts_hit_by_y_move(step.frm[0]):

@@ -179,12 +179,14 @@ def build(
         m.aspirate_uL(plate_dose_uL)
         m.dispense(pname, *well_a)
 
-    # stage 3: build the stock in the tube, which already holds the preload
+    # stage 3: build the stock in the tube, which already holds the preload.
+    # retract=False keeps the tip in the tube, because stage 4 mixes in the
+    # same well - lifting to travel and descending again would be for nothing.
     m.log_temps("stock_to_tube")
     m.aspirate_uL(stock_uL)
-    m.dispense(tube, *tube_well)
+    m.dispense(tube, *tube_well, retract=False)
 
-    # stage 4: homogenise it at the bottom, not the surface
+    # stage 4: homogenise it deep in the tube, not at the surface
     m.log_temps("mix")
     m.mix(tube, *tube_well, cycles=mix_cycles, volume_uL=mix_volume_uL)
 

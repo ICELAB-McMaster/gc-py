@@ -242,6 +242,44 @@ class Deck:
             bad.append(f"Z {z} outside [{self.z.min}, {self.z.max}]")
         return bad
 
+    def no_fly_rects(self) -> List[Tuple[str, Tuple[float, float, float, float]]]:
+        """Placements a traverse must never cross while a tip is fitted.
+
+        A tip rack is the case this exists for: the tips stand upright well
+        above the rack body, so flying over one with a tip fitted shears it
+        off. That is not a Z problem you can solve by travelling higher - the
+        fitted tip hangs below the nosecone - so it has to be routed around.
+
+        The rectangle is the measured footprint when there is one, otherwise
+        the outermost well centres expanded by half the grid pitch, which
+        approximates the rack body. Returns [(placement name, bounds)].
+        """
+        out: List[Tuple[str, Tuple[float, float, float, float]]] = []
+        for name, p in self.placements.items():
+            if not p.labware.spec.get("avoid_traverse"):
+                continue
+            box = p.footprint_bounds()
+            if box is None:
+                x0, x1, y0, y1 = p.well_bounds()
+                hx = abs(p.col_vec[0]) / 2.0 or 0.0
+                hy = abs(p.row_vec[1]) / 2.0 or 0.0
+                box = (x0 - hx, x1 + hx, y0 - hy, y1 + hy)
+            out.append((name, box))
+        return out
+
+    @staticmethod
+    def segment_hits_rect(frm: Vec2, to: Vec2,
+                          rect: Tuple[float, float, float, float]) -> bool:
+        """Does an axis-aligned move from frm to to sweep through rect?
+
+        Machine._move_xy emits one axis per step, so the swept region is the
+        axis-aligned box between the two points.
+        """
+        sx0, sx1 = sorted((frm[0], to[0]))
+        sy0, sy1 = sorted((frm[1], to[1]))
+        x0, x1, y0, y1 = rect
+        return not (sx1 < x0 or sx0 > x1 or sy1 < y0 or sy0 > y1)
+
     def keepouts_hit_by_y_move(self, x: float) -> List[KeepOut]:
         """Keep-out bands that a Y move at this X would enter."""
         return [k for k in self.keepouts if k.forbids == "y_motion" and k.contains_x(x)]
