@@ -84,16 +84,29 @@ result = m.finalize(outdir="out")        # simulates, THEN writes
 `finalize()` runs the whole-run checks and refuses to write the `.gcode` if any
 hard check fails, so a failed run leaves nothing behind to execute by accident.
 
-## The three per-labware depths
+## The per-labware depths
 
-Every effector records up to three commanded Z values per labware, shallowest
+Every effector records up to four commanded Z values per labware, shallowest
 first. They are separate numbers on purpose:
 
 | key | meaning | p300 + 300 uL tip |
 |---|---|---|
-| `work` | dispense and aspirate depth | plate 53.5, 1.5 mL tube 35.0 |
-| `mix` | where `Machine.mix` cycles the plunger | 1.5 mL tube 45.0 |
+| `work` | the dispense depth, and the draw depth when `aspirate` is absent | plate 53.5, 1.5 mL tube 35.0, water 40.0 |
+| `aspirate` | where a draw descends to. Optional; outranks `work` for `aspirate_uL` / `aspirate_from` | 1.5 mL tube 54.0 |
+| `mix` | where `Machine.mix` cycles the plunger | 1.5 mL tube 54.0 |
 | `bottom` | the well floor. A LIMIT, never a target | plate 60.8 |
+
+A dispense wants to be *above* the liquid; a draw wants the orifice *under* it,
+and the further the level falls the deeper that has to be. In the 1.5 mL tube
+those are 19 mm apart, which is why one `work` could not serve both. The key is
+opt-in: labware with a single sensible depth, like the water reservoir, declares
+no `aspirate` and a draw uses `work`.
+
+**A declared-but-null `aspirate` refuses the run.** Absent means "this labware
+never needed the distinction"; present-and-null means "it does, and nobody has
+measured it" - and falling back to `work` there would silently draw 19 mm
+shallower than intended. `_aspirate_at` selects the key on *presence*, then
+`Effector.z_for` raises on the null.
 
 Aiming a mix at `bottom` would drive the tip into the floor, which is why it is
 not the mix key.
@@ -1964,6 +1977,8 @@ Shared preconditions for anything that draws liquid: the effector is a pipette; 
 #### `_aspirate_at(x, y, labware_id, volume_uL, op="aspirate", prefer=None, z_key="work")` *(private)*
 
 The aspiration sequence itself, shared by both public forms. Returns the aspirate POS.
+
+**The depth first.** When the effector's entry for this labware contains an `aspirate` key, `z_key` switches from `"work"` to `"aspirate"` - selected on the key being *present*, so a null one refuses at `z_for` rather than falling back to the shallower dispense depth. An explicit `z_key` argument overrides both, which is how `mix` reaches its own depth. See **The per-labware depths**.
 
 Every ordering guarantee lives here, which is why the station and well forms delegate instead of each repeating it:
 
