@@ -53,7 +53,7 @@ lab/
 
 protocols/
   accuracy_test.py          ISO 8655 accuracy/repeatability, any pipette
-  centrifuge_test.py        two plates loaded to equal mass for a centrifuge
+  centrifuge_test.py        two plates, one source each, to equal mass
 ```
 
 Data flows one way: `config` -> `labware`/`effector` -> `deck` -> `machine`,
@@ -1905,9 +1905,9 @@ The shipped value is `"unconfirmed"`. In that case it assumes the low-X edge (co
 
 #### `_exit_tip_box(p, row, col, edge)` *(private)*
 
-Records a note-kind `Step` listing the positions the X exit will cross, hands it to `Simulator.check_tip_exit` (which fails on any crossed position not already consumed), then moves X one full column pitch beyond the outermost well centre - clamped into the envelope - and waits.
+Records a note-kind `Step` listing the positions the X exit will cross, hands it to `Simulator.check_tip_exit` (which fails on any crossed position not already consumed), then moves X one full column pitch **plus the labware's `consume_order.exit_clearance_mm`** beyond the outermost well centre - clamped into the envelope - and waits. A negative clearance raises `ProtocolError`, since it would steer the exit back into the rack.
 
-One pitch beyond the outermost centre clears every tip *position* (the nearest is a full pitch away) without needing the rack's physical outline, which is not measured. With `col_pitch` 9.0909 mm and the box spanning X 18-118, the low-X target is 8.909.
+One pitch beyond the outermost centre clears every tip *position*, the nearest being a full pitch away, without needing the rack's physical outline, which is not measured. But a centre-to-centre gap is not a wall-to-wall gap: the fitted tip and the standing tips are each several mm wide, so one pitch left only 4.55 mm between X 8.909 and the rack body's low-X edge at 13.45. `exit_clearance_mm` is 2.0 on `tiprack_300_96` as of 2026-09-10, putting the low-X target at **6.909** and the gap at 6.55 mm. The number lives in `labware.json`, not here, so widening it is a config edit; `test_leaving_the_tip_box_goes_toward_x_zero_then_y` recomputes the target from `col_vec` and that field rather than pinning the literal.
 
 **Why it is not redundant with the following `goto`:** it guarantees the effector is out of the box *before* `_route_xy` makes any decision that could put Y first. `test_lab.py::test_leaving_the_tip_box_goes_toward_x_zero_then_y` asserts the first tipped leg is an X move that ends below the box's low-X edge, and that the next `goto` then starts with Y at that cleared X.
 
