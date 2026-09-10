@@ -807,6 +807,22 @@ def test_leaving_the_tip_box_goes_toward_x_zero_then_y():
           f"the exit must clear the box's low-X edge {box[0]}, "
           f"stopped at {first.to[0]}")
 
+    # The stopping point is one column pitch past the outermost well centre
+    # plus the labware's own exit_clearance_mm - derived here from the same
+    # config fields, so this test cannot drift from the number in use.
+    p = m.deck.placement("tips")
+    pitch = abs(p.col_vec[0])
+    extra = p.labware.spec["consume_order"]["exit_clearance_mm"]
+    want = min(p.col_x_values()) - pitch - extra
+    check(abs(first.to[0] - want) < 1e-4,
+          f"the exit should stop at X {want:.4f} (pitch {pitch:.4f} + "
+          f"{extra} mm extra), got {first.to[0]}")
+    check(extra > 0.0,
+          f"exit_clearance_mm should buy real margin, got {extra}")
+    check(box[0] - first.to[0] > pitch / 2.0,
+          f"the exit clears the rack body by only "
+          f"{box[0] - first.to[0]:.2f} mm")
+
     # The next leg must be the Y move, taken at that cleared X.
     n = len(m.steps)
     m.goto(70.0, 175.0, op="probe")
@@ -1072,6 +1088,76 @@ def test_centrifuge_protocol_balances_the_plates():
         homes = [s for s in m.steps if s.kind == "home"]
         check(any(s.detail.get("reason") == "post-ejection" for s in homes),
               "the ejection must be followed by a G28, which returns home")
+
+
+def test_centrifuge_protocol_gives_each_plate_one_source():
+    """plate1 from water only, plate2 from the tube only.
+
+    Both plates still finish at 200 uL, so the mass-balance test passes
+    either way - which is exactly why the source needs its own assertion.
+    The source is read off the aspirate that fed each dispense: an aspirate
+    at the water station is a water dose, one at the tube's own coordinates
+    is a stock dose.
+    """
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 40.0})):
+        import importlib
+        import centrifuge_test
+        importlib.reload(centrifuge_test)
+        with tempfile.TemporaryDirectory() as td:
+            m, _ = centrifuge_test.build(layout=TEST_LAYOUT, outdir=td,
+                                         plot=False)
+
+        water_xy = m.deck.station("water").xy
+        tube_xy = m.deck.placement("big_tubes").xy(0, 0)
+
+        # Walk the steps in order; each dispense is fed by the most recent
+        # aspirate, and where that aspirate happened names the source.
+        source, sources = None, {}
+        for s in m.steps:
+            if s.op in ("aspirate", "aspirate_from") and s.kind == "move" \
+                    and s.to is not None:
+                at = (round(s.to[0], 1), round(s.to[1], 1))
+                if at == (round(water_xy[0], 1), round(water_xy[1], 1)):
+                    source = "water"
+                elif at == (round(tube_xy[0], 1), round(tube_xy[1], 1)):
+                    source = "stock"
+            elif s.op == "dispense" and s.labware == "sbs_96_wellplate":
+                p = next(d["placement"] for d in m.dispenses
+                         if abs(d["x"] - s.to[0]) < 1e-6
+                         and abs(d["y"] - s.to[1]) < 1e-6)
+                sources.setdefault(p, set()).add(source)
+
+        check(sources.get("plate1") == {"water"},
+              f"plate1 should be water only, got {sources.get('plate1')}")
+        check(sources.get("plate2") == {"stock"},
+              f"plate2 should be tube stock only, got {sources.get('plate2')}")
+        check(m.toggles["water_plate"] == "plate1"
+              and m.toggles["stock_plate"] == "plate2",
+              f"the manifest must name which plate got which source, got "
+              f"{m.toggles.get('water_plate')} / "
+              f"{m.toggles.get('stock_plate')}")
+
+        # Still a valid centrifuge pair.
+        per_plate = {}
+        for d in m.dispenses:
+            per_plate.setdefault(d["placement"], []).append(
+                d["target_volume_uL"])
+        check(sum(per_plate["plate1"]) == sum(per_plate["plate2"]) == 200.0,
+              f"both plates must still finish at 200 uL, got {per_plate}")
+
+
+def test_centrifuge_protocol_refuses_one_plate_for_both_sources():
+    """Naming the same plate twice is the old two-source behaviour."""
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 40.0})):
+        import importlib
+        import centrifuge_test
+        importlib.reload(centrifuge_test)
+        with tempfile.TemporaryDirectory() as td:
+            raises(ProtocolError,
+                   lambda: centrifuge_test.build(
+                       water_plate="plate1", stock_plate="plate1",
+                       layout=TEST_LAYOUT, outdir=td, plot=False),
+                   "one plate for both sources should raise")
 
 
 def test_centrifuge_protocol_checks_its_own_arithmetic():
