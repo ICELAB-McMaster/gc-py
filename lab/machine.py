@@ -535,19 +535,33 @@ class Machine:
         return "low_x", lo_col
 
     def _exit_tip_box(self, p: Placement, row: int, col: int, edge: str) -> None:
-        # One column pitch beyond the outermost well centre. That clears every
-        # tip POSITION (the nearest is a full pitch away) without demanding the
-        # rack's physical outline be known, which it is not. This move is not
-        # redundant with the next goto: it guarantees the effector is out of the
-        # box before _route_xy makes any decision that could put Y first.
+        # One column pitch beyond the outermost well centre, plus whatever
+        # extra the labware asks for. The pitch alone clears the neighbouring
+        # tip POSITION without demanding the rack's physical outline be known,
+        # which it is not - but a centre-to-centre gap is not a wall-to-wall
+        # gap, so consume_order.exit_clearance_mm buys real margin on top and
+        # keeps the number in config where it can be measured and changed.
+        # This move is not redundant with the next goto either: it guarantees
+        # the effector is out of the box before _route_xy makes any decision
+        # that could put Y first.
         xs = p.col_x_values()
         pitch = abs(p.col_vec[0]) or 9.0
+        extra = float(
+            (p.labware.spec.get("consume_order") or {}).get(
+                "exit_clearance_mm") or 0.0
+        )
+        if extra < 0.0:
+            raise ProtocolError(
+                f"{p.labware.id}: consume_order.exit_clearance_mm is {extra}, "
+                f"which would steer the exit back INTO the rack. It is extra "
+                f"clearance away from the box, so it cannot be negative."
+            )
         if edge == "low_x":
             crossed = [(row, c) for c in range(len(xs)) if xs[c] < xs[col]]
-            target_x = min(xs) - pitch
+            target_x = min(xs) - pitch - extra
         else:
             crossed = [(row, c) for c in range(len(xs)) if xs[c] > xs[col]]
-            target_x = max(xs) + pitch
+            target_x = max(xs) + pitch + extra
 
         frm = self.xyz()
         step = Step(i=self._n, op="get_tip", kind="note", frm=frm, to=frm,
