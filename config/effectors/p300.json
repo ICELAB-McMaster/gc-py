@@ -74,10 +74,11 @@
     },
     "tube_rack_1p5": {
       "work": 35.0,
-      "mix": 45.0,
+      "mix": 54.0,
       "bottom": null,
       "uncalibrated": true,
-      "note": "Measured 2026-09-08 with a 300 uL tip fitted. 'work' 35.0 is the dispense and aspirate depth, 'mix' 45.0 is where Machine.mix cycles - 10 mm deeper, so a mix reaches under the liquid it is stirring rather than skimming the surface. 'bottom', the tube floor, is still UNMEASURED; that one only warns, because a crash LIMIT being unknown is not the same as a commanded depth being unknown."
+      "note": "Measured with a 300 uL tip fitted; 'work' 35.0 on 2026-09-08, 'mix' 54.0 on 2026-09-10. 'work' is the dispense and aspirate depth, 'mix' is where Machine.mix cycles - 19 mm deeper, so a mix reaches well under the liquid it is stirring rather than skimming the surface. 'bottom', the tube floor, is still UNMEASURED; that one only warns, because a crash LIMIT being unknown is not the same as a commanded depth being unknown. NOTE 54.0 is 1 mm past the Z 53.0 raised-edge limit, which is legal only because a mix never leaves the location it is in - see mix_edge_note.",
+      "mix_edge_note": "The raised location edges bind at commanded Z 53.0 with a 300 uL tip, and this mix is deeper than that. It is legal because Simulator._check_raised_edges applies the limit to motion CROSSING a location boundary, not to depth as such, and a mix is XY-stationary inside slot 5. The consequence to respect: at this depth the effector must not be moved in XY at all until it has lifted back to travel height, and Machine.mix is what guarantees that. Was 45.0 until 2026-09-10."
     }
   },
   "feedrates": {
