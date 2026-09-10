@@ -1066,13 +1066,13 @@ def test_centrifuge_protocol_balances_the_plates():
             m, _ = centrifuge_test.build(layout=TEST_LAYOUT, outdir=td,
                                          plot=False)
 
+        dose = centrifuge_test.PLATE_DOSE_uL
         per_plate = {}
         for d in m.dispenses:
             per_plate.setdefault(d["placement"], []).append(d["target_volume_uL"])
-        check(per_plate.get("plate1") == [100.0, 100.0],
-              f"plate1 should get 2x100 uL, got {per_plate.get('plate1')}")
-        check(per_plate.get("plate2") == [100.0, 100.0],
-              f"plate2 should get 2x100 uL, got {per_plate.get('plate2')}")
+        for pname in ("plate1", "plate2"):
+            check(per_plate.get(pname) == [dose, dose],
+                  f"{pname} should get 2x{dose:g} uL, got {per_plate.get(pname)}")
         check(sum(per_plate["plate1"]) == sum(per_plate["plate2"]),
               "the two plates must receive equal mass - that is the whole point")
 
@@ -1081,8 +1081,13 @@ def test_centrifuge_protocol_balances_the_plates():
                  for d in m.dispenses}
         check(wells["plate1"] == wells["plate2"] == ["D6", "E7"],
               f"both plates should use D6 and E7, got {wells}")
-        check(m.toggles["tube_contents_at_end_uL"] == 100.0,
-              "the tube should finish with 100 uL")
+        left = (centrifuge_test.TUBE_PRELOAD_uL + centrifuge_test.STOCK_uL
+                - 2 * dose)
+        check(m.toggles["tube_contents_at_end_uL"] == left,
+              f"the tube should finish with {left:g} uL, got "
+              f"{m.toggles['tube_contents_at_end_uL']}")
+        check(left > 0.0,
+              f"the design must leave liquid in the tube, got {left:g} uL")
         check(m.toggles["eject_tip"], "the tip should be ejected by default")
         check(not m.tip_fitted, "the run should end with no tip fitted")
         homes = [s for s in m.steps if s.kind == "home"]
@@ -1142,8 +1147,9 @@ def test_centrifuge_protocol_gives_each_plate_one_source():
         for d in m.dispenses:
             per_plate.setdefault(d["placement"], []).append(
                 d["target_volume_uL"])
-        check(sum(per_plate["plate1"]) == sum(per_plate["plate2"]) == 200.0,
-              f"both plates must still finish at 200 uL, got {per_plate}")
+        want = 2 * centrifuge_test.PLATE_DOSE_uL
+        check(sum(per_plate["plate1"]) == sum(per_plate["plate2"]) == want,
+              f"both plates must still finish at {want:g} uL, got {per_plate}")
 
 
 def test_centrifuge_protocol_refuses_one_plate_for_both_sources():
@@ -1172,6 +1178,20 @@ def test_centrifuge_protocol_checks_its_own_arithmetic():
                        tube_preload_uL=0.0, stock_uL=100.0,
                        layout=TEST_LAYOUT, outdir=td, plot=False),
                    "withdrawing more than the tube holds should raise")
+            # Exactly empty is refused too: the final aspiration would have
+            # nothing above the tip and would draw air, and that dose lands
+            # light with nothing in the run able to notice.
+            raises(ProtocolError,
+                   lambda: centrifuge_test.build(
+                       tube_preload_uL=0.0, stock_uL=2 * 150.0,
+                       plate_dose_uL=150.0,
+                       layout=TEST_LAYOUT, outdir=td, plot=False),
+                   "draining the tube to exactly zero should raise")
+            # One microlitre of headroom is enough to be a real design.
+            centrifuge_test.build(
+                tube_preload_uL=1.0, stock_uL=2 * 150.0,
+                plate_dose_uL=150.0,
+                layout=TEST_LAYOUT, outdir=td, plot=False)
             raises(ProtocolError,
                    lambda: centrifuge_test.build(
                        well_a=(3, 5), well_b=(3, 5), layout=TEST_LAYOUT,

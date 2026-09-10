@@ -14,16 +14,22 @@ script's responsibility and the preload is recorded in the manifest.
 Sequence, with the tube contents tracked:
 
     stage  action                                    volume   tube after
-      1    water        -> plate 1, well A            100 uL      50
-      2    water        -> plate 1, well B            100 uL      50
-      3    water        -> 1.5 mL tube                250 uL     300
-      4    mix at the tube BOTTOM, 5 cycles           200 uL     300
-      5    1.5 mL tube  -> plate 2, well A            100 uL     200
-      6    1.5 mL tube  -> plate 2, well B            100 uL     100
+      1    water        -> plate 1, well A            150 uL      50
+      2    water        -> plate 1, well B            150 uL      50
+      3    water        -> 1.5 mL tube                300 uL     350
+      4    mix at the tube BOTTOM, 5 cycles           200 uL     350
+      5    1.5 mL tube  -> plate 2, well A            150 uL     200
+      6    1.5 mL tube  -> plate 2, well B            150 uL      50
 
-Both plates finish with two wells of 100 uL, so 200 uL each: equal mass from
+Both plates finish with two wells of 150 uL, so 300 uL each: equal mass from
 different liquids, which is what makes them a valid centrifuge pair while
 leaving each plate a single-source sample.
+
+The tube RECEIVES 300 uL at stage 3, so with the 50 uL preload it holds 350
+before mixing and 50 after both doses are drawn. That residual is deliberate:
+the last dose cannot be drawn off a tube that the arithmetic empties exactly,
+because the tip would take air with it, so build() refuses a design that
+leaves nothing behind.
 
 One source per plate also means the water doses and the stock doses never
 interleave. Each source is visited in one consecutive run of stages, so the
@@ -63,8 +69,8 @@ from lab.machine import Machine, ProtocolError
 WELL_A = (3, 5)          # D6
 WELL_B = (4, 6)          # E7
 
-PLATE_DOSE_uL = 100.0    # into each well, four times total
-STOCK_uL = 250.0         # water added to the 1.5 mL tube
+PLATE_DOSE_uL = 150.0    # into each well, four times total
+STOCK_uL = 300.0         # water ADDED to the 1.5 mL tube, on top of the preload
 TUBE_PRELOAD_uL = 50.0   # already in the tube, put there by hand
 TUBE_WELL = (0, 0)       # which position in the 1.5 mL holder
 
@@ -138,12 +144,20 @@ def build(
     # dose per well of one plate rather than one dose per plate.
     withdrawn = plate_dose_uL * len(wells)
     available = tube_preload_uL + stock_uL
-    if withdrawn > available:
+    if withdrawn >= available:
+        # >= not >: a design that drains the tube to exactly zero looks like
+        # it closes, but the final aspiration would be drawing from a tube
+        # with nothing left above the tip, so it takes air and that dose
+        # lands light. There is no inventory anywhere to catch it at run
+        # time, and the balance reading would look merely disappointing
+        # rather than wrong.
         raise ProtocolError(
             f"the tube would hold {available} uL "
             f"({tube_preload_uL} preloaded + {stock_uL} added) but this protocol "
-            f"withdraws {withdrawn} uL from it. Raise the preload or the stock, "
-            f"or lower the dose."
+            f"withdraws {withdrawn} uL from it, leaving "
+            f"{available - withdrawn} uL. The last dose needs liquid above the "
+            f"tip, so some must remain. Raise the preload or the stock, or "
+            f"lower the dose."
         )
     if mix_volume_uL > available:
         raise ProtocolError(
