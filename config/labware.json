@@ -77,6 +77,8 @@
       "consume_order": {
         "policy": "column_nearest_exit_first",
         "exit_edge": "unconfirmed",
+        "exit_clearance_mm": 2.0,
+        "exit_clearance_note": "EXTRA X clearance beyond the one-pitch exit, added 2026-09-10 at the operator's request. The exit stops one column pitch (9.09 mm) past the outermost well centre, which clears the neighbouring tip POSITION but leaves only 4.55 mm to the rack body's low-X edge - and the fitted tip and the standing tips are each several mm wide, so the gap between their walls is much less than the gap between their centres. This widens it to 6.55 mm. Increase it here rather than in lab/machine.py.",
         "exit_edge_note": "After pickup the effector CANNOT pass over occupied tip positions - it shears the tip off. The first move after pickup must be in X. The X exit crosses every position between the picked column and the box edge, so columns must be consumed starting nearest the exit edge. The box spans X 18-118; whether the exit is toward X 18 or X 118 is UNCONFIRMED.",
         "policy_note": "Implemented by Machine._next_free_tip_col: the first unused column working inward from exit_edge."
       },
