@@ -886,21 +886,36 @@ def test_a_null_commanded_depth_refuses_rather_than_guessing():
     null_commanded = [
         (lid, key)
         for lid, entry in e.spec["z_for_labware"].items()
-        for key in ("work", "mix")
+        for key in ("work", "aspirate", "mix")
         if key in entry and entry[key] is None
     ]
     check(not null_commanded,
           f"these commanded depths are still null and would block a run: "
           f"{null_commanded}")
 
-    # The refusal still works: blank one out and it stops the run.
-    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": None})):
+    # The refusal still works: blank one out and it stops the run. It has to
+    # be the key the draw actually uses - 'aspirate' outranks 'work' now, so
+    # nulling 'work' alone would leave a perfectly good depth in place.
+    with _WithConfig(_p300_with_z(
+            tube_rack_1p5={"work": None, "aspirate": None})):
         m = _machine()
         m.startup()
         m.get_tip()
         raises(EffectorError,
                lambda: m.aspirate_from("big_tubes", 0, 0, volume_uL=100.0),
-               "a null work Z should refuse rather than pick a depth")
+               "a null aspiration Z should refuse rather than pick a depth")
+
+    # And a null 'aspirate' refuses even though 'work' is measured: falling
+    # back to the dispense depth would be a silent 19 mm shallower draw,
+    # which on this tube means aspirating air off the top.
+    with _WithConfig(_p300_with_z(
+            tube_rack_1p5={"work": 35.0, "aspirate": None})):
+        m = _machine()
+        m.startup()
+        m.get_tip()
+        raises(EffectorError,
+               lambda: m.aspirate_from("big_tubes", 0, 0, volume_uL=100.0),
+               "a null 'aspirate' must not quietly fall back to 'work'")
 
     # The tube floor is unmeasured, and that WARNS instead of blocking.
     check(e.spec["z_for_labware"]["tube_rack_1p5"].get("bottom") is None,
@@ -950,7 +965,14 @@ def test_well_bottom_crash_is_enforced_from_the_effector_table():
 
 
 def test_aspirate_from_reaches_the_well():
-    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 45.0})):
+    """A draw uses the 'aspirate' depth, which outranks 'work'.
+
+    The two are deliberately different numbers: a dispense wants to be above
+    the liquid, a draw wants the orifice under it. The fixture sets both so
+    the precedence is what is being asserted, not just the arithmetic.
+    """
+    with _WithConfig(_p300_with_z(
+            tube_rack_1p5={"work": 45.0, "aspirate": 54.0})):
         m = _machine()
         m.startup()
         m.get_tip()
@@ -959,10 +981,12 @@ def test_aspirate_from_reaches_the_well():
         check(pos == e.aspirate_pos(100.0),
               f"should return the aspirate POS {e.aspirate_pos(100.0)}, got {pos}")
         check(m.fluid_uL == 100.0, f"should hold 100 uL, got {m.fluid_uL}")
-        deep = [s for s in m.steps
-                if s.op == "aspirate" and s.kind == "move" and s.axes == "Z"
-                and s.to[2] == 45.0]
-        check(deep, "should have descended to the tube's work Z of 45.0")
+        zs = [s.to[2] for s in m.steps
+              if s.op == "aspirate" and s.kind == "move" and s.axes == "Z"]
+        check(54.0 in zs,
+              f"should have descended to the aspirate Z 54.0, got {zs}")
+        check(45.0 not in zs,
+              f"the draw must NOT use the shallower work Z 45.0, got {zs}")
         # It must honour the holder's Y-first approach.
         legs = [s for s in m.steps
                 if s.op == "aspirate" and s.kind == "move" and s.axes in ("X", "Y")]
@@ -970,6 +994,47 @@ def test_aspirate_from_reaches_the_well():
               f"approach should be Y then X, got {[s.axes for s in legs][:2]}")
         check(m._last_aspirate["source"] == "tube_rack_1p5",
               "the aspirate record should name the source labware")
+
+
+def test_aspirate_falls_back_to_work_without_an_aspirate_key():
+    """Only labware that needs the distinction has to declare it.
+
+    The water reservoir has one depth and no 'aspirate' key, so a station
+    draw still uses 'work' - the new key is opt-in, not a migration.
+    """
+    e = eff_mod.load("p300")
+    water = e.spec["z_for_labware"]["reservoir_water"]
+    check("aspirate" not in water,
+          f"this test assumes water has no aspirate key, got {sorted(water)}")
+
+    m = _machine()
+    m.startup()
+    m.get_tip()
+    m.aspirate_uL(150.0)
+    zs = [s.to[2] for s in m.steps
+          if s.op == "aspirate" and s.kind == "move" and s.axes == "Z"]
+    check(water["work"] in zs,
+          f"should have used water's work Z {water['work']}, got {zs}")
+
+
+def test_the_tube_draws_deeper_than_it_dispenses():
+    """The shipped numbers, and that both clear the floor limit."""
+    e = eff_mod.load("p300")
+    tube = e.spec["z_for_labware"]["tube_rack_1p5"]
+    check(tube["work"] == 35.0, f"dispense should be 35.0, got {tube['work']}")
+    check(tube["aspirate"] == 54.0,
+          f"the draw should be 54.0, got {tube['aspirate']}")
+    # +Z is DOWN, so drawing deeper means a LARGER number.
+    check(tube["aspirate"] > tube["work"],
+          "the draw must be deeper than the dispense, or it takes air off "
+          "the top as the level falls")
+
+    from lab.simulate import Simulator
+    sim = Simulator(Deck.load(), e)
+    limit, missing = sim.effective_z_limit(tip_fitted=True)
+    check(not missing and tube["aspirate"] < limit,
+          f"the draw depth {tube['aspirate']} must stay above the tipped "
+          f"stage limit {limit}")
 
 
 def test_aspirate_from_refuses_bad_state():

@@ -717,8 +717,27 @@ class Machine:
         air BEFORE descending, the whole stroke is validated before a single
         line is emitted, and the anti-drip backoff happens only after the tip
         is clear of the liquid.
+
+        The depth is the labware's "aspirate" key when the effector declares
+        one, else "work". Pass `z_key` explicitly to override both.
         """
         eff = self._pipette()
+
+        # A draw and a dispense do not want the same depth. Dispensing wants
+        # to be above the liquid; drawing wants the orifice under it, and the
+        # lower the level falls the deeper that has to be. So when the
+        # effector declares an "aspirate" depth for this labware, it wins over
+        # "work" - which stays the dispense depth and the fallback for every
+        # labware that never needed the distinction.
+        # Presence of the key decides, not whether it holds a number. A null
+        # "aspirate" means someone knew this labware needs its own draw depth
+        # and has not measured it yet; falling back to "work" there would draw
+        # 19 mm shallower than intended and take air off the top. So select
+        # the key and let z_for refuse it.
+        entry = (self.effector.spec.get("z_for_labware", {})
+                 .get(labware_id) or {})
+        if z_key == "work" and "aspirate" in entry:
+            z_key = "aspirate"
 
         # Validate the WHOLE stroke, including the backoff, before a single
         # line is emitted. Discovering at the backoff that the plunger has run
