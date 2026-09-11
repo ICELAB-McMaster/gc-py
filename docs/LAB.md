@@ -29,7 +29,7 @@ lab/
 protocols/
   accuracy_test.py     ISO 8655 accuracy/repeatability, any pipette
   centrifuge_test.py   two plates to equal mass, one liquid source each
-  centrifuge_test_v2_1.py  location 2 only, corner wells, post-mix hold
+  centrifuge_test_v2_1.py  location 2 only, two corner wells
 
 tools/compare_gcode.py compare two .gcode files by motion, not bytes
 tests/test_lab.py      regression tests; pins every known-good coordinate
@@ -114,8 +114,8 @@ knowing which liquid a plate held.
 ### Version 2.1
 
 `protocols/centrifuge_test_v2_1.py` loads **location 2 only**. The tube is
-preloaded by hand with 150 uL, the robot adds 200 uL of water, mixes, lifts
-clear and holds for 30 s, then puts 140 uL into each of two **corners**.
+preloaded by hand with 150 uL, the robot adds 200 uL of water, mixes, then
+puts 140 uL into each of two **corners**.
 
 | | plate 1 | plate 2 |
 |---|---|---|
@@ -152,21 +152,6 @@ drawing 2 x 150 out of 300 empties the tube exactly - the last aspiration
 would have no liquid above the tip. `build()` refuses that, so 200 gives the
 same 300 uL of usable stock plus the 50 uL that has to stay behind anyway.
 
-**The hold.** `Machine.hold(seconds, z=...)` moves Z and then dwells, and
-touches nothing else - XY does not move, which is what keeps it clear of the
-travel-height rule. `mix(..., retract=False)` leaves the tip at the mix depth
-so the hold lifts **straight from Z 54 to Z 10**, 44 mm up, instead of
-bouncing off travel height on the way.
-
-Read that Z carefully: **+Z is down, so Z 10 is higher than Z 54 and higher
-than the Z 5 travel height is not**. Z 10 is 5 mm *below* travel. It is clear
-of the tube and of the liquid, which is all the hold needs. The Z move is
-checked like any other, so an unsafe depth is refused rather than held at.
-
-A timed hold needs nothing in `printer.cfg` and cannot leave the machine
-waiting forever, which is why it is a `G4` dwell rather than a Klipper
-`PAUSE`. `--hold-z`, `--hold-seconds` and `--no-hold` are on the CLI.
-
 ## Rules the library enforces so a protocol cannot break them
 
 | rule | where |
@@ -182,7 +167,6 @@ waiting forever, which is why it is a `G4` dwell rather than a Klipper
 | Tips are consumed edge-first, and a used position is never revisited | `Machine._next_free_tip_col` |
 | After a tip pickup, the exit is X-first over already-consumed positions | `Machine._exit_tip_box` |
 | Every tip ejection is followed by `G28` | `Simulator._pending_eject_home` |
-| A hold moves Z, dwells, and never moves XY | `Machine.hold` |
 | No dispense without an aspirate; no aspirate without a tip | `Machine.aspirate_uL` / `dispense` |
 | Nothing is written to disk until simulation passes | `Machine.finalize` |
 

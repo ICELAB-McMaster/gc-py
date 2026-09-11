@@ -1,12 +1,11 @@
-"""Centrifuge balance test, version 2.1: hold after the mix, corner wells.
+"""Centrifuge balance test, version 2.1: location 2 only, corner wells.
 
 Derived from `centrifuge_test.py`, but **only location 2 is loaded**:
 
     1. nothing goes into location 1 - no water doses at all
     2. 200 uL of water goes into the 1.5 mL tube
-    3. after mixing, the tip lifts clear and HOLDS for 30 s
-    4. plate 2 is loaded at two CORNERS, 140 uL each
-    5. the tube is preloaded by hand with 150 uL
+    3. plate 2 is loaded at two CORNERS, 140 uL each
+    4. the tube is preloaded by hand with 150 uL
 
     python protocols/centrifuge_test_v2_1.py --effector p300
 
@@ -17,9 +16,8 @@ Sequence, with the tube contents tracked:
     stage  action                                    volume   tube after
       1    water        -> 1.5 mL tube                200 uL     350
       2    mix at the tube BOTTOM, 5 cycles           200 uL     350
-      3    lift to Z 10 and hold 30 s                    -       350
-      4    1.5 mL tube  -> plate 2, H1                 140 uL     210
-      5    1.5 mL tube  -> plate 2, A12                140 uL      70
+      3    1.5 mL tube  -> plate 2, H1                 140 uL     210
+      4    1.5 mL tube  -> plate 2, A12                140 uL      70
 
 **One plate, and that is deliberate.** Location 1 is empty, so this run does
 not produce a balanced pair by itself. The operator's reason (2026-09-11): the
@@ -29,13 +27,6 @@ weighing the loaded plates, not by matching what was dispensed into them. The
 protocol still says so on every run, because "no counterweight yet" and "no
 counterweight needed" look identical in a gcode file. `--water-wells D6 E7`
 puts water into location 1 if you do want the pair.
-
-**The hold.** After the last mix stroke the tip stays at the mix depth and
-then moves to **Z 10**, which with +Z down is 44 mm **higher** - clear of the
-tube and of the liquid - and waits 30 s before the first draw pulls it back
-down to Z 54. Nothing else moves; XY is untouched. A timed hold needs nothing
-in printer.cfg and cannot leave the machine waiting forever, which is why this
-is a `G4` dwell rather than a Klipper PAUSE.
 
 **The volumes, in order.** Four numbers, and only the first is yours to do
 by hand:
@@ -103,11 +94,6 @@ MIX_VOLUME_uL = 200.0
 
 PREWET_CYCLES = 3
 
-# After the mix, lift the tip clear of the tube and let it sit. +Z is DOWN,
-# so Z 10 is 44 mm ABOVE the Z 54 mix depth.
-HOLD_Z = 10.0
-HOLD_SECONDS = 30.0
-
 
 def build(
     effector_id: str = "p300",
@@ -128,9 +114,6 @@ def build(
     prewet: bool = True,
     temp_log: bool = True,
     eject_tip: bool = True,
-    hold_after_mix: bool = True,
-    hold_z: float = HOLD_Z,
-    hold_seconds: float = HOLD_SECONDS,
     layout: str = "layout.json",
     outdir: str = ".",
     plot: bool = True,
@@ -231,8 +214,6 @@ def build(
         "prewet_cycles_requested": prewet_cycles,
         "temp_log": temp_log,
         "eject_tip": do_eject, "eject_tip_requested": eject_tip,
-        "hold_after_mix": hold_after_mix,
-        "hold_z": hold_z, "hold_seconds": hold_seconds,
         "plates": [water_plate, stock_plate], "tube": tube,
         "water_plate": water_plate, "stock_plate": stock_plate,
         "water_wells": [well_name(*w) for w in water_wells],
@@ -262,9 +243,6 @@ def build(
     m.note(f"tube: {tube_preload_uL:g} + {stock_uL:g} = {available:g} uL, "
            f"mixed {mix_cycles}x{mix_volume_uL:g} uL, "
            f"{withdrawn:g} withdrawn, {available - withdrawn:g} left")
-    if hold_after_mix:
-        m.note(f"after the mix the tip lifts to Z {hold_z:g} and holds "
-               f"{hold_seconds:g} s")
 
     # ---- generate --------------------------------------------------------
     m.startup()
@@ -288,18 +266,9 @@ def build(
     m.aspirate_uL(stock_uL)
     m.dispense(tube, *tube_well, retract=False)
 
-    # stage 4: homogenise deep in the tube, not at the surface. retract=False
-    # when a hold follows, so the tip goes straight from the mix depth to the
-    # hold height instead of bouncing off travel height on the way.
+    # stage 2: homogenise deep in the tube, not at the surface
     m.log_temps("mix")
-    m.mix(tube, *tube_well, cycles=mix_cycles, volume_uL=mix_volume_uL,
-          retract=not hold_after_mix)
-
-    # stage 5: lift clear of the tube and wait. The mix leaves the tip empty,
-    # so nothing is held while it sits, and XY does not move.
-    if hold_after_mix:
-        m.log_temps("hold")
-        m.hold(hold_seconds, z=hold_z)
+    m.mix(tube, *tube_well, cycles=mix_cycles, volume_uL=mix_volume_uL)
 
     # stages 6-7: the mixed stock into the two corners of the stock plate
     for w in stock_wells:
@@ -348,10 +317,6 @@ def summarise(m: Machine, result) -> None:
           f"{t['tube_contents_after_stock_uL']:g} uL -> mixed "
           f"{t['mix_cycles']}x{t['mix_volume_uL']:g} uL -> "
           f"{t['tube_contents_at_end_uL']:g} uL left")
-    if t.get("hold_after_mix"):
-        print(f"  after the mix: lift to Z {t['hold_z']:g} and hold "
-              f"{t['hold_seconds']:g} s (+Z is DOWN, so that is "
-              f"{54.0 - t['hold_z']:g} mm above the mix depth)")
     print()
     header = (f"{'#':>3} {'destination':>12} {'well':>5} {'source':>8} "
               f"{'vol_uL':>8} {'disp_mm':>8} {'asp_POS':>8} {'X':>8} {'Y':>8}")
@@ -410,13 +375,6 @@ def main(argv=None) -> int:
     ap.add_argument("--no-prewet", dest="prewet", action="store_false")
     ap.add_argument("--no-temp-log", dest="temp_log", action="store_false")
     ap.add_argument("--no-plot", dest="plot", action="store_false")
-    ap.add_argument("--no-hold", dest="hold_after_mix", action="store_false",
-                    help="skip the post-mix hold")
-    ap.add_argument("--hold-z", type=float, default=HOLD_Z, dest="hold_z",
-                    help="commanded Z to hold at. +Z is DOWN, so a SMALLER "
-                         "number is higher (default 10.0)")
-    ap.add_argument("--hold-seconds", type=float, default=HOLD_SECONDS,
-                    dest="hold_seconds", help="how long to hold")
     ap.add_argument("--no-eject-tip", dest="eject_tip", action="store_false",
                     help="skip the tip ejection. It runs by default, and it "
                          "forces a G28 afterwards, which is what returns the "
@@ -435,8 +393,7 @@ def main(argv=None) -> int:
             tube_preload_uL=a.tube_preload_uL, mix_cycles=a.mix_cycles,
             mix_volume_uL=a.mix_volume_uL, prewet_cycles=a.prewet_cycles,
             get_tip=a.get_tip, prewet=a.prewet, temp_log=a.temp_log,
-            eject_tip=a.eject_tip, hold_after_mix=a.hold_after_mix,
-            hold_z=a.hold_z, hold_seconds=a.hold_seconds,
+            eject_tip=a.eject_tip,
             layout=a.layout, outdir=a.outdir, plot=a.plot, strict=a.strict,
         )
     except LabError as exc:
