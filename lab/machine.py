@@ -377,40 +377,6 @@ class Machine:
         macro = self.deck.macro("log_temps")
         self._raw(f"{macro}{tag}", op="log_temps", tag=tag)
 
-    def hold(self, seconds: float, z: Optional[float] = None,
-             op: str = "hold") -> None:
-        """Sit still for a while, optionally at a commanded Z first.
-
-        For letting something happen that is not a machine action - beads
-        settling, a droplet draining off the tip, an operator photographing
-        the tube. Unlike stopping for a human it needs nothing in printer.cfg
-        and cannot leave the machine waiting forever.
-
-        `z` is a COMMANDED Z, so remember the frame: +Z is down, and a
-        SMALLER number is physically higher. Holding at z=10.0 after mixing
-        at z=54.0 lifts the tip 44 mm out of the well. The move is checked
-        like any other, so an unsafe depth is refused rather than held at.
-
-        XY is not touched. A hold happens where the machine already is, which
-        is what keeps it clear of the travel-height rule - that rule governs
-        XY motion, and there is none here.
-        """
-        if seconds <= 0:
-            raise ProtocolError(
-                f"hold() needs a positive duration, got {seconds}. Use "
-                f"nothing at all rather than a zero-length hold."
-            )
-        if z is not None:
-            self._move_z(z, self.deck.feedrate("travel"), op)
-            self.wait()
-        self.dwell(seconds, op=op)
-        # Deliberately not "hold_seconds": a protocol records its REQUESTED
-        # hold under names of its own, and an accumulator that silently added
-        # to one of them would report a 30 s hold as 60.
-        self.toggles["holds"] = self.toggles.get("holds", 0) + 1
-        self.toggles["held_seconds_total"] = (
-            self.toggles.get("held_seconds_total", 0.0) + seconds)
-
     def note(self, text: str) -> None:
         """A comment in the gcode and a line in the manifest."""
         self.g.raw(f"; {text}")
@@ -831,8 +797,7 @@ class Machine:
                                  prefer=p.labware.approach_order)
 
     def mix(self, placement: str, row: int, col: int, cycles: int,
-            volume_uL: float, z_key: str = "mix",
-            retract: bool = True) -> None:
+            volume_uL: float, z_key: str = "mix") -> None:
         """Homogenise a well by cycling the plunger deep in it.
 
         `z_key` defaults to "mix", a per-effector depth that sits BELOW the
@@ -872,12 +837,7 @@ class Machine:
         for _ in range(cycles):
             self.actuator(top, settle=eff.settle_s, op="mix")            # draw up
             self.actuator(eff.blowout_pos, settle=eff.settle_s, op="mix")  # push back
-        if retract:
-            # retract=False leaves the tip at the mix depth for a caller that
-            # is about to move Z itself - hold() lifting straight out of the
-            # well, say. Lifting to travel and being pulled back down is the
-            # same wasted round trip dispense(retract=False) exists to avoid.
-            self._move_z(self.deck.z_travel, f, "mix", labware=lid)
+        self._move_z(self.deck.z_travel, f, "mix", labware=lid)
         self.wait()
 
         self.toggles["mix_cycles"] = cycles
