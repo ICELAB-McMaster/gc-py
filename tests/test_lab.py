@@ -1397,6 +1397,12 @@ def test_v21_reaches_the_banded_corner_without_y_motion_in_the_band():
 
 
 def test_v21_tube_arithmetic_and_the_exactly_empty_refusal():
+    """150 preloaded + 150 added, 2 x 140 out, 20 left.
+
+    The residual is thin on purpose - it is what the dose was lowered to 140
+    to buy. 2 x 150 out of the same 300 would empty the tube exactly, and
+    that is refused.
+    """
     with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 40.0})):
         import importlib
         import centrifuge_test_v2_1 as v21
@@ -1404,25 +1410,67 @@ def test_v21_tube_arithmetic_and_the_exactly_empty_refusal():
         with tempfile.TemporaryDirectory() as td:
             m, _ = v21.build(layout=TEST_LAYOUT, outdir=td, plot=False)
             t = m.toggles
-            check(t["tube_contents_after_stock_uL"] == 350.0,
-                  f"200 preloaded + 150 added = 350, got "
+            check(t["tube_preload_uL"] == 150.0,
+                  f"the preload is 150, got {t['tube_preload_uL']}")
+            check(t["plate_dose_uL"] == 140.0,
+                  f"the dose is 140, got {t['plate_dose_uL']}")
+            check(t["tube_contents_after_stock_uL"] == 300.0,
+                  f"150 preloaded + 150 added = 300, got "
                   f"{t['tube_contents_after_stock_uL']}")
-            check(t["tube_contents_at_end_uL"] == 50.0,
-                  f"350 - 2x150 = 50 left, got {t['tube_contents_at_end_uL']}")
+            check(t["tube_contents_at_end_uL"] == 20.0,
+                  f"300 - 2x140 = 20 left, got {t['tube_contents_at_end_uL']}")
+            check(t["tube_contents_at_end_uL"] > 0.0,
+                  "the tube must not be drawn to nothing")
 
             per_plate = {}
             for d in m.dispenses:
                 per_plate.setdefault(d["placement"], []).append(
                     d["target_volume_uL"])
-            check(sum(per_plate["plate1"]) == sum(per_plate["plate2"]) == 300.0,
-                  f"both plates must finish at 300 uL, got {per_plate}")
+            check(per_plate.get("plate2") == [140.0, 140.0],
+                  f"plate2 should get 2 x 140 uL, got {per_plate.get('plate2')}")
+            check("plate1" not in per_plate,
+                  f"nothing may be dispensed into plate1, got "
+                  f"{per_plate.get('plate1')}")
 
-            # The literal request - 150 preloaded, 150 added, 300 drawn -
-            # empties the tube exactly, and that is refused.
+            # 2 x 150 out of the same 300 empties it exactly.
             raises(ProtocolError,
-                   lambda: v21.build(tube_preload_uL=150.0, stock_uL=150.0,
-                                     layout=TEST_LAYOUT, outdir=td, plot=False),
-                   "150 + 150 with 300 withdrawn leaves nothing and must raise")
+                   lambda: v21.build(plate_dose_uL=150.0, layout=TEST_LAYOUT,
+                                     outdir=td, plot=False),
+                   "2 x 150 out of 300 leaves nothing and must raise")
+
+
+def test_v21_says_out_loud_that_it_is_not_a_balanced_pair():
+    """Location 1 is empty, so the protocol's own premise no longer holds."""
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 40.0})):
+        import importlib
+        import centrifuge_test_v2_1 as v21
+        importlib.reload(v21)
+        with tempfile.TemporaryDirectory() as td:
+            m, _ = v21.build(layout=TEST_LAYOUT, outdir=td, plot=False)
+            check(any("does NOT produce a balanced centrifuge pair" in w
+                      for w in m.sim.report.warnings),
+                  f"an unbalanced run must say so: {m.sim.report.warnings}")
+            check(m.toggles["water_wells"] == [],
+                  f"no water wells, got {m.toggles['water_wells']}")
+
+            # Putting water back restores the pair, and the warning goes.
+            m2, _ = v21.build(water_wells=((3, 5), (4, 6)),
+                              layout=TEST_LAYOUT, outdir=td, plot=False)
+            check(not any("balanced centrifuge pair" in w
+                          for w in m2.sim.report.warnings),
+                  "loading both plates should clear the warning")
+            per_plate = {}
+            for d in m2.dispenses:
+                per_plate.setdefault(d["placement"], []).append(
+                    d["target_volume_uL"])
+            check(sum(per_plate["plate1"]) == sum(per_plate["plate2"]),
+                  f"with both loaded the masses must match, got {per_plate}")
+
+            # And an empty stock list is not a run at all.
+            raises(ProtocolError,
+                   lambda: v21.build(stock_wells=(), layout=TEST_LAYOUT,
+                                     outdir=td, plot=False),
+                   "a run that dispenses nothing should raise")
 
 
 def test_centrifuge_protocol_checks_its_own_arithmetic():

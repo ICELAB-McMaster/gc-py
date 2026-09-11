@@ -1,30 +1,32 @@
 """Centrifuge balance test, version 2.1: hold after the mix, corner wells.
 
-Same shape as `centrifuge_test.py` - two 96-well plates loaded to equal mass,
-one liquid source each - with four changes:
+Derived from `centrifuge_test.py`, but **only location 2 is loaded**:
 
-    1. only 150 uL of water goes into the 1.5 mL tube, not 300
-    2. after mixing, the tip lifts clear and HOLDS for 30 s
-    3. plate 2 is loaded at two CORNERS rather than two middle wells
-    4. the tube is preloaded with 200 uL, not 50
+    1. nothing goes into location 1 - no water doses at all
+    2. 150 uL of water goes into the 1.5 mL tube
+    3. after mixing, the tip lifts clear and HOLDS for 30 s
+    4. plate 2 is loaded at two CORNERS, 140 uL each
+    5. the tube is preloaded by hand with 150 uL
 
     python protocols/centrifuge_test_v2_1.py --effector p300
 
-BEFORE RUNNING: the 1.5 mL tube must be **preloaded by hand with 200 uL**.
+BEFORE RUNNING: the 1.5 mL tube must be **preloaded by hand with 150 uL**.
 
 Sequence, with the tube contents tracked:
 
     stage  action                                    volume   tube after
-      1    water        -> plate 1, D6                150 uL     200
-      2    water        -> plate 1, E7                150 uL     200
-      3    water        -> 1.5 mL tube                150 uL     350
-      4    mix at the tube BOTTOM, 5 cycles           200 uL     350
-      5    lift to Z 10 and hold 30 s                    -       350
-      6    1.5 mL tube  -> plate 2, H1                 150 uL     200
-      7    1.5 mL tube  -> plate 2, A12                150 uL      50
+      1    water        -> 1.5 mL tube                150 uL     300
+      2    mix at the tube BOTTOM, 5 cycles           200 uL     300
+      3    lift to Z 10 and hold 30 s                    -       300
+      4    1.5 mL tube  -> plate 2, H1                 140 uL     160
+      5    1.5 mL tube  -> plate 2, A12                140 uL      20
 
-Each plate finishes with two wells of 150 uL, 300 uL per plate, so the pair
-still balances.
+**This run no longer balances a pair.** Location 1 is empty, so location 2's
+280 uL has nothing opposite it. That is what was asked for, and the protocol
+warns about it on every run rather than quietly dropping the word "balance"
+from its own name - if the plate is going in a centrifuge, something of equal
+mass has to go in the other side. Pass `--water-wells D6 E7` to put water back
+into location 1 and restore the pair.
 
 **The hold.** After the last mix stroke the tip stays at the mix depth and
 then moves to **Z 10**, which with +Z down is 44 mm **higher** - clear of the
@@ -33,25 +35,23 @@ down to Z 54. Nothing else moves; XY is untouched. A timed hold needs nothing
 in printer.cfg and cannot leave the machine waiting forever, which is why this
 is a `G4` dwell rather than a Klipper PAUSE.
 
-**Why the preload is 200 and not 150.** Three different volumes are easy to
-confuse here, so, in order:
+**The volumes, in order.** Four numbers, and only the first is yours to do
+by hand:
 
-    200 uL   you put in the tube BY HAND before the run
-    150 uL   the robot adds at stage 3          -> 350 in the tube
-    300 uL   the robot draws back out, 150 per corner
-     50 uL   left in the tube at the end
+    150 uL   you put in the tube BY HAND before the run
+    150 uL   the robot adds                     -> 300 in the tube
+    280 uL   the robot draws back out, 140 per corner
+     20 uL   left in the tube at the end
 
-The robot still adds exactly the 150 uL that was asked for, and still puts
-exactly 150 uL in each corner. The only number that changed is the hand
-preload, and it changed because **a tube cannot be drawn to exactly zero**:
-with 150 preloaded the tube would hold 300 and give up 300, so the last
-aspiration would have no liquid above the tip, would take air, and would land
-light - with nothing in the run able to notice, since there is no liquid
-inventory anywhere. 200 preloaded leaves 50 uL that has to stay behind either
-way, and the usable stock is still the 300 uL the request asked for.
+The 20 uL residual is what makes this legal. A tube cannot be drawn to exactly
+zero: the last aspiration would have no liquid above the tip, would take air,
+and would land light - with nothing in the run able to notice, since there is
+no liquid inventory anywhere. `build()` refuses any combination that does not
+leave a positive residual, which is why the dose is 140 and not 150.
 
-Change `--preload` if you would rather lower `--dose` instead; `build()`
-refuses any combination that does not leave a positive residual.
+20 uL is a thin margin. It assumes the two 140 uL draws take 140 uL each; if
+they run over, the second one is the one that comes up short. Lower `--dose`
+further if the balance readings suggest they do.
 
 **The two corners.** "Highest X and lowest Y" is **H1** at (251.0, 336.0) and
 "highest Y and lowest X" is **A12** at (152.0, 399.0). They are diagonally
@@ -84,12 +84,15 @@ from lab.machine import Machine, ProtocolError
 # Plate 1 keeps the middle pair; plate 2 uses the two corners the operator
 # asked for. Both pairs are diagonally opposite about the plate centre, so
 # each plate is internally balanced as well as matched to the other.
-PLATE1_WELLS = ((3, 5), (4, 6))          # D6, E7
+# Location 1 gets nothing in this version; the tuple is kept so the water
+# doses can be switched back on without restructuring the run.
+PLATE1_WELLS = ()                        # nothing into location 1
 PLATE2_WELLS = ((7, 0), (0, 11))         # H1 (high X, low Y), A12 (low X, high Y)
 
-PLATE_DOSE_uL = 150.0    # into each well, four times total
+PLATE_DOSE_uL = 140.0    # into each well. 140 and not 150 so the tube keeps a
+                         # residual - see the volume table above.
 STOCK_uL = 150.0         # water ADDED to the 1.5 mL tube
-TUBE_PRELOAD_uL = 200.0  # already in the tube, put there by hand
+TUBE_PRELOAD_uL = 150.0  # already in the tube, put there by hand
 TUBE_WELL = (0, 0)
 
 MIX_CYCLES = 5
@@ -144,13 +147,21 @@ def build(
     for v in (plate_dose_uL, stock_uL, mix_volume_uL):
         eff.check_volume(v)          # window + stroke, including the backoff
 
-    if water_plate == stock_plate:
+    if not stock_wells:
+        raise ProtocolError(
+            "stock_wells is empty, so this run would draw nothing and dispense "
+            "nothing. There is no run to generate."
+        )
+    if water_wells and water_plate == stock_plate:
         raise ProtocolError(
             f"water_plate and stock_plate are both {water_plate!r}. One source "
             f"per plate is the point; two into one leaves nothing to balance "
             f"against."
         )
-    for pname, wells in ((water_plate, water_wells), (stock_plate, stock_wells)):
+    targets = [(stock_plate, stock_wells)]
+    if water_wells:
+        targets.append((water_plate, water_wells))
+    for pname, wells in targets:
         p = m.deck.placement(pname)  # raises DeckError if not loaded
         for w in wells:
             p.check_well(*w)         # raises IndexError if out of range
@@ -160,7 +171,20 @@ def build(
                 f"{[well_name(*w) for w in wells]}. Each dose is meant to land "
                 f"somewhere the last did not."
             )
-    if len(water_wells) != len(stock_wells):
+
+    # The protocol is named for a mass balance, and with one plate loaded
+    # there is no longer a pair. That is a legitimate thing to ask for, so it
+    # warns rather than refuses - but it must not pass in silence.
+    if not water_wells:
+        m.sim.warn(
+            "unbalanced_pair",
+            f"only {stock_plate} is loaded ({len(stock_wells)} x "
+            f"{plate_dose_uL:g} = {len(stock_wells) * plate_dose_uL:g} uL); "
+            f"nothing goes into {water_plate}. This run does NOT produce a "
+            f"balanced centrifuge pair - put something of equal mass in the "
+            f"opposite position before spinning it.",
+        )
+    elif len(water_wells) != len(stock_wells):
         raise ProtocolError(
             f"{water_plate} gets {len(water_wells)} doses and {stock_plate} "
             f"gets {len(stock_wells)}; the plates would not balance."
@@ -213,15 +237,21 @@ def build(
         "mix_cycles": mix_cycles, "mix_volume_uL": mix_volume_uL,
     })
 
-    m.note(f"{name}: centrifuge mass balance, version 2.1")
-    m.note(f"{water_plate} <- water only; {stock_plate} <- {tube} only")
+    m.note(f"{name}: version 2.1")
+    if water_wells:
+        m.note(f"{water_plate} <- water only; {stock_plate} <- {tube} only")
+    else:
+        m.note(f"{stock_plate} <- {tube} only; {water_plate} gets NOTHING - "
+               f"this run is not a balanced pair")
     m.note(f"PRELOAD REQUIRED: {tube_preload_uL:g} uL already in {tube} "
            f"{well_name(*tube_well)} before this runs")
-    m.note(f"each plate receives {len(water_wells)} x {plate_dose_uL:g} uL = "
-           f"{len(water_wells) * plate_dose_uL:g} uL")
-    m.note(f"{water_plate}: {', '.join(well_name(*w) for w in water_wells)}; "
-           f"{stock_plate}: {', '.join(well_name(*w) for w in stock_wells)} "
+    m.note(f"{stock_plate}: {len(stock_wells)} x {plate_dose_uL:g} uL = "
+           f"{len(stock_wells) * plate_dose_uL:g} uL into "
+           f"{', '.join(well_name(*w) for w in stock_wells)} "
            f"(opposite corners)")
+    if water_wells:
+        m.note(f"{water_plate}: {len(water_wells)} x {plate_dose_uL:g} uL into "
+               f"{', '.join(well_name(*w) for w in water_wells)}")
     m.note(f"tube: {tube_preload_uL:g} + {stock_uL:g} = {available:g} uL, "
            f"mixed {mix_cycles}x{mix_volume_uL:g} uL, "
            f"{withdrawn:g} withdrawn, {available - withdrawn:g} left")
@@ -295,9 +325,15 @@ def summarise(m: Machine, result) -> None:
     print(f"  toggles: " + "  ".join(
         f"{k}={v}" for k, v in t.items() if isinstance(v, bool)))
     print()
-    print(f"  {t['water_plate']} <- water only, "
-          f"{t['stock_plate']} <- {t['tube']} only, "
-          f"{len(t['water_wells']) * t['plate_dose_uL']:g} uL each")
+    stock_total = len(t["stock_wells"]) * t["plate_dose_uL"]
+    if t["water_wells"]:
+        print(f"  {t['water_plate']} <- water only, "
+              f"{t['stock_plate']} <- {t['tube']} only, "
+              f"{stock_total:g} uL each")
+    else:
+        print(f"  {t['stock_plate']} <- {t['tube']} only, "
+              f"{stock_total:g} uL. {t['water_plate']} gets NOTHING, so this "
+              f"is NOT a balanced pair")
     print(f"  PRELOAD: {t['tube_preload_uL']:g} uL must already be in "
           f"{t['tube']} before this runs")
     print(f"  tube: {t['tube_preload_uL']:g} + {t['stock_uL']:g} = "

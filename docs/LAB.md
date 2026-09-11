@@ -29,7 +29,7 @@ lab/
 protocols/
   accuracy_test.py     ISO 8655 accuracy/repeatability, any pipette
   centrifuge_test.py   two plates to equal mass, one liquid source each
-  centrifuge_test_v2_1.py  as above, plus a post-mix hold; corner wells
+  centrifuge_test_v2_1.py  location 2 only, corner wells, post-mix hold
 
 tools/compare_gcode.py compare two .gcode files by motion, not bytes
 tests/test_lab.py      regression tests; pins every known-good coordinate
@@ -113,20 +113,30 @@ knowing which liquid a plate held.
 
 ### Version 2.1
 
-`protocols/centrifuge_test_v2_1.py` keeps the shape and changes four things:
-only 150 uL of water goes into the tube, the tube is preloaded with 200 uL,
-the tip **lifts clear after the mix and holds for 30 s**, and plate 2 is
-loaded at two **corners** instead of two middle wells.
+`protocols/centrifuge_test_v2_1.py` loads **location 2 only**. The tube is
+preloaded by hand with 150 uL, the robot adds 150 uL of water, mixes, lifts
+clear and holds for 30 s, then puts 140 uL into each of two **corners**.
 
 | | plate 1 | plate 2 |
 |---|---|---|
-| wells | D6, E7 | **H1** (251.0, 336.0), **A12** (152.0, 399.0) |
-| source | water | the mixed tube stock |
-| total | 2 x 150 = 300 uL | 2 x 150 = 300 uL |
+| wells | none | **H1** (251.0, 336.0), **A12** (152.0, 399.0) |
+| source | - | the mixed tube stock |
+| total | 0 | 2 x 140 = 280 uL |
 
-Both pairs are diagonally opposite about the plate centre, so each plate is
-internally balanced as well as matched to the other - `Placement.grid_center()`
-is the midpoint of each pair, and a test asserts it.
+The two corners are diagonally opposite about the plate centre, so the plate
+is internally balanced - `Placement.grid_center()` is the midpoint of the
+pair, and a test asserts it rather than pinning coordinates.
+
+**This run does not produce a balanced pair**, because location 1 is empty.
+The protocol warns on every run rather than quietly dropping the word from
+its own name; something of equal mass has to go opposite before it spins.
+`--water-wells D6 E7` puts water back into location 1 and restores the pair.
+
+**Why the dose is 140.** 150 preloaded plus 150 added is 300, and drawing
+2 x 150 would empty the tube exactly - the last aspiration would have no
+liquid above the tip. 140 leaves 20 uL. That is a thin margin: it assumes
+each draw really takes 140, and if they run over it is the second one that
+comes up short.
 
 **A12 is at X 152, inside the tip-ejector band X[148, 162]**, where Y motion
 with a tip fitted is a hard error. It is reachable because `_route_xy` takes
