@@ -377,6 +377,41 @@ class Machine:
         macro = self.deck.macro("log_temps")
         self._raw(f"{macro}{tag}", op="log_temps", tag=tag)
 
+    def pause(self, message: str = "") -> None:
+        """Stop and wait for the operator. Emits M400, then the PAUSE macro.
+
+        The M400 is not decoration: without it the pause is queued behind
+        motion that has not run yet, so the machine would stop somewhere
+        later than the protocol says it stopped. Draining the queue first is
+        what makes "paused here" true.
+
+        The effector keeps whatever state it has - a fitted tip stays fitted,
+        the plunger stays where it is - so a protocol should reach a position
+        it is happy to sit at before calling this. Nothing here checks that,
+        because "happy to sit at" is a judgement about the experiment.
+
+        `message` is recorded as a gcode comment, in `self.notes`, and in the
+        step detail, so the manifest says what the operator was asked to do.
+
+        Raises DeckError if the deck declares no pause macro.
+        """
+        self.wait()                       # the queue must be empty first
+        if message:
+            self.note(f"PAUSE: {message}")
+        self._raw(self.deck.macro("pause"), "pause", message=message)
+        self.toggles["paused"] = self.toggles.get("paused", 0) + 1
+
+        # The macro has never been exercised on this machine, and a missing
+        # [pause_resume] section fails at the pause rather than at generation.
+        if not self.deck.raw.get("klipper_macros", {}).get("pause_validated"):
+            self.sim.warn(
+                "pause_unvalidated",
+                "this run PAUSES, and the pause macro has never been validated "
+                "on this machine. It needs [pause_resume] in printer.cfg; "
+                "without it Klipper errors on an unknown command and stops "
+                "with a tip fitted. Confirm the section exists first.",
+            )
+
     def note(self, text: str) -> None:
         """A comment in the gcode and a line in the manifest."""
         self.g.raw(f"; {text}")
