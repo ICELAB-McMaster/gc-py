@@ -1397,11 +1397,11 @@ def test_v21_reaches_the_banded_corner_without_y_motion_in_the_band():
 
 
 def test_v21_tube_arithmetic_and_the_exactly_empty_refusal():
-    """150 preloaded + 150 added, 2 x 140 out, 20 left.
+    """The tube must end with liquid in it, whatever the numbers are.
 
-    The residual is thin on purpose - it is what the dose was lowered to 140
-    to buy. 2 x 150 out of the same 300 would empty the tube exactly, and
-    that is refused.
+    Derived from the protocol's own constants rather than pinned, because the
+    operator changes these and the invariant - a positive residual, and every
+    dose landing in the stock plate - is what the test is actually about.
     """
     with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 40.0})):
         import importlib
@@ -1410,33 +1410,36 @@ def test_v21_tube_arithmetic_and_the_exactly_empty_refusal():
         with tempfile.TemporaryDirectory() as td:
             m, _ = v21.build(layout=TEST_LAYOUT, outdir=td, plot=False)
             t = m.toggles
-            check(t["tube_preload_uL"] == 150.0,
-                  f"the preload is 150, got {t['tube_preload_uL']}")
-            check(t["plate_dose_uL"] == 140.0,
-                  f"the dose is 140, got {t['plate_dose_uL']}")
-            check(t["tube_contents_after_stock_uL"] == 300.0,
-                  f"150 preloaded + 150 added = 300, got "
-                  f"{t['tube_contents_after_stock_uL']}")
-            check(t["tube_contents_at_end_uL"] == 20.0,
-                  f"300 - 2x140 = 20 left, got {t['tube_contents_at_end_uL']}")
-            check(t["tube_contents_at_end_uL"] > 0.0,
-                  "the tube must not be drawn to nothing")
+            n_wells = len(v21.PLATE2_WELLS)
+            available = v21.TUBE_PRELOAD_uL + v21.STOCK_uL
+            left = available - n_wells * v21.PLATE_DOSE_uL
+
+            check(t["tube_contents_after_stock_uL"] == available,
+                  f"{v21.TUBE_PRELOAD_uL:g} preloaded + {v21.STOCK_uL:g} added "
+                  f"= {available:g}, got {t['tube_contents_after_stock_uL']}")
+            check(t["tube_contents_at_end_uL"] == left,
+                  f"should leave {left:g} uL, got {t['tube_contents_at_end_uL']}")
+            check(left > 0.0,
+                  f"the tube must not be drawn to nothing, got {left:g} uL")
 
             per_plate = {}
             for d in m.dispenses:
                 per_plate.setdefault(d["placement"], []).append(
                     d["target_volume_uL"])
-            check(per_plate.get("plate2") == [140.0, 140.0],
-                  f"plate2 should get 2 x 140 uL, got {per_plate.get('plate2')}")
+            check(per_plate.get("plate2") == [v21.PLATE_DOSE_uL] * n_wells,
+                  f"plate2 should get {n_wells} x {v21.PLATE_DOSE_uL:g} uL, "
+                  f"got {per_plate.get('plate2')}")
             check("plate1" not in per_plate,
                   f"nothing may be dispensed into plate1, got "
                   f"{per_plate.get('plate1')}")
 
-            # 2 x 150 out of the same 300 empties it exactly.
+            # A dose that divides the contents exactly empties the tube, and
+            # that is refused however generous the stock is.
             raises(ProtocolError,
-                   lambda: v21.build(plate_dose_uL=150.0, layout=TEST_LAYOUT,
-                                     outdir=td, plot=False),
-                   "2 x 150 out of 300 leaves nothing and must raise")
+                   lambda: v21.build(plate_dose_uL=available / n_wells,
+                                     layout=TEST_LAYOUT, outdir=td, plot=False),
+                   f"{n_wells} x {available / n_wells:g} out of {available:g} "
+                   f"leaves nothing and must raise")
 
 
 def test_v21_says_out_loud_that_it_is_not_a_balanced_pair():

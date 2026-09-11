@@ -3,7 +3,7 @@
 Derived from `centrifuge_test.py`, but **only location 2 is loaded**:
 
     1. nothing goes into location 1 - no water doses at all
-    2. 150 uL of water goes into the 1.5 mL tube
+    2. 200 uL of water goes into the 1.5 mL tube
     3. after mixing, the tip lifts clear and HOLDS for 30 s
     4. plate 2 is loaded at two CORNERS, 140 uL each
     5. the tube is preloaded by hand with 150 uL
@@ -15,18 +15,20 @@ BEFORE RUNNING: the 1.5 mL tube must be **preloaded by hand with 150 uL**.
 Sequence, with the tube contents tracked:
 
     stage  action                                    volume   tube after
-      1    water        -> 1.5 mL tube                150 uL     300
-      2    mix at the tube BOTTOM, 5 cycles           200 uL     300
-      3    lift to Z 10 and hold 30 s                    -       300
-      4    1.5 mL tube  -> plate 2, H1                 140 uL     160
-      5    1.5 mL tube  -> plate 2, A12                140 uL      20
+      1    water        -> 1.5 mL tube                200 uL     350
+      2    mix at the tube BOTTOM, 5 cycles           200 uL     350
+      3    lift to Z 10 and hold 30 s                    -       350
+      4    1.5 mL tube  -> plate 2, H1                 140 uL     210
+      5    1.5 mL tube  -> plate 2, A12                140 uL      70
 
-**This run no longer balances a pair.** Location 1 is empty, so location 2's
-280 uL has nothing opposite it. That is what was asked for, and the protocol
-warns about it on every run rather than quietly dropping the word "balance"
-from its own name - if the plate is going in a centrifuge, something of equal
-mass has to go in the other side. Pass `--water-wells D6 E7` to put water back
-into location 1 and restore the pair.
+**One plate, and that is deliberate.** Location 1 is empty, so this run does
+not produce a balanced pair by itself. The operator's reason (2026-09-11): the
+two well plates have **different tare weights**, so matching their liquid
+volumes would not have balanced them anyway. Balance the centrifuge by
+weighing the loaded plates, not by matching what was dispensed into them. The
+protocol still says so on every run, because "no counterweight yet" and "no
+counterweight needed" look identical in a gcode file. `--water-wells D6 E7`
+puts water into location 1 if you do want the pair.
 
 **The hold.** After the last mix stroke the tip stays at the mix depth and
 then moves to **Z 10**, which with +Z down is 44 mm **higher** - clear of the
@@ -39,19 +41,20 @@ is a `G4` dwell rather than a Klipper PAUSE.
 by hand:
 
     150 uL   you put in the tube BY HAND before the run
-    150 uL   the robot adds                     -> 300 in the tube
+    200 uL   the robot adds                     -> 350 in the tube
     280 uL   the robot draws back out, 140 per corner
-     20 uL   left in the tube at the end
+     70 uL   left in the tube at the end
 
-The 20 uL residual is what makes this legal. A tube cannot be drawn to exactly
-zero: the last aspiration would have no liquid above the tip, would take air,
-and would land light - with nothing in the run able to notice, since there is
-no liquid inventory anywhere. `build()` refuses any combination that does not
-leave a positive residual, which is why the dose is 140 and not 150.
+The residual is what makes this legal. A tube cannot be drawn to exactly zero:
+the last aspiration would have no liquid above the tip, would take air, and
+would land light - with nothing in the run able to notice, since there is no
+liquid inventory anywhere. `build()` refuses any combination that does not
+leave a positive residual.
 
-20 uL is a thin margin. It assumes the two 140 uL draws take 140 uL each; if
-they run over, the second one is the one that comes up short. Lower `--dose`
-further if the balance readings suggest they do.
+70 uL is a comfortable margin, up from the 20 uL that 150 of stock gave. It no
+longer depends on each 140 uL draw taking exactly 140. Note that at 350 in the
+tube the dose could go back up to 150 and still leave 50 - `--dose 150` if the
+round number matters more than the margin.
 
 **The two corners.** "Highest X and lowest Y" is **H1** at (251.0, 336.0) and
 "highest Y and lowest X" is **A12** at (152.0, 399.0). They are diagonally
@@ -89,9 +92,9 @@ from lab.machine import Machine, ProtocolError
 PLATE1_WELLS = ()                        # nothing into location 1
 PLATE2_WELLS = ((7, 0), (0, 11))         # H1 (high X, low Y), A12 (low X, high Y)
 
-PLATE_DOSE_uL = 140.0    # into each well. 140 and not 150 so the tube keeps a
-                         # residual - see the volume table above.
-STOCK_uL = 150.0         # water ADDED to the 1.5 mL tube
+PLATE_DOSE_uL = 140.0    # into each well
+STOCK_uL = 200.0         # water ADDED to the 1.5 mL tube, for margin: 150 left
+                         # only 20 uL behind, this leaves 70
 TUBE_PRELOAD_uL = 150.0  # already in the tube, put there by hand
 TUBE_WELL = (0, 0)
 
@@ -173,16 +176,20 @@ def build(
             )
 
     # The protocol is named for a mass balance, and with one plate loaded
-    # there is no longer a pair. That is a legitimate thing to ask for, so it
-    # warns rather than refuses - but it must not pass in silence.
+    # there is no longer a pair. Deliberate here - the plates differ in tare
+    # weight, so equal volumes would not have balanced them anyway - but it
+    # must not pass in silence, because "no counterweight yet" and "no
+    # counterweight needed" look identical in a gcode file.
     if not water_wells:
         m.sim.warn(
             "unbalanced_pair",
             f"only {stock_plate} is loaded ({len(stock_wells)} x "
             f"{plate_dose_uL:g} = {len(stock_wells) * plate_dose_uL:g} uL); "
             f"nothing goes into {water_plate}. This run does NOT produce a "
-            f"balanced centrifuge pair - put something of equal mass in the "
-            f"opposite position before spinning it.",
+            f"balanced centrifuge pair on its own. That is by design here - "
+            f"the plates have different tare weights, so matching dispensed "
+            f"volumes would not balance them either. WEIGH the loaded plates "
+            f"and balance on total mass before spinning.",
         )
     elif len(water_wells) != len(stock_wells):
         raise ProtocolError(
@@ -332,8 +339,9 @@ def summarise(m: Machine, result) -> None:
               f"{stock_total:g} uL each")
     else:
         print(f"  {t['stock_plate']} <- {t['tube']} only, "
-              f"{stock_total:g} uL. {t['water_plate']} gets NOTHING, so this "
-              f"is NOT a balanced pair")
+              f"{stock_total:g} uL. {t['water_plate']} gets NOTHING: not a "
+              f"balanced pair on its own - weigh the plates and balance on "
+              f"total mass")
     print(f"  PRELOAD: {t['tube_preload_uL']:g} uL must already be in "
           f"{t['tube']} before this runs")
     print(f"  tube: {t['tube_preload_uL']:g} + {t['stock_uL']:g} = "

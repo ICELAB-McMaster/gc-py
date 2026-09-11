@@ -114,7 +114,7 @@ knowing which liquid a plate held.
 ### Version 2.1
 
 `protocols/centrifuge_test_v2_1.py` loads **location 2 only**. The tube is
-preloaded by hand with 150 uL, the robot adds 150 uL of water, mixes, lifts
+preloaded by hand with 150 uL, the robot adds 200 uL of water, mixes, lifts
 clear and holds for 30 s, then puts 140 uL into each of two **corners**.
 
 | | plate 1 | plate 2 |
@@ -127,16 +127,19 @@ The two corners are diagonally opposite about the plate centre, so the plate
 is internally balanced - `Placement.grid_center()` is the midpoint of the
 pair, and a test asserts it rather than pinning coordinates.
 
-**This run does not produce a balanced pair**, because location 1 is empty.
-The protocol warns on every run rather than quietly dropping the word from
-its own name; something of equal mass has to go opposite before it spins.
-`--water-wells D6 E7` puts water back into location 1 and restores the pair.
+**This run does not produce a balanced pair on its own**, because location 1
+is empty - and that is deliberate. The operator's reason (2026-09-11): the two
+well plates have **different tare weights**, so matching their dispensed
+volumes would not have balanced them anyway. Balance by weighing the loaded
+plates, not by matching what went into them. The protocol still says so on
+every run, because "no counterweight yet" and "no counterweight needed" look
+identical in a gcode file. `--water-wells D6 E7` restores the pair if wanted.
 
-**Why the dose is 140.** 150 preloaded plus 150 added is 300, and drawing
-2 x 150 would empty the tube exactly - the last aspiration would have no
-liquid above the tip. 140 leaves 20 uL. That is a thin margin: it assumes
-each draw really takes 140, and if they run over it is the second one that
-comes up short.
+**The tube arithmetic.** 150 preloaded plus 200 added is 350, and 2 x 140
+draws 280, leaving **70 uL**. A tube can never be drawn to exactly zero - the
+last aspiration would have no liquid above the tip - and `build()` refuses any
+combination that does not leave a positive residual. 70 uL is comfortable; at
+350 in the tube the dose could go back to 150 and still leave 50.
 
 **A12 is at X 152, inside the tip-ejector band X[148, 162]**, where Y motion
 with a tip fitted is a hard error. It is reachable because `_route_xy` takes
