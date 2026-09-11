@@ -1,18 +1,16 @@
-"""Centrifuge balance test, version 2.1: pause for a photograph.
+"""Centrifuge balance test, version 2.1: hold after the mix, corner wells.
 
 Same shape as `centrifuge_test.py` - two 96-well plates loaded to equal mass,
 one liquid source each - with four changes:
 
     1. only 150 uL of water goes into the 1.5 mL tube, not 300
-    2. the run PAUSES after the mix so the operator can photograph the tube
+    2. after mixing, the tip lifts clear and HOLDS for 30 s
     3. plate 2 is loaded at two CORNERS rather than two middle wells
     4. the tube is preloaded with 200 uL, not 50
 
     python protocols/centrifuge_test_v2_1.py --effector p300
 
-BEFORE RUNNING: the 1.5 mL tube must be **preloaded by hand with 200 uL**, and
-`[pause_resume]` must exist in printer.cfg or the PAUSE will stop the run dead
-with a tip fitted.
+BEFORE RUNNING: the 1.5 mL tube must be **preloaded by hand with 200 uL**.
 
 Sequence, with the tube contents tracked:
 
@@ -21,21 +19,39 @@ Sequence, with the tube contents tracked:
       2    water        -> plate 1, E7                150 uL     200
       3    water        -> 1.5 mL tube                150 uL     350
       4    mix at the tube BOTTOM, 5 cycles           200 uL     350
-      5    PAUSE for a photograph                        -       350
+      5    lift to Z 10 and hold 30 s                    -       350
       6    1.5 mL tube  -> plate 2, H1                 150 uL     200
       7    1.5 mL tube  -> plate 2, A12                150 uL      50
 
 Each plate finishes with two wells of 150 uL, 300 uL per plate, so the pair
 still balances.
 
-**Why the preload is 200 and not 150.** The request was 150 uL added to the
-tube leaving 300 uL for use, which reads as a 150 uL preload and a tube drawn
-from 300 to nothing. A tube cannot be drawn to exactly zero: the last
-aspiration would have no liquid above the tip and would take air, that dose
-would land light, and nothing in the run could notice - there is no liquid
-inventory anywhere. 200 preloaded gives the same **300 uL of usable stock**
-plus 50 uL that has to stay behind either way. Change `--preload` if you
-disagree; `build()` refuses anything that does not leave a positive residual.
+**The hold.** After the last mix stroke the tip stays at the mix depth and
+then moves to **Z 10**, which with +Z down is 44 mm **higher** - clear of the
+tube and of the liquid - and waits 30 s before the first draw pulls it back
+down to Z 54. Nothing else moves; XY is untouched. A timed hold needs nothing
+in printer.cfg and cannot leave the machine waiting forever, which is why this
+is a `G4` dwell rather than a Klipper PAUSE.
+
+**Why the preload is 200 and not 150.** Three different volumes are easy to
+confuse here, so, in order:
+
+    200 uL   you put in the tube BY HAND before the run
+    150 uL   the robot adds at stage 3          -> 350 in the tube
+    300 uL   the robot draws back out, 150 per corner
+     50 uL   left in the tube at the end
+
+The robot still adds exactly the 150 uL that was asked for, and still puts
+exactly 150 uL in each corner. The only number that changed is the hand
+preload, and it changed because **a tube cannot be drawn to exactly zero**:
+with 150 preloaded the tube would hold 300 and give up 300, so the last
+aspiration would have no liquid above the tip, would take air, and would land
+light - with nothing in the run able to notice, since there is no liquid
+inventory anywhere. 200 preloaded leaves 50 uL that has to stay behind either
+way, and the usable stock is still the 300 uL the request asked for.
+
+Change `--preload` if you would rather lower `--dose` instead; `build()`
+refuses any combination that does not leave a positive residual.
 
 **The two corners.** "Highest X and lowest Y" is **H1** at (251.0, 336.0) and
 "highest Y and lowest X" is **A12** at (152.0, 399.0). They are diagonally
@@ -81,8 +97,10 @@ MIX_VOLUME_uL = 200.0
 
 PREWET_CYCLES = 3
 
-PAUSE_MESSAGE = ("photograph the 1.5 mL tube, then resume. The tip is still "
-                 "fitted and the plunger is bottomed.")
+# After the mix, lift the tip clear of the tube and let it sit. +Z is DOWN,
+# so Z 10 is 44 mm ABOVE the Z 54 mix depth.
+HOLD_Z = 10.0
+HOLD_SECONDS = 30.0
 
 
 def build(
@@ -104,8 +122,9 @@ def build(
     prewet: bool = True,
     temp_log: bool = True,
     eject_tip: bool = True,
-    pause_for_photo: bool = True,
-    pause_at_park: bool = True,
+    hold_after_mix: bool = True,
+    hold_z: float = HOLD_Z,
+    hold_seconds: float = HOLD_SECONDS,
     layout: str = "layout.json",
     outdir: str = ".",
     plot: bool = True,
@@ -181,7 +200,8 @@ def build(
         "prewet_cycles_requested": prewet_cycles,
         "temp_log": temp_log,
         "eject_tip": do_eject, "eject_tip_requested": eject_tip,
-        "pause_for_photo": pause_for_photo, "pause_at_park": pause_at_park,
+        "hold_after_mix": hold_after_mix,
+        "hold_z": hold_z, "hold_seconds": hold_seconds,
         "plates": [water_plate, stock_plate], "tube": tube,
         "water_plate": water_plate, "stock_plate": stock_plate,
         "water_wells": [well_name(*w) for w in water_wells],
@@ -205,9 +225,9 @@ def build(
     m.note(f"tube: {tube_preload_uL:g} + {stock_uL:g} = {available:g} uL, "
            f"mixed {mix_cycles}x{mix_volume_uL:g} uL, "
            f"{withdrawn:g} withdrawn, {available - withdrawn:g} left")
-    if pause_for_photo:
-        m.note("this run PAUSES after the mix - needs [pause_resume] in "
-               "printer.cfg")
+    if hold_after_mix:
+        m.note(f"after the mix the tip lifts to Z {hold_z:g} and holds "
+               f"{hold_seconds:g} s")
 
     # ---- generate --------------------------------------------------------
     m.startup()
@@ -231,19 +251,18 @@ def build(
     m.aspirate_uL(stock_uL)
     m.dispense(tube, *tube_well, retract=False)
 
-    # stage 4: homogenise deep in the tube, not at the surface
+    # stage 4: homogenise deep in the tube, not at the surface. retract=False
+    # when a hold follows, so the tip goes straight from the mix depth to the
+    # hold height instead of bouncing off travel height on the way.
     m.log_temps("mix")
-    m.mix(tube, *tube_well, cycles=mix_cycles, volume_uL=mix_volume_uL)
+    m.mix(tube, *tube_well, cycles=mix_cycles, volume_uL=mix_volume_uL,
+          retract=not hold_after_mix)
 
-    # stage 5: stop for the photograph. The mix leaves the tip empty and at
-    # travel height, so this is a safe place to sit. Retreating to park first
-    # takes the effector out of the shot; it is an ordinary traverse, and the
-    # tip is empty, so nothing is at risk while the machine waits.
-    if pause_for_photo:
-        m.log_temps("pause")
-        if pause_at_park:
-            m.goto_station("park", op="pause_retreat")
-        m.pause(PAUSE_MESSAGE)
+    # stage 5: lift clear of the tube and wait. The mix leaves the tip empty,
+    # so nothing is held while it sits, and XY does not move.
+    if hold_after_mix:
+        m.log_temps("hold")
+        m.hold(hold_seconds, z=hold_z)
 
     # stages 6-7: the mixed stock into the two corners of the stock plate
     for w in stock_wells:
@@ -285,10 +304,10 @@ def summarise(m: Machine, result) -> None:
           f"{t['tube_contents_after_stock_uL']:g} uL -> mixed "
           f"{t['mix_cycles']}x{t['mix_volume_uL']:g} uL -> "
           f"{t['tube_contents_at_end_uL']:g} uL left")
-    if t.get("pause_for_photo"):
-        print(f"  PAUSES after the mix"
-              + (" at the park position" if t.get("pause_at_park") else "")
-              + " - needs [pause_resume] in printer.cfg")
+    if t.get("hold_after_mix"):
+        print(f"  after the mix: lift to Z {t['hold_z']:g} and hold "
+              f"{t['hold_seconds']:g} s (+Z is DOWN, so that is "
+              f"{54.0 - t['hold_z']:g} mm above the mix depth)")
     print()
     header = (f"{'#':>3} {'destination':>12} {'well':>5} {'source':>8} "
               f"{'vol_uL':>8} {'disp_mm':>8} {'asp_POS':>8} {'X':>8} {'Y':>8}")
@@ -347,11 +366,13 @@ def main(argv=None) -> int:
     ap.add_argument("--no-prewet", dest="prewet", action="store_false")
     ap.add_argument("--no-temp-log", dest="temp_log", action="store_false")
     ap.add_argument("--no-plot", dest="plot", action="store_false")
-    ap.add_argument("--no-pause", dest="pause_for_photo", action="store_false",
-                    help="skip the photograph pause after the mix")
-    ap.add_argument("--pause-in-place", dest="pause_at_park",
-                    action="store_false",
-                    help="pause above the tube instead of retreating to park")
+    ap.add_argument("--no-hold", dest="hold_after_mix", action="store_false",
+                    help="skip the post-mix hold")
+    ap.add_argument("--hold-z", type=float, default=HOLD_Z, dest="hold_z",
+                    help="commanded Z to hold at. +Z is DOWN, so a SMALLER "
+                         "number is higher (default 10.0)")
+    ap.add_argument("--hold-seconds", type=float, default=HOLD_SECONDS,
+                    dest="hold_seconds", help="how long to hold")
     ap.add_argument("--no-eject-tip", dest="eject_tip", action="store_false",
                     help="skip the tip ejection. It runs by default, and it "
                          "forces a G28 afterwards, which is what returns the "
@@ -370,9 +391,9 @@ def main(argv=None) -> int:
             tube_preload_uL=a.tube_preload_uL, mix_cycles=a.mix_cycles,
             mix_volume_uL=a.mix_volume_uL, prewet_cycles=a.prewet_cycles,
             get_tip=a.get_tip, prewet=a.prewet, temp_log=a.temp_log,
-            eject_tip=a.eject_tip, pause_for_photo=a.pause_for_photo,
-            pause_at_park=a.pause_at_park, layout=a.layout, outdir=a.outdir,
-            plot=a.plot, strict=a.strict,
+            eject_tip=a.eject_tip, hold_after_mix=a.hold_after_mix,
+            hold_z=a.hold_z, hold_seconds=a.hold_seconds,
+            layout=a.layout, outdir=a.outdir, plot=a.plot, strict=a.strict,
         )
     except LabError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)

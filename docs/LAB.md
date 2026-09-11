@@ -29,7 +29,7 @@ lab/
 protocols/
   accuracy_test.py     ISO 8655 accuracy/repeatability, any pipette
   centrifuge_test.py   two plates to equal mass, one liquid source each
-  centrifuge_test_v2_1.py  as above, but pauses for a photo; corner wells
+  centrifuge_test_v2_1.py  as above, plus a post-mix hold; corner wells
 
 tools/compare_gcode.py compare two .gcode files by motion, not bytes
 tests/test_lab.py      regression tests; pins every known-good coordinate
@@ -115,8 +115,8 @@ knowing which liquid a plate held.
 
 `protocols/centrifuge_test_v2_1.py` keeps the shape and changes four things:
 only 150 uL of water goes into the tube, the tube is preloaded with 200 uL,
-the run **pauses after the mix** so the operator can photograph the tube, and
-plate 2 is loaded at two **corners** instead of two middle wells.
+the tip **lifts clear after the mix and holds for 30 s**, and plate 2 is
+loaded at two **corners** instead of two middle wells.
 
 | | plate 1 | plate 2 |
 |---|---|---|
@@ -139,14 +139,20 @@ drawing 2 x 150 out of 300 empties the tube exactly - the last aspiration
 would have no liquid above the tip. `build()` refuses that, so 200 gives the
 same 300 uL of usable stock plus the 50 uL that has to stay behind anyway.
 
-**The pause needs `[pause_resume]` in `printer.cfg`.** `Machine.pause()` emits
-`M400` and then the deck's `pause` macro, in that order, because a pause queued
-behind unexecuted motion stops the machine somewhere later than the protocol
-says it stopped. The macro is flagged `pause_validated: false` in `deck.json`
-and every run that pauses warns about it: if the section is missing, Klipper
-errors on an unknown command and stops with a tip fitted. By default the
-effector retreats to park first so it is out of the shot; `--pause-in-place`
-keeps it above the tube, and `--no-pause` skips the stop entirely.
+**The hold.** `Machine.hold(seconds, z=...)` moves Z and then dwells, and
+touches nothing else - XY does not move, which is what keeps it clear of the
+travel-height rule. `mix(..., retract=False)` leaves the tip at the mix depth
+so the hold lifts **straight from Z 54 to Z 10**, 44 mm up, instead of
+bouncing off travel height on the way.
+
+Read that Z carefully: **+Z is down, so Z 10 is higher than Z 54 and higher
+than the Z 5 travel height is not**. Z 10 is 5 mm *below* travel. It is clear
+of the tube and of the liquid, which is all the hold needs. The Z move is
+checked like any other, so an unsafe depth is refused rather than held at.
+
+A timed hold needs nothing in `printer.cfg` and cannot leave the machine
+waiting forever, which is why it is a `G4` dwell rather than a Klipper
+`PAUSE`. `--hold-z`, `--hold-seconds` and `--no-hold` are on the CLI.
 
 ## Rules the library enforces so a protocol cannot break them
 
@@ -163,7 +169,7 @@ keeps it above the tube, and `--no-pause` skips the stop entirely.
 | Tips are consumed edge-first, and a used position is never revisited | `Machine._next_free_tip_col` |
 | After a tip pickup, the exit is X-first over already-consumed positions | `Machine._exit_tip_box` |
 | Every tip ejection is followed by `G28` | `Simulator._pending_eject_home` |
-| A pause drains the motion queue before it stops | `Machine.pause` |
+| A hold moves Z, dwells, and never moves XY | `Machine.hold` |
 | No dispense without an aspirate; no aspirate without a tip | `Machine.aspirate_uL` / `dispense` |
 | Nothing is written to disk until simulation passes | `Machine.finalize` |
 
