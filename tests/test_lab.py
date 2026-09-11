@@ -1231,6 +1231,151 @@ def test_centrifuge_protocol_refuses_one_plate_for_both_sources():
                    "one plate for both sources should raise")
 
 
+def test_pause_drains_the_queue_first():
+    """A pause behind queued motion stops somewhere later than it claims."""
+    m = _machine()
+    m.startup()
+    n = len(m.steps)
+    m.goto(70.0, 175.0, op="probe")
+    m.pause("look at it")
+
+    lines = [s.detail.get("line") for s in m.steps[n:] if s.kind == "macro"]
+    check("PAUSE" in lines, f"should emit the PAUSE macro, got {lines}")
+
+    # M400 records no Step, so read the emitted text: the drain must come
+    # after the last motion and immediately before the PAUSE, with only
+    # the comment in between.
+    emitted = [ln for ln in m.g.getvalue().splitlines() if ln.strip()]
+    i_pause = emitted.index("PAUSE")
+    before = [ln for ln in emitted[:i_pause] if not ln.startswith(";")]
+    check(before[-1].startswith("M400"),
+          f"the queue must be drained immediately before the pause, got "
+          f"{before[-1]!r}")
+
+    check(m.toggles["paused"] == 1, f"the manifest should count the pause, "
+          f"got {m.toggles.get('paused')}")
+    check(any("pause macro has never been validated" in w
+              for w in m.sim.report.warnings),
+          "an unvalidated pause macro should warn on every run that uses it")
+
+
+def test_v21_pauses_once_after_the_mix():
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 40.0})):
+        import importlib
+        import centrifuge_test_v2_1 as v21
+        importlib.reload(v21)
+        with tempfile.TemporaryDirectory() as td:
+            m, _ = v21.build(layout=TEST_LAYOUT, outdir=td, plot=False)
+
+        pauses = [s for s in m.steps if s.op == "pause" and s.kind == "macro"]
+        check(len(pauses) == 1, f"exactly one pause, got {len(pauses)}")
+
+        mixes = [s.i for s in m.steps if s.op == "mix"]
+        draws = [s.i for s in m.steps if s.op == "aspirate"
+                 and s.labware == "tube_rack_1p5"]
+        check(mixes and draws, "the run should mix and then draw from the tube")
+        check(max(mixes) < pauses[0].i < min(draws),
+              f"the pause must sit between the mix (ends {max(mixes)}) and the "
+              f"first draw (starts {min(draws)}), got {pauses[0].i}")
+
+        # Safe to sit there: nothing held, and lifted clear.
+        at = [s for s in m.steps if s.i < pauses[0].i and s.kind == "move"][-1]
+        check(at.to[2] == m.deck.z_travel,
+              f"the machine should pause at travel height, got Z {at.to[2]}")
+        check(pauses[0].fluid_uL == 0.0,
+              f"it should not pause holding fluid, got {pauses[0].fluid_uL} uL")
+
+
+def test_v21_corners_are_opposite_and_reachable():
+    """H1 and A12: high X/low Y and low X/high Y, diagonally opposite."""
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 40.0})):
+        import importlib
+        import centrifuge_test_v2_1 as v21
+        importlib.reload(v21)
+        with tempfile.TemporaryDirectory() as td:
+            m, _ = v21.build(layout=TEST_LAYOUT, outdir=td, plot=False)
+
+        p = m.deck.placement("plate2")
+        wells = {d["well"]: (d["x"], d["y"]) for d in m.dispenses
+                 if d["placement"] == "plate2"}
+        check(set(wells) == {"H1", "A12"},
+              f"plate2 should use the two corners, got {sorted(wells)}")
+
+        xs = [x for x, _ in [p.xy(r, c) for r, c in p.corner_wells()]]
+        ys = [y for _, y in [p.xy(r, c) for r, c in p.corner_wells()]]
+        check(wells["H1"] == (max(xs), min(ys)),
+              f"H1 should be the high-X low-Y corner {(max(xs), min(ys))}, "
+              f"got {wells['H1']}")
+        check(wells["A12"] == (min(xs), max(ys)),
+              f"A12 should be the low-X high-Y corner {(min(xs), max(ys))}, "
+              f"got {wells['A12']}")
+
+        # Diagonally opposite means their midpoint is the grid centre, which
+        # is what keeps the plate internally balanced.
+        mid = ((wells["H1"][0] + wells["A12"][0]) / 2.0,
+               (wells["H1"][1] + wells["A12"][1]) / 2.0)
+        check(mid == p.grid_center(),
+              f"the two corners should straddle the grid centre "
+              f"{p.grid_center()}, got {mid}")
+
+
+def test_v21_reaches_the_banded_corner_without_y_motion_in_the_band():
+    """A12 sits at X 152, inside the ejector band X[148, 162].
+
+    Reachable only because the router takes the Y leg at a clear X and comes
+    in along X - a pure X move through the band is harmless, Y motion in it
+    with a tip fitted is a hard error.
+    """
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 40.0})):
+        import importlib
+        import centrifuge_test_v2_1 as v21
+        importlib.reload(v21)
+        with tempfile.TemporaryDirectory() as td:
+            m, _ = v21.build(layout=TEST_LAYOUT, outdir=td, plot=False)
+
+        band = m.deck.keepouts[0]
+        a12 = m.deck.placement("plate2").xy(0, 11)
+        check(band.contains_x(a12[0]),
+              f"this test assumes A12 at X {a12[0]} is inside the band "
+              f"{band.x_range}; if the plate moved, retarget it")
+
+        offenders = [(s.i, s.op, s.frm[:2], s.to[:2]) for s in m.steps
+                     if s.kind == "move" and s.axes == "Y"
+                     and band.contains_x(s.frm[0])
+                     and not s.detail.get("keepout_exempt")]
+        check(not offenders,
+              f"no unexempt Y leg may happen inside the band: {offenders}")
+
+
+def test_v21_tube_arithmetic_and_the_exactly_empty_refusal():
+    with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 40.0})):
+        import importlib
+        import centrifuge_test_v2_1 as v21
+        importlib.reload(v21)
+        with tempfile.TemporaryDirectory() as td:
+            m, _ = v21.build(layout=TEST_LAYOUT, outdir=td, plot=False)
+            t = m.toggles
+            check(t["tube_contents_after_stock_uL"] == 350.0,
+                  f"200 preloaded + 150 added = 350, got "
+                  f"{t['tube_contents_after_stock_uL']}")
+            check(t["tube_contents_at_end_uL"] == 50.0,
+                  f"350 - 2x150 = 50 left, got {t['tube_contents_at_end_uL']}")
+
+            per_plate = {}
+            for d in m.dispenses:
+                per_plate.setdefault(d["placement"], []).append(
+                    d["target_volume_uL"])
+            check(sum(per_plate["plate1"]) == sum(per_plate["plate2"]) == 300.0,
+                  f"both plates must finish at 300 uL, got {per_plate}")
+
+            # The literal request - 150 preloaded, 150 added, 300 drawn -
+            # empties the tube exactly, and that is refused.
+            raises(ProtocolError,
+                   lambda: v21.build(tube_preload_uL=150.0, stock_uL=150.0,
+                                     layout=TEST_LAYOUT, outdir=td, plot=False),
+                   "150 + 150 with 300 withdrawn leaves nothing and must raise")
+
+
 def test_centrifuge_protocol_checks_its_own_arithmetic():
     with _WithConfig(_p300_with_z(tube_rack_1p5={"work": 40.0})):
         import importlib

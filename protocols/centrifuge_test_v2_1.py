@@ -1,0 +1,386 @@
+"""Centrifuge balance test, version 2.1: pause for a photograph.
+
+Same shape as `centrifuge_test.py` - two 96-well plates loaded to equal mass,
+one liquid source each - with four changes:
+
+    1. only 150 uL of water goes into the 1.5 mL tube, not 300
+    2. the run PAUSES after the mix so the operator can photograph the tube
+    3. plate 2 is loaded at two CORNERS rather than two middle wells
+    4. the tube is preloaded with 200 uL, not 50
+
+    python protocols/centrifuge_test_v2_1.py --effector p300
+
+BEFORE RUNNING: the 1.5 mL tube must be **preloaded by hand with 200 uL**, and
+`[pause_resume]` must exist in printer.cfg or the PAUSE will stop the run dead
+with a tip fitted.
+
+Sequence, with the tube contents tracked:
+
+    stage  action                                    volume   tube after
+      1    water        -> plate 1, D6                150 uL     200
+      2    water        -> plate 1, E7                150 uL     200
+      3    water        -> 1.5 mL tube                150 uL     350
+      4    mix at the tube BOTTOM, 5 cycles           200 uL     350
+      5    PAUSE for a photograph                        -       350
+      6    1.5 mL tube  -> plate 2, H1                 150 uL     200
+      7    1.5 mL tube  -> plate 2, A12                150 uL      50
+
+Each plate finishes with two wells of 150 uL, 300 uL per plate, so the pair
+still balances.
+
+**Why the preload is 200 and not 150.** The request was 150 uL added to the
+tube leaving 300 uL for use, which reads as a 150 uL preload and a tube drawn
+from 300 to nothing. A tube cannot be drawn to exactly zero: the last
+aspiration would have no liquid above the tip and would take air, that dose
+would land light, and nothing in the run could notice - there is no liquid
+inventory anywhere. 200 preloaded gives the same **300 uL of usable stock**
+plus 50 uL that has to stay behind either way. Change `--preload` if you
+disagree; `build()` refuses anything that does not leave a positive residual.
+
+**The two corners.** "Highest X and lowest Y" is **H1** at (251.0, 336.0) and
+"highest Y and lowest X" is **A12** at (152.0, 399.0). They are diagonally
+opposite about the plate centre, so plate 2 is internally balanced the way
+plate 1's D6/E7 pair is.
+
+A12 sits at X 152, **inside the tip-ejector keep-out band X[148, 162]**, where
+Y motion with a tip fitted is a hard error. It is still reachable - the router
+takes the Y leg at a clear X and comes in along X - but that is the router
+doing real work, not a coincidence, and it is why this protocol does not
+hand-order its own moves.
+
+Volumes are requested in microlitres. The millimetre displacement comes from
+the pipette's stored calibration at generation time; no mm value is typed here.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lab.effector import LabError, Pipette
+from lab.labware import well_name
+from lab.machine import Machine, ProtocolError
+
+# ---- design constants ---------------------------------------------------
+# Plate 1 keeps the middle pair; plate 2 uses the two corners the operator
+# asked for. Both pairs are diagonally opposite about the plate centre, so
+# each plate is internally balanced as well as matched to the other.
+PLATE1_WELLS = ((3, 5), (4, 6))          # D6, E7
+PLATE2_WELLS = ((7, 0), (0, 11))         # H1 (high X, low Y), A12 (low X, high Y)
+
+PLATE_DOSE_uL = 150.0    # into each well, four times total
+STOCK_uL = 150.0         # water ADDED to the 1.5 mL tube
+TUBE_PRELOAD_uL = 200.0  # already in the tube, put there by hand
+TUBE_WELL = (0, 0)
+
+MIX_CYCLES = 5
+MIX_VOLUME_uL = 200.0
+
+PREWET_CYCLES = 3
+
+PAUSE_MESSAGE = ("photograph the 1.5 mL tube, then resume. The tip is still "
+                 "fitted and the plunger is bottomed.")
+
+
+def build(
+    effector_id: str = "p300",
+    name: str | None = None,
+    water_plate: str = "plate1",
+    stock_plate: str = "plate2",
+    tube: str = "big_tubes",
+    tube_well=TUBE_WELL,
+    water_wells=PLATE1_WELLS,
+    stock_wells=PLATE2_WELLS,
+    plate_dose_uL: float = PLATE_DOSE_uL,
+    stock_uL: float = STOCK_uL,
+    tube_preload_uL: float = TUBE_PRELOAD_uL,
+    mix_cycles: int = MIX_CYCLES,
+    mix_volume_uL: float = MIX_VOLUME_uL,
+    prewet_cycles: int = PREWET_CYCLES,
+    get_tip: bool = True,
+    prewet: bool = True,
+    temp_log: bool = True,
+    eject_tip: bool = True,
+    pause_for_photo: bool = True,
+    pause_at_park: bool = True,
+    layout: str = "layout.json",
+    outdir: str = ".",
+    plot: bool = True,
+    strict: bool = True,
+):
+    name = name or "centrifuge_test_v2_1"
+    m = Machine(effector=effector_id, name=name, layout=layout,
+                strict=strict, temp_log=temp_log)
+
+    eff = m.effector
+    if not isinstance(eff, Pipette):
+        raise ProtocolError(
+            f"{effector_id} is a {eff.kind}; this protocol needs a pipette"
+        )
+
+    # ---- design checks, before a single line of gcode -------------------
+    for v in (plate_dose_uL, stock_uL, mix_volume_uL):
+        eff.check_volume(v)          # window + stroke, including the backoff
+
+    if water_plate == stock_plate:
+        raise ProtocolError(
+            f"water_plate and stock_plate are both {water_plate!r}. One source "
+            f"per plate is the point; two into one leaves nothing to balance "
+            f"against."
+        )
+    for pname, wells in ((water_plate, water_wells), (stock_plate, stock_wells)):
+        p = m.deck.placement(pname)  # raises DeckError if not loaded
+        for w in wells:
+            p.check_well(*w)         # raises IndexError if out of range
+        if len(set(wells)) != len(wells):
+            raise ProtocolError(
+                f"{pname} lists the same well twice: "
+                f"{[well_name(*w) for w in wells]}. Each dose is meant to land "
+                f"somewhere the last did not."
+            )
+    if len(water_wells) != len(stock_wells):
+        raise ProtocolError(
+            f"{water_plate} gets {len(water_wells)} doses and {stock_plate} "
+            f"gets {len(stock_wells)}; the plates would not balance."
+        )
+    m.deck.placement(tube).check_well(*tube_well)
+
+    # Nothing in the library tracks how much liquid is in a well, so the
+    # arithmetic is checked here or not at all.
+    withdrawn = plate_dose_uL * len(stock_wells)
+    available = tube_preload_uL + stock_uL
+    if withdrawn >= available:
+        # >= not >: a design that drains the tube to exactly zero looks like it
+        # closes, but the final aspiration has nothing above the tip, takes
+        # air, and lands light with nothing able to notice at run time.
+        raise ProtocolError(
+            f"the tube would hold {available} uL "
+            f"({tube_preload_uL} preloaded + {stock_uL} added) but this "
+            f"protocol withdraws {withdrawn} uL from it, leaving "
+            f"{available - withdrawn} uL. The last dose needs liquid above the "
+            f"tip, so some must remain. Raise the preload or the stock, or "
+            f"lower the dose."
+        )
+    if mix_volume_uL > available:
+        raise ProtocolError(
+            f"the mix stroke is {mix_volume_uL} uL but the tube only holds "
+            f"{available} uL; the tip would draw air"
+        )
+
+    do_tip = get_tip and eff.needs_tip
+    do_prewet = prewet and eff.prewet_enabled
+    do_eject = eject_tip and eff.can_eject_tip
+
+    m.toggles.update({
+        "protocol_version": "2.1",
+        "get_tip": do_tip, "get_tip_requested": get_tip,
+        "prewet": do_prewet, "prewet_requested": prewet,
+        "prewet_cycles_requested": prewet_cycles,
+        "temp_log": temp_log,
+        "eject_tip": do_eject, "eject_tip_requested": eject_tip,
+        "pause_for_photo": pause_for_photo, "pause_at_park": pause_at_park,
+        "plates": [water_plate, stock_plate], "tube": tube,
+        "water_plate": water_plate, "stock_plate": stock_plate,
+        "water_wells": [well_name(*w) for w in water_wells],
+        "stock_wells": [well_name(*w) for w in stock_wells],
+        "plate_dose_uL": plate_dose_uL, "stock_uL": stock_uL,
+        "tube_preload_uL": tube_preload_uL,
+        "tube_contents_after_stock_uL": available,
+        "tube_contents_at_end_uL": available - withdrawn,
+        "mix_cycles": mix_cycles, "mix_volume_uL": mix_volume_uL,
+    })
+
+    m.note(f"{name}: centrifuge mass balance, version 2.1")
+    m.note(f"{water_plate} <- water only; {stock_plate} <- {tube} only")
+    m.note(f"PRELOAD REQUIRED: {tube_preload_uL:g} uL already in {tube} "
+           f"{well_name(*tube_well)} before this runs")
+    m.note(f"each plate receives {len(water_wells)} x {plate_dose_uL:g} uL = "
+           f"{len(water_wells) * plate_dose_uL:g} uL")
+    m.note(f"{water_plate}: {', '.join(well_name(*w) for w in water_wells)}; "
+           f"{stock_plate}: {', '.join(well_name(*w) for w in stock_wells)} "
+           f"(opposite corners)")
+    m.note(f"tube: {tube_preload_uL:g} + {stock_uL:g} = {available:g} uL, "
+           f"mixed {mix_cycles}x{mix_volume_uL:g} uL, "
+           f"{withdrawn:g} withdrawn, {available - withdrawn:g} left")
+    if pause_for_photo:
+        m.note("this run PAUSES after the mix - needs [pause_resume] in "
+               "printer.cfg")
+
+    # ---- generate --------------------------------------------------------
+    m.startup()
+    m.log_temps("start")
+
+    if do_tip:
+        m.get_tip()
+    if do_prewet:
+        m.prewet(prewet_cycles)
+    m.log_temps("prewet_done")
+
+    # stages 1-2: water into both wells of the water plate
+    for w in water_wells:
+        m.log_temps(f"water_{water_plate}_{well_name(*w)}")
+        m.aspirate_uL(plate_dose_uL)
+        m.dispense(water_plate, *w)
+
+    # stage 3: top the tube up. retract=False keeps the tip in the tube,
+    # because stage 4 mixes in the same well.
+    m.log_temps("stock_to_tube")
+    m.aspirate_uL(stock_uL)
+    m.dispense(tube, *tube_well, retract=False)
+
+    # stage 4: homogenise deep in the tube, not at the surface
+    m.log_temps("mix")
+    m.mix(tube, *tube_well, cycles=mix_cycles, volume_uL=mix_volume_uL)
+
+    # stage 5: stop for the photograph. The mix leaves the tip empty and at
+    # travel height, so this is a safe place to sit. Retreating to park first
+    # takes the effector out of the shot; it is an ordinary traverse, and the
+    # tip is empty, so nothing is at risk while the machine waits.
+    if pause_for_photo:
+        m.log_temps("pause")
+        if pause_at_park:
+            m.goto_station("park", op="pause_retreat")
+        m.pause(PAUSE_MESSAGE)
+
+    # stages 6-7: the mixed stock into the two corners of the stock plate
+    for w in stock_wells:
+        m.log_temps(f"stock_{stock_plate}_{well_name(*w)}")
+        m.aspirate_from(tube, *tube_well, volume_uL=plate_dose_uL)
+        m.dispense(stock_plate, *w)
+
+    m.log_temps("end")
+    if do_eject and m.tip_fitted:
+        # The ejection forces a mandatory G28, so the machine is already home;
+        # park() then only has to drop Z.
+        m.eject_tip()
+    m.park()
+
+    return m, m.finalize(outdir=outdir, plot=plot)
+
+
+def summarise(m: Machine, result) -> None:
+    eff = m.effector
+    t = m.toggles
+    print(f"done -> {result['gcode']}")
+    print(f"        {result['manifest']}")
+    if result.get("plot"):
+        print(f"        {result['plot']}")
+    print(f"        {result['lines']} gcode lines, "
+          f"{result['dispenses']} dispenses")
+    print()
+    print(f"  {eff.id}  {eff.equation}   "
+          f"window {eff.window[0]}-{eff.window[1]} uL")
+    print(f"  toggles: " + "  ".join(
+        f"{k}={v}" for k, v in t.items() if isinstance(v, bool)))
+    print()
+    print(f"  {t['water_plate']} <- water only, "
+          f"{t['stock_plate']} <- {t['tube']} only, "
+          f"{len(t['water_wells']) * t['plate_dose_uL']:g} uL each")
+    print(f"  PRELOAD: {t['tube_preload_uL']:g} uL must already be in "
+          f"{t['tube']} before this runs")
+    print(f"  tube: {t['tube_preload_uL']:g} + {t['stock_uL']:g} = "
+          f"{t['tube_contents_after_stock_uL']:g} uL -> mixed "
+          f"{t['mix_cycles']}x{t['mix_volume_uL']:g} uL -> "
+          f"{t['tube_contents_at_end_uL']:g} uL left")
+    if t.get("pause_for_photo"):
+        print(f"  PAUSES after the mix"
+              + (" at the park position" if t.get("pause_at_park") else "")
+              + " - needs [pause_resume] in printer.cfg")
+    print()
+    header = (f"{'#':>3} {'destination':>12} {'well':>5} {'source':>8} "
+              f"{'vol_uL':>8} {'disp_mm':>8} {'asp_POS':>8} {'X':>8} {'Y':>8}")
+    print(header)
+    for d in m.dispenses:
+        source = "stock" if d["placement"] == t["stock_plate"] else "water"
+        print(f"{d['order_index']:>3} {d['placement']:>12} {d['well']:>5} "
+              f"{source:>8} "
+              f"{d['target_volume_uL']:>8.1f} {d['displacement_mm']:>8.3f} "
+              f"{d['aspirate_pos']:>8.3f} {d['x']:>8g} {d['y']:>8g}")
+
+    report = result["report"]
+    if report.warnings:
+        print()
+        print(f"{len(report.warnings)} warning(s):")
+        for w in report.warnings:
+            print(f"  - {w}")
+    unc = m.uncalibrated()
+    if unc:
+        print()
+        print(f"{len(unc)} uncalibrated field(s) recorded in the manifest:")
+        for u in unc:
+            print(f"  - {u}")
+
+
+def main(argv=None) -> int:
+    from lab import effector as _eff
+
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--effector", default="p300", choices=_eff.available(),
+                    help="which end effector, i.e. config/effectors/<id>.json")
+    ap.add_argument("--name", default=None, help="output basename")
+    ap.add_argument("--water-plate", default="plate1", dest="water_plate",
+                    help="layout placement loaded from the water reservoir")
+    ap.add_argument("--stock-plate", default="plate2", dest="stock_plate",
+                    help="layout placement loaded from the mixed tube stock")
+    ap.add_argument("--tube", default="big_tubes",
+                    help="layout placement holding the 1.5 mL tube")
+    ap.add_argument("--dose", type=float, default=PLATE_DOSE_uL,
+                    dest="plate_dose_uL", help="uL into each well")
+    ap.add_argument("--stock", type=float, default=STOCK_uL, dest="stock_uL",
+                    help="uL of water added to the tube")
+    ap.add_argument("--preload", type=float, default=TUBE_PRELOAD_uL,
+                    dest="tube_preload_uL",
+                    help="uL already in the tube by hand before the run")
+    ap.add_argument("--mix-cycles", type=int, default=MIX_CYCLES,
+                    dest="mix_cycles")
+    ap.add_argument("--mix-volume", type=float, default=MIX_VOLUME_uL,
+                    dest="mix_volume_uL")
+    ap.add_argument("--prewet-cycles", type=int, default=PREWET_CYCLES,
+                    dest="prewet_cycles")
+    ap.add_argument("--layout", default="layout.json",
+                    help="layout file in the config dir; the per-run bench")
+    ap.add_argument("--outdir", default=".")
+    ap.add_argument("--no-tip", dest="get_tip", action="store_false")
+    ap.add_argument("--no-prewet", dest="prewet", action="store_false")
+    ap.add_argument("--no-temp-log", dest="temp_log", action="store_false")
+    ap.add_argument("--no-plot", dest="plot", action="store_false")
+    ap.add_argument("--no-pause", dest="pause_for_photo", action="store_false",
+                    help="skip the photograph pause after the mix")
+    ap.add_argument("--pause-in-place", dest="pause_at_park",
+                    action="store_false",
+                    help="pause above the tube instead of retreating to park")
+    ap.add_argument("--no-eject-tip", dest="eject_tip", action="store_false",
+                    help="skip the tip ejection. It runs by default, and it "
+                         "forces a G28 afterwards, which is what returns the "
+                         "machine home. NOTE the ejection routine has still "
+                         "never been validated on hardware.")
+    ap.add_argument("--lenient", dest="strict", action="store_false",
+                    help="collect every simulation error instead of raising on "
+                         "the first. Still refuses to write the gcode.")
+    a = ap.parse_args(argv)
+
+    try:
+        m, result = build(
+            effector_id=a.effector, name=a.name,
+            water_plate=a.water_plate, stock_plate=a.stock_plate,
+            tube=a.tube, plate_dose_uL=a.plate_dose_uL, stock_uL=a.stock_uL,
+            tube_preload_uL=a.tube_preload_uL, mix_cycles=a.mix_cycles,
+            mix_volume_uL=a.mix_volume_uL, prewet_cycles=a.prewet_cycles,
+            get_tip=a.get_tip, prewet=a.prewet, temp_log=a.temp_log,
+            eject_tip=a.eject_tip, pause_for_photo=a.pause_for_photo,
+            pause_at_park=a.pause_at_park, layout=a.layout, outdir=a.outdir,
+            plot=a.plot, strict=a.strict,
+        )
+    except LabError as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 1
+
+    summarise(m, result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

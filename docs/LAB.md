@@ -29,6 +29,7 @@ lab/
 protocols/
   accuracy_test.py     ISO 8655 accuracy/repeatability, any pipette
   centrifuge_test.py   two plates to equal mass, one liquid source each
+  centrifuge_test_v2_1.py  as above, but pauses for a photo; corner wells
 
 tools/compare_gcode.py compare two .gcode files by motion, not bytes
 tests/test_lab.py      regression tests; pins every known-good coordinate
@@ -110,6 +111,43 @@ Three design points that are easy to get backwards:
 into the manifest, because a balance reading is not interpretable without
 knowing which liquid a plate held.
 
+### Version 2.1
+
+`protocols/centrifuge_test_v2_1.py` keeps the shape and changes four things:
+only 150 uL of water goes into the tube, the tube is preloaded with 200 uL,
+the run **pauses after the mix** so the operator can photograph the tube, and
+plate 2 is loaded at two **corners** instead of two middle wells.
+
+| | plate 1 | plate 2 |
+|---|---|---|
+| wells | D6, E7 | **H1** (251.0, 336.0), **A12** (152.0, 399.0) |
+| source | water | the mixed tube stock |
+| total | 2 x 150 = 300 uL | 2 x 150 = 300 uL |
+
+Both pairs are diagonally opposite about the plate centre, so each plate is
+internally balanced as well as matched to the other - `Placement.grid_center()`
+is the midpoint of each pair, and a test asserts it.
+
+**A12 is at X 152, inside the tip-ejector band X[148, 162]**, where Y motion
+with a tip fitted is a hard error. It is reachable because `_route_xy` takes
+the Y leg at a clear X (252.5, coming off the tube) and then crosses the band
+in X, which is harmless. That is the router earning its place; do not
+hand-order moves into that column.
+
+**The preload is 200 uL, not 150.** 150 preloaded plus 150 added is 300, and
+drawing 2 x 150 out of 300 empties the tube exactly - the last aspiration
+would have no liquid above the tip. `build()` refuses that, so 200 gives the
+same 300 uL of usable stock plus the 50 uL that has to stay behind anyway.
+
+**The pause needs `[pause_resume]` in `printer.cfg`.** `Machine.pause()` emits
+`M400` and then the deck's `pause` macro, in that order, because a pause queued
+behind unexecuted motion stops the machine somewhere later than the protocol
+says it stopped. The macro is flagged `pause_validated: false` in `deck.json`
+and every run that pauses warns about it: if the section is missing, Klipper
+errors on an unknown command and stops with a tip fitted. By default the
+effector retreats to park first so it is out of the shot; `--pause-in-place`
+keeps it above the tube, and `--no-pause` skips the stop entirely.
+
 ## Rules the library enforces so a protocol cannot break them
 
 | rule | where |
@@ -125,6 +163,7 @@ knowing which liquid a plate held.
 | Tips are consumed edge-first, and a used position is never revisited | `Machine._next_free_tip_col` |
 | After a tip pickup, the exit is X-first over already-consumed positions | `Machine._exit_tip_box` |
 | Every tip ejection is followed by `G28` | `Simulator._pending_eject_home` |
+| A pause drains the motion queue before it stops | `Machine.pause` |
 | No dispense without an aspirate; no aspirate without a tip | `Machine.aspirate_uL` / `dispense` |
 | Nothing is written to disk until simulation passes | `Machine.finalize` |
 
