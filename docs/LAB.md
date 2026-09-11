@@ -1,6 +1,7 @@
 # The `lab` layer
 
 > Function-by-function reference: [API.md](API.md).
+> What actually happened on the bench: [RUNS.md](RUNS.md).
 
 Everything the pipetting robot knows about itself lives in `config/`. Everything
 it knows how to *do* lives in `lab/`. A protocol script is then just the
@@ -27,6 +28,7 @@ lab/
 
 protocols/
   accuracy_test.py     ISO 8655 accuracy/repeatability, any pipette
+  centrifuge_test.py   two plates to equal mass, one liquid source each
 
 tools/compare_gcode.py compare two .gcode files by motion, not bytes
 tests/test_lab.py      regression tests; pins every known-good coordinate
@@ -56,11 +58,57 @@ result = m.finalize(outdir="out") # simulates, THEN writes
 hard check fails. It also writes `<name>.manifest.json` and
 `<name>.balance.csv`.
 
-Run the built-in protocol:
+Run a built-in protocol:
 
 ```bash
 python protocols/accuracy_test.py --effector p300 --outdir out
+python protocols/centrifuge_test.py --effector p300 --outdir out
 ```
+
+## The centrifuge balance test
+
+`protocols/centrifuge_test.py` prepares two 96-well plates with **equal mass**
+so they can sit opposite each other in a centrifuge, while giving each plate a
+**single liquid source** so the samples stay unmixed.
+
+The deck it expects: tips in slot 3, a 96-well plate in slots 1 and 2, the
+1.5 mL tube holder in slot 5, water at the station near slot 9.
+
+| stage | action | volume | tube after |
+|---|---|---|---|
+| 1 | water → plate 1, D6 | 150 µL | 50 |
+| 2 | water → plate 1, E7 | 150 µL | 50 |
+| 3 | water → 1.5 mL tube | 300 µL | 350 |
+| 4 | mix at Z 54, 5 cycles | 200 µL | 350 |
+| 5 | tube → plate 2, D6 | 150 µL | 200 |
+| 6 | tube → plate 2, E7 | 150 µL | 50 |
+
+**The tube is preloaded by hand with 50 µL before the run.** Nothing in the
+library tracks liquid in a well, so source sufficiency is the protocol's own
+job: `build()` refuses a design that withdraws more than the tube holds, and
+refuses one that empties it *exactly* — the final draw needs liquid above the
+tip or it takes air, and no check at run time could notice.
+
+Each plate finishes with two wells of 150 µL, 300 µL per plate. The two wells
+are diagonally opposite about the plate centre, so each plate is internally
+balanced as well as matched to the other.
+
+Three design points that are easy to get backwards:
+
+* **Every transfer is an independent aspirate plus full blow-out.** One 300 µL
+  load split into two metered 150 µL dispenses would be fewer moves, but the
+  second dispense retains a film the first did not, and one plate would land a
+  few µL light. Equal mass is the entire point.
+* **Draw and dispense use different depths in the tube** — `aspirate` 54.0 and
+  `work` 35.0. A dispense wants to be above the liquid; a draw wants the orifice
+  under it, and the further the level falls the deeper that has to be.
+* **Z 54 is 1 mm past the Z 53.0 raised-edge limit.** Legal only because the mix
+  and the draw are XY-stationary inside slot 5 and lift to travel height before
+  any XY move. The simulator hard-fails any XY leg at that depth.
+
+`--water-plate` and `--stock-plate` name which plate gets which source; both go
+into the manifest, because a balance reading is not interpretable without
+knowing which liquid a plate held.
 
 ## Rules the library enforces so a protocol cannot break them
 
@@ -169,8 +217,11 @@ Row-major, three rows of three. **Slots 1-3 are the front row** (largest Y,
 365), 4-6 the middle (272), **7-9 the back** (smallest Y, 178.5). Within a row
 X descends, so the first of the three is highest X.
 
-Currently loaded: tip rack in **slot 3**, 0.65 mL tube holder in **slot 8**,
-water in **slot 9**.
+Currently loaded (`config/layout.json`, the centrifuge bench): tip rack in
+**slot 3**, 96-well plates in **slots 1 and 2**, the 1.5 mL tube holder in
+**slot 5**, water at the station near **slot 9**. The 0.65 mL holder that the
+accuracy protocol uses is off the deck; `config/layout_test.json` is the
+fixture that keeps the test suite independent of whatever is loaded today.
 
 ## The Z envelope, measured 2026-08-26
 

@@ -5,7 +5,8 @@ output drives real hardware into real glassware, so a wrong number here does not
 crash - it dispenses into the wrong tube and the balance readings still look
 plausible.
 
-`docs/LAB.md` orients; `docs/API.md` documents every function. Two project
+`docs/LAB.md` orients; `docs/API.md` documents every function;
+`docs/RUNS.md` logs what happened on the bench. Two project
 subagents exist: **lab-explainer** for "why do these numbers disagree" and doc
 work, **lab-engineer** for code changes.
 
