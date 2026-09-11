@@ -377,40 +377,39 @@ class Machine:
         macro = self.deck.macro("log_temps")
         self._raw(f"{macro}{tag}", op="log_temps", tag=tag)
 
-    def pause(self, message: str = "") -> None:
-        """Stop and wait for the operator. Emits M400, then the PAUSE macro.
+    def hold(self, seconds: float, z: Optional[float] = None,
+             op: str = "hold") -> None:
+        """Sit still for a while, optionally at a commanded Z first.
 
-        The M400 is not decoration: without it the pause is queued behind
-        motion that has not run yet, so the machine would stop somewhere
-        later than the protocol says it stopped. Draining the queue first is
-        what makes "paused here" true.
+        For letting something happen that is not a machine action - beads
+        settling, a droplet draining off the tip, an operator photographing
+        the tube. Unlike stopping for a human it needs nothing in printer.cfg
+        and cannot leave the machine waiting forever.
 
-        The effector keeps whatever state it has - a fitted tip stays fitted,
-        the plunger stays where it is - so a protocol should reach a position
-        it is happy to sit at before calling this. Nothing here checks that,
-        because "happy to sit at" is a judgement about the experiment.
+        `z` is a COMMANDED Z, so remember the frame: +Z is down, and a
+        SMALLER number is physically higher. Holding at z=10.0 after mixing
+        at z=54.0 lifts the tip 44 mm out of the well. The move is checked
+        like any other, so an unsafe depth is refused rather than held at.
 
-        `message` is recorded as a gcode comment, in `self.notes`, and in the
-        step detail, so the manifest says what the operator was asked to do.
-
-        Raises DeckError if the deck declares no pause macro.
+        XY is not touched. A hold happens where the machine already is, which
+        is what keeps it clear of the travel-height rule - that rule governs
+        XY motion, and there is none here.
         """
-        self.wait()                       # the queue must be empty first
-        if message:
-            self.note(f"PAUSE: {message}")
-        self._raw(self.deck.macro("pause"), "pause", message=message)
-        self.toggles["paused"] = self.toggles.get("paused", 0) + 1
-
-        # The macro has never been exercised on this machine, and a missing
-        # [pause_resume] section fails at the pause rather than at generation.
-        if not self.deck.raw.get("klipper_macros", {}).get("pause_validated"):
-            self.sim.warn(
-                "pause_unvalidated",
-                "this run PAUSES, and the pause macro has never been validated "
-                "on this machine. It needs [pause_resume] in printer.cfg; "
-                "without it Klipper errors on an unknown command and stops "
-                "with a tip fitted. Confirm the section exists first.",
+        if seconds <= 0:
+            raise ProtocolError(
+                f"hold() needs a positive duration, got {seconds}. Use "
+                f"nothing at all rather than a zero-length hold."
             )
+        if z is not None:
+            self._move_z(z, self.deck.feedrate("travel"), op)
+            self.wait()
+        self.dwell(seconds, op=op)
+        # Deliberately not "hold_seconds": a protocol records its REQUESTED
+        # hold under names of its own, and an accumulator that silently added
+        # to one of them would report a 30 s hold as 60.
+        self.toggles["holds"] = self.toggles.get("holds", 0) + 1
+        self.toggles["held_seconds_total"] = (
+            self.toggles.get("held_seconds_total", 0.0) + seconds)
 
     def note(self, text: str) -> None:
         """A comment in the gcode and a line in the manifest."""
@@ -832,7 +831,8 @@ class Machine:
                                  prefer=p.labware.approach_order)
 
     def mix(self, placement: str, row: int, col: int, cycles: int,
-            volume_uL: float, z_key: str = "mix") -> None:
+            volume_uL: float, z_key: str = "mix",
+            retract: bool = True) -> None:
         """Homogenise a well by cycling the plunger deep in it.
 
         `z_key` defaults to "mix", a per-effector depth that sits BELOW the
@@ -872,7 +872,12 @@ class Machine:
         for _ in range(cycles):
             self.actuator(top, settle=eff.settle_s, op="mix")            # draw up
             self.actuator(eff.blowout_pos, settle=eff.settle_s, op="mix")  # push back
-        self._move_z(self.deck.z_travel, f, "mix", labware=lid)
+        if retract:
+            # retract=False leaves the tip at the mix depth for a caller that
+            # is about to move Z itself - hold() lifting straight out of the
+            # well, say. Lifting to travel and being pulled back down is the
+            # same wasted round trip dispense(retract=False) exists to avoid.
+            self._move_z(self.deck.z_travel, f, "mix", labware=lid)
         self.wait()
 
         self.toggles["mix_cycles"] = cycles
