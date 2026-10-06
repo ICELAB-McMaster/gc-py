@@ -444,14 +444,20 @@ class Machine:
         """Emit one GRIPPER_* macro, fenced by M400 and a guard dwell."""
         eff = self._gripper()
         name = eff.macro(op)
-        if self._imu_session is not None and op not in self._DURING_CAPTURE:
+        concurrent = bool((eff.spec.get("capture_concurrency") or {})
+                          .get("commands_during_capture"))
+        if (self._imu_session is not None and not concurrent
+                and op not in self._DURING_CAPTURE):
             raise ProtocolError(
                 f"{name} cannot be sent while an IMU capture is running. The "
                 f"board streams samples in a blocking loop and does not read "
                 f"the command queue until it finishes - the command would be "
                 f"QUEUED and then fire when the capture ends, long after the "
                 f"gantry has moved on. Only abort, stop and a mark get "
-                f"through. Stop the capture first: gripper_imu_stop()."
+                f"through. Stop the capture first: gripper_imu_stop(). If "
+                f"the firmware has since been fixed, set "
+                f"capture_concurrency.commands_during_capture true in "
+                f"config/effectors/{eff.id}.json."
             )
         if name in eff.forbidden_macros:
             raise ProtocolError(
