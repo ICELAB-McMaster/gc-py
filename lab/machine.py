@@ -594,13 +594,20 @@ class Machine:
         self._move_z(z, feedrate or self.deck.feedrate("travel"), op)
 
     def gripper_imu_start(self, csv: str, label: Optional[str] = None,
-                          rate: Optional[int] = None) -> None:
+                          rate: Optional[int] = None,
+                          dest: Optional[str] = None) -> None:
         """Begin an IMU capture that keeps running while the gantry moves.
 
         Unlike `gripper_imu`, which is one blocking fixed-length capture, this
         brackets motion: start, move, mark, stop. It needs `imu_session.py` on
         the Pi - the shipped `gripctl.py imu` is blocking and has no start or
         stop, so there was no way to record THROUGH a pick.
+
+        `csv` is a LOCAL path on the Pi. `dest` is where the finished capture
+        is copied when it stops - a mounted directory, not a UNC path, and
+        nothing here can verify it is mounted. The capture is never written
+        straight to a share: a stalled mount would truncate the run and look
+        like a short recording rather than an error.
         """
         self._gripper()
         if self._imu_session is not None:
@@ -609,12 +616,22 @@ class Machine:
                 f"stop it before starting another. The host keeps one session "
                 f"at a time and would refuse the second."
             )
+        if dest and "\\" in dest:
+            raise ProtocolError(
+                f"the IMU destination {dest!r} looks like a Windows UNC path. "
+                f"The capture runs on the Pi, where that is not a path at all "
+                f"- it would become a filename with backslashes in it. Mount "
+                f"the share and give the mounted directory instead."
+            )
         args = f"CSV={csv}"
         if label:
             args += f" LABEL={label}"
         if rate:
             args += f" RATE={int(rate)}"
-        self._gripper_macro("imu_start", args, csv=csv, label=label, rate=rate)
+        if dest:
+            args += f" DEST={dest}"
+        self._gripper_macro("imu_start", args, csv=csv, label=label,
+                            rate=rate, dest=dest)
         self._imu_session = csv
         self.toggles["imu_sessions"] = self.toggles.get("imu_sessions", 0) + 1
 
