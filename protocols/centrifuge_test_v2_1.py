@@ -90,7 +90,7 @@ TUBE_PRELOAD_uL = 150.0  # already in the tube, put there by hand
 TUBE_WELL = (0, 0)
 
 MIX_CYCLES = 5
-MIX_VOLUME_uL = 200.0
+MIX_VOLUME_uL = 250.0
 
 PREWET_CYCLES = 3
 
