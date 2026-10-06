@@ -281,8 +281,9 @@ ordering.
 `gripctl.py imu` is a **blocking, fixed-duration** capture: it runs for
 `--seconds` and returns. From gcode that cannot express "start recording, now
 move, now stop", which is what measuring a pick actually needs. Three macros
-and a host wrapper close that gap, all of them **new and never run on
-hardware**:
+and a host wrapper close that gap. The macros are confirmed working on
+hardware (2026-10-06); the wrapper has been fixed once since and has **still
+not completed a live capture** - see [RUNS.md](RUNS.md):
 
 | | |
 |---|---|

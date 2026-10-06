@@ -11,6 +11,55 @@ claim. Where a number is derived, say what from.
 
 ---
 
+## 2026-10-06 - gripper bring-up at station 9
+
+First hardware run of `protocols/gripper_station9_test.py`. Two failures,
+neither in the motion.
+
+**Attempt 1: every GRIPPER_* came back `Unknown command`.**
+`gripper_macros.cfg` had never been included from `printer.cfg`. The
+significant part is what Klipper did next: it **carried on**. The gantry ran
+the whole sequence - traverse, descend to Z 107, lift, hold, lower, retreat -
+with the gripper inert, and the log reads like a completed run.
+
+Fixed by installing it (`[include gripper_macros.cfg]`, with
+`shell_command.cfg` for the `gcode_shell_command` extra). Guarded by emitting
+`GRIPPER_PING` and `GRIPPER_STATUS` **before `G28`**, so the failure now
+arrives with the machine parked. Nothing in a gcode file can force Klipper to
+abort on an unknown command; this only moves when it is noticed.
+
+**Attempt 2: the gripper worked, the IMU wrapper did not.**
+
+    pong from node 0 in 7.0 ms
+    n/a deg   13 mA  pulse 0 us  idle  [homed,powered]
+    home: done -> 0.0 deg, mean 133 mA, peak/extra 1234
+    open: done -> 0.0 deg, mean  92 mA, peak/extra  157
+
+Then `FileNotFoundError: /home/admin/imu/..._01.csv.marks.csv`.
+`/home/admin/imu` did not exist. Three faults in `host/imu_session.py`, all
+mine:
+
+* nothing created the parent directory - and `gripctl.py imu --csv` does not
+  either, so the forked capture had already died for the same reason,
+* the fork happened **before** the write that failed, leaving an orphaned
+  child and a state file naming a dead pid,
+* `_append_mark` assumed the file existed, so every later mark and the stop
+  raised their own traceback on top of the first.
+
+Fixed: the directory and the marks header are created **before** the fork, a
+`--settle` check confirms the capture survived its first moment, the child's
+output is kept at `<csv>.log`, and a mark never raises - it records the
+timestamp and warns if the capture has gone.
+
+**Note `status` reports `n/a deg`.** That is the expected reading, not a
+fault: the feedback output has failed, so there is no position to report.
+
+**Still open:** nothing has yet confirmed the IMU records across a pick,
+because attempt 2 never got a live capture. Run the single-cycle file and
+check `<csv>.log` is empty and the CSV has rows before trying 15.
+
+---
+
 ## 2026-09-11 - centrifuge_test with latex microbeads
 
 First hardware run of `protocols/centrifuge_test.py`. The suspension handled
