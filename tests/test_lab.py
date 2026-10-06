@@ -349,6 +349,169 @@ def test_a_hold_that_outlasts_its_expiry_is_refused():
            "dwelling past the expiry must refuse rather than drop the plate")
 
 
+def _station9(**kw):
+    import importlib
+    import gripper_station9_test as g9
+    importlib.reload(g9)
+    with tempfile.TemporaryDirectory() as td:
+        kw.setdefault("plot", False)
+        return g9.build(outdir=td, layout=TEST_LAYOUT, **kw)[0]
+
+
+def test_station9_heights_run_in_the_order_the_operator_specified():
+    """approach 90 -> grip 107 -> lift 90 -> lower 100 -> retreat 90.
+
+    +Z is DOWN throughout, so 107 is the lowest point and 90 the highest.
+    """
+    m = _station9(cycles=1)
+    # Select by op rather than slicing the list: startup and park also move
+    # Z, and an index that happens to work today breaks the moment either
+    # gains a step.
+    cycle_ops = ("approach", "descend", "lift", "lower", "retreat")
+    cycle = [s.to[2] for s in m.steps
+             if s.kind == "move" and s.axes == "Z" and s.op in cycle_ops]
+    check(cycle == [90.0, 107.0, 90.0, 100.0, 90.0],
+          f"the cycle should be 90, 107, 90, 100, 90; got {cycle}")
+
+    d = m.deck.station("gripper_pick_9")
+    check((round(d.xy[0], 2), round(d.xy[1], 2)) == (69.50, 178.20),
+          f"station 9 pick point should be (69.50, 178.20), got {d.xy}")
+    xy = [s for s in m.steps if s.kind == "move" and s.axes in ("X", "Y")]
+    check(xy and all(abs(s.to[2] - m.deck.z_travel) < 1e-6 for s in xy),
+          "every XY leg must happen at travel height")
+
+
+def test_station9_imu_brackets_the_pick_and_marks_each_phase():
+    m = _station9(cycles=1)
+    ops = [(s.i, s.op) for s in m.steps if s.kind == "macro"]
+    starts = [i for i, op in ops if op == "gripper:imu_start"]
+    stops = [i for i, op in ops if op == "gripper:imu_stop"]
+    marks = [i for i, op in ops if op == "gripper:imu_mark"]
+    grips = [i for i, op in ops if op == "gripper:grip"]
+    rels = [i for i, op in ops if op == "gripper:release"]
+
+    check(len(starts) == len(stops) == 1,
+          f"one capture per cycle, got {len(starts)} starts {len(stops)} stops")
+    check(starts[0] < grips[0],
+          "the capture must be running before the grip, or the grip "
+          "transient is lost")
+    check(stops[0] < rels[0],
+          "as specified, the capture stops BEFORE the release")
+    check(len(marks) == 5,
+          f"five phase marks - at_grip, gripped, lifted, held, at_release; "
+          f"got {len(marks)}")
+    check(all(starts[0] < i < stops[0] for i in marks),
+          "every mark must fall inside the open capture")
+
+    # kind=="macro" matters: the guard dwell that follows each macro is
+    # recorded under the SAME op name, so an unfiltered list is half Nones.
+    labels = [s.detail.get("label") for s in m.steps
+              if s.op == "gripper:imu_mark" and s.kind == "macro"]
+    check(all(l and l.startswith("pick01_") for l in labels),
+          f"each mark must name the pick it belongs to: {labels}")
+    check(any("gripped_500ma" in l for l in labels),
+          f"the grip current belongs in the label: {labels}")
+
+
+def test_station9_marks_and_sessions_refuse_outside_a_capture():
+    m = _station9(cycles=1)
+    raises(ProtocolError, lambda: m.gripper_imu_mark("stray"),
+           "a mark with no capture open would be written to nothing")
+    raises(ProtocolError, m.gripper_imu_stop,
+           "stopping a capture that is not running should raise")
+
+
+def test_station9_declares_the_seven_millimetre_drop():
+    """Releasing 7 mm above the grip is deliberate, and must be said."""
+    m = _station9(cycles=1)
+    check(m.toggles["release_drop_mm"] == 7.0,
+          f"the drop should be 107 - 100 = 7 mm, got "
+          f"{m.toggles['release_drop_mm']}")
+    check(any("falls that far" in w for w in m.sim.report.warnings),
+          f"a declared drop must still warn: {m.sim.report.warnings}")
+
+
+def test_an_undeclared_drop_is_still_refused():
+    """The rule moved from "never" to "this far, on purpose" - not away."""
+    m = _gripper_machine()
+    m.startup()
+    m.gripper_home()
+    m.gripper_open()
+    m.move_to_z(107.0, op="probe")
+    m.grip(ma=500, what="part")
+    m.move_to_z(100.0, op="probe")        # 7 mm above the grip
+    raises(ProtocolError, m.release,
+           "the default max_drop_mm is 0, so this must refuse")
+    raises(ProtocolError, lambda: m.release(max_drop_mm=6.0),
+           "a declared drop smaller than the real one must still refuse")
+    m.release(max_drop_mm=7.0)            # declared, allowed
+    check(m.gripper_holding is None, "the release should have happened")
+
+
+def test_station9_repeats_cleanly_for_fifteen_cycles():
+    m = _station9(cycles=15)
+    check(m.toggles["grips"] == 15, f"15 grips, got {m.toggles['grips']}")
+    check(m.toggles["imu_sessions"] == 15,
+          f"one capture per pick, got {m.toggles['imu_sessions']}")
+    check(m.toggles["imu_marks"] == 75, f"5 marks x 15 picks, got "
+          f"{m.toggles['imu_marks']}")
+    check(m.gripper_holding is None, "the run must not end holding the part")
+
+    # Every cycle re-homes, because timed travel drifts.
+    homes = [s for s in m.steps
+             if s.op == "gripper:home" and s.kind == "macro"]
+    check(len(homes) == 15, f"one re-home per cycle, got {len(homes)}")
+
+    # And each capture is named for its own pick, so the files do not collide.
+    csvs = [s.detail.get("csv") for s in m.steps
+            if s.op == "gripper:imu_start" and s.kind == "macro"]
+    check(len(set(csvs)) == 15, f"15 distinct capture files, got "
+          f"{len(set(csvs))}")
+    check(csvs[0].endswith("_01.csv") and csvs[-1].endswith("_15.csv"),
+          f"captures should be numbered per pick: {csvs[0]} .. {csvs[-1]}")
+
+
+def _gripper_station_config(**z):
+    """Temp LAB_CONFIG with the station-9 heights overridden."""
+    import json as _json, shutil
+    from lab import config as cfgmod
+    d = Path(tempfile.mkdtemp())
+    for src in cfgmod.config_dir().glob("*.json"):
+        shutil.copy(src, d / src.name)
+    shutil.copytree(cfgmod.config_path("effectors"), d / "effectors")
+    spec = _json.loads((d / "effectors" / "gripper.json").read_text())
+    spec["z_for_station"]["gripper_pick_9"].update(z)
+    (d / "effectors" / "gripper.json").write_text(_json.dumps(spec))
+    return d
+
+
+def test_station9_refuses_heights_in_the_wrong_sense():
+    """+Z is DOWN, so grip must be the LARGER number than approach.
+
+    Getting this backwards is the single most likely way to write this
+    protocol wrong, and it would drive the gripper upward onto the part.
+    """
+    import importlib
+    import gripper_station9_test as g9
+
+    # grip ABOVE approach
+    with _WithConfig(_gripper_station_config(grip=80.0)):
+        importlib.reload(g9)
+        with tempfile.TemporaryDirectory() as td:
+            raises(ProtocolError,
+                   lambda: g9.build(outdir=td, layout=TEST_LAYOUT, plot=False),
+                   "a grip height above the approach must refuse")
+
+    # release outside the approach..grip band
+    with _WithConfig(_gripper_station_config(release=120.0)):
+        importlib.reload(g9)
+        with tempfile.TemporaryDirectory() as td:
+            raises(ProtocolError,
+                   lambda: g9.build(outdir=td, layout=TEST_LAYOUT, plot=False),
+                   "releasing below the grip would drive the part down")
+    importlib.reload(g9)
+
+
 def test_unknown_effector():
     raises(EffectorError, lambda: eff_mod.load("p1000"),
            "an unknown effector id should raise")

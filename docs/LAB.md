@@ -31,6 +31,7 @@ protocols/
   centrifuge_test.py   two plates to equal mass, one liquid source each
   centrifuge_test_v2_1.py  location 2 only, two corner wells
   gripper_plate_test.py    pick a plate, lift, read the IMU, put it back
+  gripper_station9_test.py pick at station 9, IMU through the pick
 
 tools/compare_gcode.py compare two .gcode files by motion, not bytes
 tests/test_lab.py      regression tests; pins every known-good coordinate
@@ -246,9 +247,45 @@ is confirmed and the dwells disappear, about 3.5 s a cycle. Note the guard is
 a `G4` and **not** an `M400`: `M400` drains the *motion* queue, and a shell
 command was never in it.
 
-The IMU is reached through `GRIPPER_IMU`, which this work **added** to
-`gripper_macros.cfg` - the shipped file had no IMU macro, so there was no way
-to ask for a measurement from gcode at all.
+### Recording through a pick
+
+`gripctl.py imu` is a **blocking, fixed-duration** capture: it runs for
+`--seconds` and returns. From gcode that cannot express "start recording, now
+move, now stop", which is what measuring a pick actually needs. Three macros
+and a host wrapper close that gap, all of them **new and never run on
+hardware**:
+
+| | |
+|---|---|
+| `GRIPPER_IMU` | the shipped blocking capture. Added to the cfg - it had no IMU macro at all |
+| `GRIPPER_IMU_START` / `_MARK` / `_STOP` | a session that spans motion, via `host/imu_session.py` |
+
+`imu_session.py` forks the capture and **SIGINT**s it to finish, because
+`cmd_imu` catches `KeyboardInterrupt`, aborts the board and still calls
+`log.finish()` - so the CSV closes properly where a `SIGTERM` would truncate
+it. Marks go to `<csv>.marks.csv` as elapsed seconds plus a label; join on
+elapsed time. The capture file is named per pick, so *which pick-up* is the
+filename and *which part of the cycle* is the mark.
+
+### The station 9 pick test
+
+`protocols/gripper_station9_test.py`, every height operator-measured
+2026-10-06. XY (69.50, 178.20), which is a **station** rather than a slot
+placement - it is one measured position for a part, not a labware grid.
+
+    approach Z 90 -> descend Z 107 -> grip -> lift Z 90 -> hold 1 s
+        -> lower Z 100 -> stop IMU -> release -> Z 90, repeat
+
+**The release is 7 mm above the grip, so the part falls 7 mm.**
+`Machine.release` takes `max_drop_mm`, defaulting to **zero** - an accidental
+release at height still refuses outright. A protocol that means to drop a
+part says how far, the number goes in the manifest, and the run warns anyway.
+The rule moved from "never" to "this far, on purpose"; it did not go away.
+
+`Machine.move_to_z` is the deliberate exception to "Z is never commanded
+directly". Pipetting depths come from labware; a gripper sequence is a list of
+measured heights that belong to the *part*. It routes through `_move_z`, so
+every envelope, stage-floor and raised-edge check still applies.
 
 ## Conventions that read backwards
 
