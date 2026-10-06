@@ -70,7 +70,12 @@ HOLD_S = 1.0              # at the raised height, between lift and descent
 POST_RELEASE_S = 1.0      # keep recording after the jaws open, so the 7 mm
                           # fall and the landing are in the capture
 IMU_RATE = None           # samples/s; None lets the host choose
-CSV_DIR = "/home/admin/imu"   # ON THE PI, not on this machine
+CSV_DIR = "/home/admin/imu"   # ON THE PI. Local disk: the capture is written
+                              # here and copied to DEST_DIR when it stops.
+# \\ICE-NAS\Data\GC_ARCCS\GripperIMU as the Pi sees it, assuming the Data
+# share is mounted at /mnt/ice-nas. A UNC path cannot be used directly - the
+# capture runs on Linux.
+DEST_DIR = "/mnt/ice-nas/GC_ARCCS/GripperIMU"
 CYCLES = 1
 
 
@@ -84,6 +89,7 @@ def build(
     post_release_s: float = POST_RELEASE_S,
     imu_rate: int | None = IMU_RATE,
     csv_dir: str = CSV_DIR,
+    dest_dir: str | None = DEST_DIR,
     imu: bool = True,
     layout: str = "layout.json",
     outdir: str = ".",
@@ -162,6 +168,7 @@ def build(
         "z_approach": z_approach, "z_grip": z_grip, "z_release": z_release,
         "release_drop_mm": drop_mm,
         "imu": imu, "imu_rate": imu_rate, "csv_dir": csv_dir,
+        "dest_dir": dest_dir,
         "held_dwell_per_cycle_s": held_s,
         "shell_blocks": eff.spec.get("shell_command", {}).get("blocks"),
     })
@@ -178,6 +185,10 @@ def build(
                f"phase marks in the matching .marks.csv")
         m.note(f"the capture spans the RELEASE and runs {post_release_s:g} s "
                f"past it, so the fall and the landing are recorded")
+        if dest_dir:
+            m.note(f"each capture is copied to {dest_dir} on the Pi when it "
+                   f"stops - that must be a MOUNTED share, and the originals "
+                   f"stay in {csv_dir} either way")
         m.note("IMU start/stop needs host/imu_session.py, which is NEW and "
                "has never been run on hardware")
 
@@ -204,7 +215,8 @@ def build(
 
         if imu:
             m.gripper_imu_start(csv=f"{csv_dir}/{name}_{tag}.csv",
-                                label=f"pick{tag}", rate=imu_rate)
+                                label=f"pick{tag}", rate=imu_rate,
+                                dest=dest_dir)
             m.gripper_imu_mark(f"pick{tag}_at_grip_z{z_grip:g}")
 
         m.grip(ma=int(grip_ma), what=f"part@{station}")
@@ -255,6 +267,8 @@ def summarise(m: Machine, result) -> None:
     if t.get("imu"):
         print(f"  capture spans the release, +{t['post_release_s']:g} s past "
               f"it for the fall and the landing")
+        print(f"  captures -> {t['csv_dir']} on the Pi"
+              + (f", copied to {t['dest_dir']}" if t.get("dest_dir") else ""))
     if t["release_drop_mm"]:
         print(f"  the part FALLS {t['release_drop_mm']:g} mm on release")
     print(f"  grips {t.get('grips', 0)}, IMU sessions "
@@ -292,7 +306,14 @@ def main(argv=None) -> int:
                          "the fall and landing are captured")
     ap.add_argument("--imu-rate", type=int, default=IMU_RATE, dest="imu_rate")
     ap.add_argument("--csv-dir", default=CSV_DIR, dest="csv_dir",
-                    help="directory ON THE PI for the IMU captures")
+                    help="LOCAL directory on the Pi the capture is written to")
+    ap.add_argument("--dest-dir", default=DEST_DIR, dest="dest_dir",
+                    help="where finished captures are copied. A MOUNTED path "
+                         "on the Pi - \\\\ICE-NAS\\Data\\GC_ARCCS\\GripperIMU "
+                         "is /mnt/ice-nas/GC_ARCCS/GripperIMU if the Data "
+                         "share is mounted at /mnt/ice-nas")
+    ap.add_argument("--no-dest", dest="dest_dir", action="store_const",
+                    const=None, help="keep the captures on the Pi only")
     ap.add_argument("--no-imu", dest="imu", action="store_false",
                     help="run the motion without recording")
     ap.add_argument("--layout", default="layout.json")
@@ -306,7 +327,8 @@ def main(argv=None) -> int:
             effector_id=a.effector, name=a.name, station=a.station,
             cycles=a.cycles, grip_ma=a.grip_ma, hold_s=a.hold_s,
             post_release_s=a.post_release_s,
-            imu_rate=a.imu_rate, csv_dir=a.csv_dir, imu=a.imu,
+            imu_rate=a.imu_rate, csv_dir=a.csv_dir, dest_dir=a.dest_dir,
+            imu=a.imu,
             layout=a.layout, outdir=a.outdir, plot=a.plot, strict=a.strict,
         )
     except LabError as exc:

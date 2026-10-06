@@ -404,6 +404,42 @@ def test_station9_preflights_before_it_moves():
           f"the gcode must say what an unknown command means: {m.notes[:3]}")
 
 
+def test_station9_captures_locally_and_copies_to_the_share():
+    """The capture is written to local disk, then copied. Never onto a mount.
+
+    A 100 Hz capture writing to a share that stalls takes the run with it,
+    and it surfaces as a short CSV rather than an error.
+    """
+    m = _station9(cycles=1)
+    start = next(s for s in m.steps
+                 if s.op == "gripper:imu_start" and s.kind == "macro")
+    csv, dest = start.detail["csv"], start.detail["dest"]
+    check(csv.startswith("/home/admin/"),
+          f"the capture itself must go to local disk, got {csv}")
+    check(dest == "/mnt/ice-nas/GC_ARCCS/GripperIMU",
+          f"the copy destination should be the mounted share, got {dest}")
+    check(not dest.startswith(csv.rsplit("/", 1)[0]),
+          "capturing and publishing to the same directory defeats the point")
+
+
+def test_a_unc_path_is_refused_as_an_imu_destination():
+    """The capture runs on Linux; a UNC path is not a path there.
+
+    Passed through, it would become a filename with backslashes in it and
+    the data would land somewhere nobody looks.
+    """
+    m = _gripper_machine()
+    m.startup()
+    m.gripper_home()
+    raises(ProtocolError,
+           lambda: m.gripper_imu_start(csv="/home/admin/imu/x.csv",
+                                       dest=r"\\ICE-NAS\Data\GC_ARCCS"),
+           "a Windows UNC destination must refuse")
+    m.gripper_imu_start(csv="/home/admin/imu/x.csv",
+                        dest="/mnt/ice-nas/GC_ARCCS/GripperIMU")
+    m.gripper_imu_stop()
+
+
 def test_station9_imu_brackets_the_pick_and_marks_each_phase():
     m = _station9(cycles=1)
     ops = [(s.i, s.op) for s in m.steps if s.kind == "macro"]

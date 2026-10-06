@@ -290,6 +290,21 @@ not completed a live capture** - see [RUNS.md](RUNS.md):
 | `GRIPPER_IMU` | the shipped blocking capture. Added to the cfg - it had no IMU macro at all |
 | `GRIPPER_IMU_START` / `_MARK` / `_STOP` | a session that spans motion, via `host/imu_session.py` |
 
+**Where the data goes.** Captures are written to the Pi's **local disk**
+(`/home/admin/imu`) and copied to the share when each one stops. Never
+recorded straight onto a mount: a 100 Hz capture writing to a share that
+stalls or drops takes the run with it, and it would surface as a short CSV
+rather than an error. Copy-after means a share that is down costs the copy,
+not the data - the originals stay local and `stop` says so.
+
+The destination is `\ICE-NAS\Data\GC_ARCCS\GripperIMU`, which on the Pi
+is **`/mnt/ice-nas/GC_ARCCS/GripperIMU`** assuming the `Data` share is
+mounted at `/mnt/ice-nas`. A UNC path cannot be used directly - the capture
+runs on Linux, where it is not a path at all, and `gripper_imu_start` refuses
+one rather than letting it become a filename with backslashes in it. If the
+share is mounted elsewhere, pass `--dest-dir`; nothing on the slicing machine
+can check a mount on the Pi.
+
 `imu_session.py` forks the capture and **SIGINT**s it to finish, because
 `cmd_imu` catches `KeyboardInterrupt`, aborts the board and still calls
 `log.finish()` - so the CSV closes properly where a `SIGTERM` would truncate
