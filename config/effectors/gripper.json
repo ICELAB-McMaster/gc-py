@@ -53,6 +53,15 @@
     "do_not_use_note": "DANGEROUS ON THIS MACHINE. Both do relative Z moves with the sign convention of a normal printer - GRIPPER_PICK emits G1 Z+40 and calls it a lift. Here +Z is DOWN, so that command drives the gripper 40 mm INTO the plate. This library emits absolute Z through Machine, which knows the convention."
   },
 
+  "imu_storage": {
+    "capture_dir": "/home/admin/imu",
+    "dest_dir": "/mnt/ice-nas/GC_ARCCS/GripperIMU",
+    "unc": "\\\\ICE-NAS\\Data\\GC_ARCCS\\GripperIMU",
+    "note": "Captures are written to capture_dir on the Pi's LOCAL disk and copied to dest_dir when the capture stops. Never recorded straight onto the share: a 100 Hz capture writing to a mount that stalls or drops takes the run with it, and it would surface as a short CSV rather than an error. Copy-after means a share that is down costs the copy, not the data.",
+    "mount_note": "dest_dir is a path ON THE PI and the share must already be mounted there - a Windows UNC path means nothing to Linux. The mapping assumed here is the 'Data' share of ICE-NAS mounted at /mnt/ice-nas, so UNC \\\\ICE-NAS\\Data\\GC_ARCCS\\GripperIMU becomes /mnt/ice-nas/GC_ARCCS/GripperIMU. If it is mounted somewhere else, pass --dest-dir; nothing here can check a mount from the slicing machine.",
+    "validated": false
+  },
+
   "shell_command": {
     "blocks": null,
     "guard_dwell_ms": 1500,
