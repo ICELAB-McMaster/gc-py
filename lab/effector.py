@@ -268,30 +268,134 @@ class Pipette(Effector):
 
 
 class Gripper(Effector):
-    """Plate gripper. Not built yet; the class exists so the loader dispatches.
+    """Plate gripper: a continuous-rotation servo on a rack and pinion.
 
-    A gripper mutates the deck layout at run time, which a pipette never does,
-    so it carries the held-labware state the simulator needs.
+    Nothing about it is positional. The servo's feedback output has failed, so
+    the firmware runs open loop and every motion is TIMED - "open for 400 ms",
+    never "open to 30 degrees". Gripping is a controlled stall at a commanded
+    current, which expires. The three constraints that shape every method:
+
+    * **Closing self-references, opening does not.** Closing ends at a hard
+      stop, which is what makes HOME meaningful. Opening ends at nothing: past
+      full travel the racks leave the pinion and the mechanism is a hand
+      rebuild. Hence `open_ms_max`, and hence refusing rather than clamping.
+    * **It must be homed** before OPEN, CLOSE or GRIP will run at all.
+    * **A hold expires** after about 140 s, in three tiers. A sequence that
+      carries a plate for longer has to be redesigned, not retried.
     """
 
     kind = "gripper"
 
     def __init__(self, cfg: config.ConfigFile) -> None:
         super().__init__(cfg)
-        g = self.spec.get("actuator", {})
-        self.open_pos = g.get("open_pos")
-        self.closed_pos = g.get("closed_pos")
-        self.grip_pos = g.get("grip_pos")
+        a = self.spec.get("actuator", {})
+        self.open_ms_max: int = int(a.get("open_ms_max", 850))
+        self.grip_ma_default: int = int(a.get("grip_ma_default", 300))
+        self.grip_ma_min: int = int(a.get("grip_ma_min", 100))
+        self.grip_ma_max: int = int(a.get("grip_ma_max", 500))
+
+        h = self.spec.get("hold", {})
+        self.hold_expires_s: float = float(h.get("expires_s", 140.0))
+        self.hold_tier1_s: float = float(h.get("tier1_s", 20.0))
+
+        self.requires_home: bool = bool(self.spec.get("requires_home", True))
         self.carries_labware: bool = bool(self.spec.get("carries_labware", True))
         self.held: Optional[str] = None
 
+    # ---- the Klipper macro names ---------------------------------------
+
+    def macro(self, name: str) -> str:
+        """The GRIPPER_* macro for an operation. Raises rather than guessing.
+
+        No default on purpose: a fallback literal would mean a renamed or
+        missing macro emits a command that Klipper does not recognise, and the
+        run stops mid-sequence with a plate in the jaws.
+        """
+        macros = self.spec.get("macros", {})
+        if name not in macros or not isinstance(macros[name], str):
+            known = sorted(k for k, v in macros.items()
+                           if isinstance(v, str) and not k.endswith("note"))
+            raise EffectorError(
+                f"{self.id}: no Klipper macro named {name!r}. Known: {known}. "
+                f"Add it to config/effectors/{self.id}.json -> macros, and to "
+                f"gripper_macros.cfg."
+            )
+        return macros[name]
+
+    @property
+    def forbidden_macros(self) -> List[str]:
+        """Macros that exist but must never be emitted on this machine."""
+        return list(self.spec.get("macros", {}).get("do_not_use", []))
+
+    # ---- guards ---------------------------------------------------------
+
+    def check_open_ms(self, ms: int) -> None:
+        """Refuse an open longer than the firmware clamp.
+
+        The firmware would clamp this silently. Refusing instead keeps the
+        gcode an honest record of what was asked for - and if someone is
+        asking for more than the clamp, the assumption behind the sequence is
+        already wrong and should be fixed rather than truncated.
+        """
+        if ms <= 0:
+            raise EffectorError(
+                f"{self.id}: open needs a positive duration, got {ms} ms."
+            )
+        if ms > self.open_ms_max:
+            raise EffectorError(
+                f"{self.id}: open for {ms} ms exceeds the {self.open_ms_max} ms "
+                f"firmware clamp. Opening has NO hard stop - past full travel "
+                f"the racks come off the pinion and the mechanism has to be "
+                f"rebuilt by hand. There is no software recovery. Do not try "
+                f"to defeat the clamp."
+            )
+
+    def check_grip_ma(self, ma: int) -> None:
+        if not (self.grip_ma_min <= ma <= self.grip_ma_max):
+            raise EffectorError(
+                f"{self.id}: grip current {ma} mA is outside "
+                f"{self.grip_ma_min}-{self.grip_ma_max}. {self.grip_ma_max} is "
+                f"the firmware clamp and the hardware ceiling is about 570 mA; "
+                f"a setpoint above the clamp is silently reduced, which is why "
+                f"this refuses rather than passing it on."
+            )
+
+    def guard_dwell_ms(self, op: str) -> Optional[int]:
+        """How long to stall after a macro, while shell blocking is unproven.
+
+        Returns None once `shell_command.blocks` is true. Until then a move
+        following a gripper macro could start while the gripper is still
+        running, which during a grip means lifting before the jaws have closed.
+        """
+        sc = self.spec.get("shell_command", {})
+        if sc.get("blocks"):
+            return None
+        if op == "grip":
+            return int(sc.get("guard_dwell_grip_ms", 2000))
+        return int(sc.get("guard_dwell_ms", 1500))
+
     def require_ready(self) -> None:
-        missing = [k for k in ("open_pos", "closed_pos", "grip_pos")
-                   if getattr(self, k) is None]
+        """Refuse to generate motion while the geometry is unmeasured.
+
+        Checks the VALUES, not the config's own `uncalibrated` list. That list
+        is a human declaration and goes stale in both directions: a filled-in
+        number nobody removed from it would block forever, and a field quietly
+        set to null but never added to it would sail through. The null is the
+        machine-checkable fact.
+        """
+        missing = []
+        for lid, entry in (self.spec.get("z_for_labware") or {}).items():
+            for key, value in entry.items():
+                if key.endswith("note") or key == "uncalibrated":
+                    continue
+                if value is None:
+                    missing.append(f"z_for_labware.{lid}.{key}")
         if missing:
             raise EffectorError(
-                f"{self.id}: cannot generate motion, these are still null in "
-                f"config/effectors/{self.id}.json: {missing}. Measure them first."
+                f"{self.id}: cannot generate plate motion, these are still "
+                f"null in config/effectors/{self.id}.json: {sorted(missing)}. "
+                f"Measure them by jogging with the gripper fitted and open, "
+                f"then fill them in."
             )
 
 

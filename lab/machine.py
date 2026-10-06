@@ -28,7 +28,8 @@ from gcodepy.gcode import Gcode
 
 from . import config
 from .deck import Deck
-from .effector import Effector, LabError, Pipette, load as load_effector
+from .effector import (Effector, Gripper, LabError, Pipette,
+                       load as load_effector)
 from .labware import Placement, well_name
 from .simulate import Report, Simulator, Step, plot_path
 
@@ -65,6 +66,18 @@ class Machine:
         self.current_tip: Optional[Tuple[int, int]] = None
         self._keepout_exempt = False
         self._last_aspirate: Optional[Dict[str, Any]] = None
+
+        # ---- gripper state -------------------------------------------------
+        # The servo has no position, so there is nothing to mirror. What has
+        # to be tracked is what the HARDWARE refuses or damages itself over:
+        # whether it has been homed, whether something is held, the Z the
+        # grip was taken at (so a release cannot happen above it), and how
+        # much commanded dwell has accumulated since (so an expiring hold is
+        # visible).
+        self.gripper_homed = False
+        self.gripper_holding: Optional[str] = None
+        self._grip_z: Optional[float] = None
+        self._grip_dwell_s = 0.0
 
         # ---- records -------------------------------------------------------
         self.steps: List[Step] = []
@@ -279,7 +292,11 @@ class Machine:
 
     def _route_problem(self, legs) -> Optional[str]:
         """Why this leg sequence is unsafe, or None if it is clear."""
-        no_fly = self.deck.no_fly_rects() if self.tip_fitted else []
+        # A carried plate is as unroutable over the tip rack as a fitted
+        # tip: it is wider than the nosecone, hangs below it, and shears the
+        # standing tips off. Flying higher does not help either.
+        carrying = self.tip_fitted or self.gripper_holding is not None
+        no_fly = self.deck.no_fly_rects() if carrying else []
         z = self.deck.z_travel
         for frm, to in legs:
             if not self.deck.x.contains(to[0]) or not self.deck.y.contains(to[1]):
@@ -362,10 +379,37 @@ class Machine:
             self.dwell(settle, op=op)
         return pos
 
+    def _count_dwell(self, seconds: float) -> None:
+        """Charge a dwell against an open grip's expiry budget."""
+        if self.gripper_holding is None or seconds <= 0:
+            return
+        eff = self.effector
+        self._grip_dwell_s += seconds
+        if not isinstance(eff, Gripper):
+            return
+        if self._grip_dwell_s > eff.hold_expires_s:
+            raise ProtocolError(
+                f"the grip on {self.gripper_holding!r} has been held through "
+                f"{self._grip_dwell_s:g} s of commanded dwell, past the "
+                f"{eff.hold_expires_s:g} s at which the hold is de-energised "
+                f"and a fault raised. The plate would be dropped. Put it down "
+                f"sooner, or hold it in something that does not expire."
+            )
+        if self._grip_dwell_s > eff.hold_tier1_s:
+            self.sim.warn(
+                "grip_tier2",
+                f"the grip has been held through {self._grip_dwell_s:g} s of "
+                f"commanded dwell, past the {eff.hold_tier1_s:g} s tier-1 "
+                f"window, so the current has dropped. NOTE this counts DWELLS "
+                f"ONLY - travel time is not modelled, so the real elapsed time "
+                f"is longer and this is a lower bound.",
+            )
+
     def dwell(self, seconds: float, op: str = "dwell") -> None:
         """Guarded: a zero or negative settle is a no-op, not an exception."""
         if seconds and seconds > 0:
             self.g.dwell(seconds)
+            self._count_dwell(seconds)
             self._record(op=op, kind="dwell", detail={"seconds": seconds})
 
     def wait(self) -> None:
@@ -376,6 +420,225 @@ class Machine:
             return
         macro = self.deck.macro("log_temps")
         self._raw(f"{macro}{tag}", op="log_temps", tag=tag)
+
+    # ---- gripper ---------------------------------------------------------
+    #
+    # Every one of these emits M400 FIRST. Klipper queues moves, so without it
+    # the shell command runs while the gantry is still travelling - gripping
+    # before arriving, or lifting before the jaws have closed.
+
+    def _gripper(self) -> Gripper:
+        if not isinstance(self.effector, Gripper):
+            raise ProtocolError(
+                f"{self.effector.id} is a {self.effector.kind}, not a gripper; "
+                f"it cannot grip or release"
+            )
+        return self.effector
+
+    def _gripper_macro(self, op: str, args: str = "", **detail: Any) -> None:
+        """Emit one GRIPPER_* macro, fenced by M400 and a guard dwell."""
+        eff = self._gripper()
+        name = eff.macro(op)
+        if name in eff.forbidden_macros:
+            raise ProtocolError(
+                f"{name} must never be emitted on this machine. It does a "
+                f"RELATIVE Z move with a normal printer's sign convention, and "
+                f"here +Z is DOWN - so its 'lift' drives the gripper into the "
+                f"deck. Use the absolute Z moves this library emits."
+            )
+        self.wait()                                   # the gantry must arrive
+        self._raw(f"{name} {args}".strip(), f"gripper:{op}", **detail)
+        ms = eff.guard_dwell_ms(op)
+        if ms:
+            # Whether RUN_SHELL_COMMAND blocks is install-dependent and
+            # untested here. Until it is, stall long enough that the next move
+            # cannot start while the gripper is still running. Note this is a
+            # G4 and NOT an M400: M400 drains the motion queue, and a shell
+            # command was never in it, so an M400 here would wait for nothing.
+            self.dwell(ms / 1000.0, op=f"gripper:{op}")
+
+    def gripper_home(self) -> None:
+        """Drive into the closed stop and call it zero. Required before motion.
+
+        Cheap, about a second, and the only reference a timed open-loop
+        mechanism has. Home again after any limit, abort or power cycle.
+        """
+        self._gripper()
+        if self.gripper_holding is not None:
+            raise ProtocolError(
+                f"cannot home while holding {self.gripper_holding!r} - homing "
+                f"drives into the closed stop and the part is in the way. "
+                f"Lower and release first."
+            )
+        self._gripper_macro("home")
+        self.gripper_homed = True
+
+    def _require_gripper_homed(self, what: str) -> Gripper:
+        eff = self._gripper()
+        if eff.requires_home and not self.gripper_homed:
+            raise ProtocolError(
+                f"{what} before the gripper was homed. The firmware refuses "
+                f"OPEN, CLOSE and GRIP until HOME has run. Call gripper_home()."
+            )
+        return eff
+
+    def gripper_open(self, ms: Optional[int] = None) -> None:
+        """Open, fully or for `ms`. Refuses anything past the firmware clamp.
+
+        Opening ends at NOTHING - past full travel the racks leave the pinion
+        and the mechanism is a hand rebuild. The firmware would clamp an
+        over-long request silently; this refuses it, so the gcode stays an
+        honest record and the wrong assumption behind it gets fixed.
+        """
+        eff = self._require_gripper_homed("gripper_open()")
+        if ms is None:
+            self._gripper_macro("open")
+        else:
+            eff.check_open_ms(int(ms))
+            self._gripper_macro("open", f"MS={int(ms)}", ms=int(ms))
+        self.toggles["gripper_opens"] = self.toggles.get("gripper_opens", 0) + 1
+
+    def gripper_close(self, ms: Optional[int] = None) -> None:
+        """Close to the stop, or for `ms`. With no MS this re-references zero."""
+        self._require_gripper_homed("gripper_close()")
+        if ms is None:
+            self._gripper_macro("close")
+        else:
+            self._gripper_macro("close", f"MS={int(ms)}", ms=int(ms))
+
+    def grip(self, ma: Optional[int] = None, what: str = "part") -> None:
+        """Close onto a part and hold at `ma` milliamps.
+
+        A grip is a controlled stall, not a clamp: there is no holding torque
+        at rest, and the hold expires. The Z at which it is taken is recorded,
+        because releasing above that height drops the part.
+        """
+        eff = self._require_gripper_homed("grip()")
+        if self.gripper_holding is not None:
+            raise ProtocolError(
+                f"already holding {self.gripper_holding!r}; release it before "
+                f"gripping something else"
+            )
+        ma = int(eff.grip_ma_default if ma is None else ma)
+        eff.check_grip_ma(ma)
+        self._gripper_macro("grip", f"MA={ma}", ma=ma, what=what)
+        self.gripper_holding = what
+        self._grip_z = self.g.get_z()
+        self._grip_dwell_s = 0.0
+        eff.held = what
+        self.toggles["grips"] = self.toggles.get("grips", 0) + 1
+
+    def release(self) -> None:
+        """Stop holding and open enough to let go. Refuses above the pick Z.
+
+        "Never release at height" is the first rule in the gripper's API, and
+        it is the one a protocol breaks by accident. +Z is DOWN, so a release
+        is legal only at a commanded Z at least as LARGE as the one the grip
+        was taken at.
+        """
+        self._gripper()
+        if self.gripper_holding is None:
+            raise ProtocolError("release() with nothing held")
+        z = self.g.get_z()
+        if self._grip_z is not None and z is not None and z < self._grip_z - 1e-6:
+            raise ProtocolError(
+                f"release at Z {z} would drop {self.gripper_holding!r}: the "
+                f"grip was taken at Z {self._grip_z}, and +Z is DOWN, so this "
+                f"is {self._grip_z - z:g} mm ABOVE where the part was picked "
+                f"up. Lower to at least Z {self._grip_z} first."
+            )
+        self._gripper_macro("release", what=self.gripper_holding)
+        self.gripper_holding = None
+        self._grip_z = None
+        self._grip_dwell_s = 0.0
+        self.effector.held = None
+
+    def gripper_abort(self) -> None:
+        """Clear a latched fault. All motion is refused until this runs."""
+        self._gripper_macro("abort")
+
+    def gripper_status(self) -> None:
+        """Print current and flags. Moves nothing."""
+        self._gripper_macro("status")
+
+    def gripper_imu(self, seconds: float, rate: Optional[int] = None,
+                    csv: Optional[str] = None) -> None:
+        """Record IMU samples for `seconds`, optionally to a CSV on the Pi.
+
+        Counts against the hold budget when something is held, because the
+        machine is standing still for the whole capture - which is exactly the
+        case where a grip quietly slides into tier 2.
+        """
+        self._gripper()
+        if seconds <= 0:
+            raise ProtocolError(
+                f"gripper_imu() needs a positive duration, got {seconds}"
+            )
+        args = f"SECONDS={seconds:g}"
+        if rate:
+            args += f" RATE={int(rate)}"
+        if csv:
+            args += f" CSV={csv}"
+        self._gripper_macro("imu", args, seconds=seconds, rate=rate, csv=csv)
+        # The capture itself is wall-clock time the hold has to survive.
+        self.dwell(seconds, op="gripper:imu")
+        self.toggles["imu_captures"] = self.toggles.get("imu_captures", 0) + 1
+        self.toggles["imu_seconds_total"] = (
+            self.toggles.get("imu_seconds_total", 0.0) + seconds)
+
+    def pick_plate(self, placement: str, ma: Optional[int] = None) -> Tuple[float, float]:
+        """Traverse to a plate, descend, grip it, and lift to carry height.
+
+        The XY target is the placement's grid centre. Both Z values come from
+        the effector's own table, because the jaw reference sits at a different
+        height from any pipette nosecone.
+        """
+        eff = self._require_gripper_homed("pick_plate()")
+        eff.require_ready()
+        p = self.deck.placement(placement)
+        lid = p.labware.id
+        z_grip = eff.z_for(lid, "grip")
+        z_lift = eff.z_for(lid, "lift")
+        if z_lift >= z_grip:
+            raise ProtocolError(
+                f"{eff.id}: the carry height for {lid} (Z {z_lift}) is not "
+                f"above the grip height (Z {z_grip}). +Z is DOWN, so lift must "
+                f"be the SMALLER number - as written the plate would be "
+                f"'lifted' further into the deck."
+            )
+        x, y = p.grid_center()
+        f = self.deck.feedrate("travel")
+
+        self.goto(x, y, op="pick", prefer=p.labware.approach_order)
+        self._move_z(z_grip, f, "pick", labware=lid)
+        self.grip(ma=ma, what=placement)
+        self._move_z(z_lift, f, "carry", labware=lid)
+        self.wait()
+        return x, y
+
+    def place_plate(self, placement: str) -> Tuple[float, float]:
+        """Lower a carried plate back onto a slot and release it.
+
+        The descent happens BEFORE the release, which is the whole point.
+        """
+        eff = self._gripper()
+        eff.require_ready()
+        if self.gripper_holding is None:
+            raise ProtocolError("place_plate() with nothing held")
+        p = self.deck.placement(placement)
+        lid = p.labware.id
+        z_grip = eff.z_for(lid, "grip")
+        z_lift = eff.z_for(lid, "lift")
+        x, y = p.grid_center()
+        f = self.deck.feedrate("travel")
+
+        if abs(x - self.g.get_x()) > 1e-6 or abs(y - self.g.get_y()) > 1e-6:
+            self.goto(x, y, op="carry", prefer=p.labware.approach_order)
+        self._move_z(z_grip, f, "place", labware=lid)
+        self.release()
+        self._move_z(z_lift, f, "place", labware=lid)
+        self.wait()
+        return x, y
 
     def note(self, text: str) -> None:
         """A comment in the gcode and a line in the manifest."""
@@ -392,8 +655,11 @@ class Machine:
         self._record(op=op, kind="home", to=self.xyz(), detail={"axes": "Z"})
         self.g.home("XY")
         self._record(op=op, kind="home", to=self.xyz(), detail={"axes": "XY"})
-        macro = self.deck.macro("home_actuator")
-        self._raw(macro, op=op)
+        # HOME_ACTUATOR references the pipette PLUNGER. With a gripper
+        # fitted that axis is not on the machine, so homing it is at best
+        # meaningless and at worst drives something that is not there.
+        if isinstance(self.effector, Pipette):
+            self._raw(self.deck.macro("home_actuator"), op=op)
         self.homed = True
 
     def startup(self) -> None:
