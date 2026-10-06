@@ -641,9 +641,34 @@ class Machine:
         """Clear a latched fault. All motion is refused until this runs."""
         self._gripper_macro("abort")
 
+    def gripper_ping(self) -> None:
+        """Check the node is alive. Moves nothing."""
+        self._gripper_macro("ping")
+
     def gripper_status(self) -> None:
         """Print current and flags. Moves nothing."""
         self._gripper_macro("status")
+
+    def gripper_preflight(self) -> None:
+        """Emit the harmless gripper commands FIRST, before any motion.
+
+        Klipper does not stop on an unknown command in every configuration -
+        observed 2026-10-06, a run whose gripper_macros.cfg was never included
+        reported "Unknown command: GRIPPER_HOME" and carried on, so the gantry
+        performed the whole sequence with the gripper inert. That looks like a
+        successful run in the log and is not one.
+
+        Nothing here can make Klipper abort. What it can do is put the first
+        failure before `G28`, so the operator sees it with the machine still
+        parked instead of after fifteen cycles of pantomime. Both commands
+        move nothing, so emitting them before homing is safe.
+        """
+        self.note("PREFLIGHT - if either line below reports "
+                  "'Unknown command', STOP: gripper_macros.cfg is not "
+                  "included from printer.cfg and nothing in this file will "
+                  "actually grip. See docs/LAB.md.")
+        self.gripper_ping()
+        self.gripper_status()
 
     def gripper_imu(self, seconds: float, rate: Optional[int] = None,
                     csv: Optional[str] = None) -> None:
