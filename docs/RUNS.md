@@ -60,6 +60,38 @@ check `<csv>.log` is empty and the CSV has rows before trying 15.
 
 ---
 
+## 2026-10-06 (later) - the board cannot command and stream at once
+
+Third attempt. `imu_session 2026-10-06.2` confirmed in the log, the directory
+fix landed, `GRIPPER_IMU_START` and the first mark both succeeded - and then
+`GRIPPER_GRIP` never returned. No `Command {gripper} finished`, where every
+earlier gripper command had one.
+
+The tell was the ordering: `PING`, `STATUS`, `HOME` and `OPEN` all succeeded,
+and every one of them ran **before** the capture started. The first command
+after it hung.
+
+`board/gripnode.py` explains it. `imu_read()` streams in a blocking loop, and
+`drain()` documents the consequence: *"a motion in progress polls that flag
+and the queue is not read until the motion returns"*. ESTOP, ABORT and STOP
+set the flag immediately; everything else is queued, up to 8 deep.
+
+So the grip was never refused - it was **queued**, and would have fired when
+the capture finished. The 30 s `gripctl` timeout is what stopped that from
+happening, which was luck rather than design: a queued grip firing minutes
+late, with the gantry elsewhere, is worse than a timeout.
+
+The sequence was wrong, not the code. A capture can only span **gantry**
+motion. The protocol now grips first, captures the lift/hold/lower, stops,
+then releases - and the two transients it can no longer see are taken from
+the board's own telemetry via `--log --csv`, which writes current against
+time for the grip and the release.
+
+`Machine._gripper_macro` refuses a gripper command while a session is open,
+so this cannot be written again.
+
+---
+
 ## 2026-09-11 - centrifuge_test with latex microbeads
 
 First hardware run of `protocols/centrifuge_test.py`. The suspension handled

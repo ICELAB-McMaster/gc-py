@@ -316,6 +316,30 @@ it. Marks go to `<csv>.marks.csv` as elapsed seconds plus a label; join on
 elapsed time. The capture file is named per pick, so *which pick-up* is the
 filename and *which part of the cycle* is the mark.
 
+### A capture cannot contain a gripper command
+
+**The board does one thing at a time.** `board/gripnode.py`'s `imu_read()` is
+a blocking `for i in range(count)` loop, and `drain()` states the rule
+outright: *"a motion in progress polls that flag and the queue is not read
+until the motion returns"*. Only **ESTOP, ABORT and STOP** set the abort flag
+immediately. Everything else is **queued**.
+
+So a `GRIPPER_GRIP` sent during a capture is not refused - it sits in
+`_pending` and fires when the capture ends, which with a 300 s ceiling is
+minutes later, long after the gantry has moved on. Observed 2026-10-06 as a
+`gripctl` timeout with no reply, which was the mild version of what could
+have happened.
+
+`Machine._gripper_macro` now refuses any gripper command while a session is
+open, except the four the board really does service. What a capture CAN span
+is **gantry motion** - Klipper owns that, and the board is idle throughout.
+
+That leaves the grip and release transients unrecordable by the IMU. They are
+not lost: `gripctl` takes `--log --csv` on any motion command and streams the
+board's **own current trace** for that motion, so each cycle writes
+`..._NN_grip.csv` and `..._NN_release.csv` alongside the IMU capture. Current
+against time through a stall is arguably the better record of a grip anyway.
+
 ### The station 9 pick test
 
 `protocols/gripper_station9_test.py`, every height operator-measured

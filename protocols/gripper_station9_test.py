@@ -213,15 +213,21 @@ def build(
 
         m.move_to_z(z_grip, op="descend")
 
+        # The GRIP goes BEFORE the capture. The board streams IMU samples in
+        # a blocking loop and does not read its command queue until the
+        # capture ends, so a grip sent during one is queued and fires minutes
+        # later. Its own transient is recorded instead by the board's motion
+        # telemetry, which is what --log --csv on the command produces.
+        m.grip(ma=int(grip_ma), what=f"part@{station}",
+               log_csv=(f"{csv_dir}/{name}_{tag}_grip.csv" if imu else None))
+
+        # From here to the stop is GANTRY motion only. Klipper owns that, so
+        # the board is free to stream throughout.
         if imu:
             m.gripper_imu_start(csv=f"{csv_dir}/{name}_{tag}.csv",
                                 label=f"pick{tag}", rate=imu_rate,
                                 dest=dest_dir)
-            m.gripper_imu_mark(f"pick{tag}_at_grip_z{z_grip:g}")
-
-        m.grip(ma=int(grip_ma), what=f"part@{station}")
-        if imu:
-            m.gripper_imu_mark(f"pick{tag}_gripped_{int(grip_ma)}ma")
+            m.gripper_imu_mark(f"pick{tag}_gripped_{int(grip_ma)}ma_z{z_grip:g}")
 
         m.move_to_z(z_approach, op="lift")
         if imu:
@@ -234,15 +240,14 @@ def build(
         m.move_to_z(z_release, op="lower")
         if imu:
             m.gripper_imu_mark(f"pick{tag}_at_release_z{z_release:g}")
-
-        # The capture stays open across the release. The part falls 7 mm, and
-        # the fall and the landing are the interesting part - stopping at the
-        # release command would record the jaws opening and nothing after it.
-        m.release(max_drop_mm=drop_mm)
-        if imu:
-            m.gripper_imu_mark(f"pick{tag}_released_drop{drop_mm:g}mm")
-            m.dwell(post_release_s, op="post_release")
+            # Stopped before the release because it HAS to be, not by choice.
             m.gripper_imu_stop()
+
+        m.release(max_drop_mm=drop_mm,
+                  log_csv=(f"{csv_dir}/{name}_{tag}_release.csv"
+                           if imu else None))
+        if post_release_s:
+            m.dwell(post_release_s, op="post_release")
 
         m.move_to_z(z_approach, op="retreat")
 

@@ -451,19 +451,27 @@ def test_station9_imu_brackets_the_pick_and_marks_each_phase():
 
     check(len(starts) == len(stops) == 1,
           f"one capture per cycle, got {len(starts)} starts {len(stops)} stops")
-    check(starts[0] < grips[0],
-          "the capture must be running before the grip, or the grip "
-          "transient is lost")
-    check(rels[0] < stops[0],
-          "the capture must still be open at the release - the part falls "
-          "7 mm and the fall is the interesting part")
-    dwells = [s.i for s in m.steps if s.op == "post_release"]
-    check(dwells and rels[0] < dwells[0] < stops[0],
-          "the settle after the release belongs inside the capture, or the "
-          "landing is not recorded")
-    check(len(marks) == 6,
-          f"six phase marks - at_grip, gripped, lifted, held, at_release, "
-          f"released; got {len(marks)}")
+    # The grip and release transients are unrecordable by the IMU, so they
+    # are taken from the board's own motion telemetry instead.
+    gm = next(s for s in m.steps if s.op == "gripper:grip" and s.kind == "macro")
+    rm = next(s for s in m.steps
+              if s.op == "gripper:release" and s.kind == "macro")
+    check(gm.detail.get("log_csv", "").endswith("_grip.csv"),
+          f"the grip should log its own current trace, got "
+          f"{gm.detail.get('log_csv')}")
+    check(rm.detail.get("log_csv", "").endswith("_release.csv"),
+          f"the release should log its own trace, got "
+          f"{rm.detail.get('log_csv')}")
+    # The board streams IMU samples in a blocking loop and does not read its
+    # command queue until the capture ends, so no gripper command may sit
+    # inside one - it would be queued and fire minutes later.
+    check(grips[0] < starts[0],
+          "the grip must come BEFORE the capture opens")
+    check(stops[0] < rels[0],
+          "the capture must be stopped BEFORE the release is commanded")
+    check(len(marks) == 4,
+          f"four phase marks - gripped, lifted, held, at_release; got "
+          f"{len(marks)}")
     check(all(starts[0] < i < stops[0] for i in marks),
           "every mark must fall inside the open capture")
 
@@ -475,6 +483,34 @@ def test_station9_imu_brackets_the_pick_and_marks_each_phase():
           f"each mark must name the pick it belongs to: {labels}")
     check(any("gripped_500ma" in l for l in labels),
           f"the grip current belongs in the label: {labels}")
+
+
+def test_no_gripper_command_may_be_sent_during_a_capture():
+    """The board queues commands it receives while streaming.
+
+    board/gripnode.py imu_read() is a blocking loop, and drain() says it
+    outright: "the queue is not read until the motion returns". A grip sent
+    during a capture is not refused by the board - it is QUEUED, and fires
+    when the capture ends, long after the gantry has moved on. Observed
+    2026-10-06 as a gripctl timeout with no reply.
+    """
+    m = _gripper_machine()
+    m.startup()
+    m.gripper_home()
+    m.gripper_open()
+    m.gripper_imu_start(csv="/home/admin/imu/x.csv")
+    for call, what in ((lambda: m.grip(ma=300), "grip"),
+                       (lambda: m.gripper_open(), "open"),
+                       (lambda: m.gripper_home(), "home"),
+                       (lambda: m.gripper_status(), "status")):
+        raises(ProtocolError, call,
+               f"{what} during a capture must refuse - the board would queue "
+               f"it")
+    # A mark and the stop do get through: ABORT and STOP set the flag
+    # immediately rather than being queued.
+    m.gripper_imu_mark("still_ok")
+    m.gripper_imu_stop()
+    m.grip(ma=300)                       # and now it is allowed again
 
 
 def test_station9_marks_and_sessions_refuse_outside_a_capture():
@@ -517,7 +553,7 @@ def test_station9_repeats_cleanly_for_fifteen_cycles():
     check(m.toggles["grips"] == 15, f"15 grips, got {m.toggles['grips']}")
     check(m.toggles["imu_sessions"] == 15,
           f"one capture per pick, got {m.toggles['imu_sessions']}")
-    check(m.toggles["imu_marks"] == 6 * 15, f"6 marks x 15 picks, got "
+    check(m.toggles["imu_marks"] == 4 * 15, f"4 marks x 15 picks, got "
           f"{m.toggles['imu_marks']}")
     check(m.gripper_holding is None, "the run must not end holding the part")
 
