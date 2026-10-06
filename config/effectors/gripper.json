@@ -2,42 +2,96 @@
   "schema_version": 1,
   "id": "gripper",
   "kind": "gripper",
-  "display_name": "Plate gripper (planned - NOT BUILT)",
-  "status": "placeholder",
-  "status_note": "LOADER ONLY. lab.effector dispatches on kind and gives this file a Gripper class, and that is the whole of the integration today. The Gripper class has NO motion methods; lab/deck.py does not reference effectors at all; lab/simulate.py checks plunger POS only for Pipette, so a gripper POS would be emitted unvalidated. Every numeric field below is a placeholder and MUST be measured before this file is used to generate motion. lab.effector refuses to load a placeholder unless allow_placeholder=True.",
+  "display_name": "Parallax Feedback 360 plate gripper (rack and pinion, CAN)",
+  "status": "unmeasured",
+  "status_note": "The COMMAND model is now real - taken from Gripper/API.md and Gripper/klipper/gripper_macros.cfg in the SDL_Gcode repo, 2026-10-06. What is still missing is GEOMETRY: every z_for_labware value is null, so a protocol that moves the gripper to a plate refuses until they are measured. The previous version of this file modelled the gripper as POSITIONAL (open_pos / closed_pos / grip_pos) and that was simply wrong for this hardware - see no_position below.",
+
+  "no_position": {
+    "has_feedback": false,
+    "note": "THE SERVO HAS NO POSITION. The Parallax Feedback 360's feedback output has failed on two units, so the firmware runs OPEN LOOP and every motion is TIMED, not positional. There is no 'open to 30 degrees', only 'open for 400 ms'. Any position field in a reply reads n/a. This is a hardware fault, not a software choice. Do not reintroduce a *_pos field: a number that cannot be measured or commanded is worse than an absent one."
+  },
+
   "actuator": {
-    "open_pos": null,
-    "closed_pos": null,
-    "grip_pos": null,
-    "pos_min": 0.0,
-    "pos_max": null,
-    "stroke_margin": null,
-    "decimals": 3,
-    "note": "If the gripper is driven by the same ACTUATOR_MOVE macro, these are POS values on that axis. If it gets its own macro, add a macro_name field here and the loader will use it instead."
+    "model": "timed_open_current_grip",
+    "open_ms_default": null,
+    "open_ms_max": 850,
+    "open_ms_max_note": "FIRMWARE CLAMP, and the single most dangerous number in this file. Closing ends at a hard stop; opening ends at NOTHING. Past full travel the racks disengage from the pinion and the mechanism must be reassembled by hand. There is no software recovery. Machine.gripper_open refuses anything above this rather than letting the firmware silently clamp, so the gcode says what was asked for.",
+    "close_ms_default": null,
+    "grip_ma_default": 300,
+    "grip_ma_min": 100,
+    "grip_ma_max": 500,
+    "grip_ma_note": "500 is the firmware clamp; the hardware ceiling is about 570 mA. A setpoint above the clamp is SILENTLY reduced by the firmware, which is why the library refuses it instead. --ma is repeatable but UNCALIBRATED against force: it is not newtons.",
+    "decimals": 0
   },
-  "grip": {
-    "approach_clearance_mm": null,
-    "jaw_span_open_mm": null,
-    "jaw_span_closed_mm": null,
-    "settle_s": null
+
+  "hold": {
+    "tier1_s": 20.0,
+    "tier2_s": 120.0,
+    "expires_s": 140.0,
+    "note": "A grip is a CONTROLLED STALL, not a clamp - this servo has no holding torque at rest. Full commanded current for the first 20 s, reduced for the next 120, then de-energised with a fault raised. Design every sequence to put the part down before 140 s. If a plate must be held longer, this actuator is the wrong tool and the fixture needs a mechanical detent."
   },
+
+  "requires_home": true,
+  "requires_home_note": "OPEN, CLOSE and GRIP are refused by the firmware until HOME has run. Home drives into the closed stop and calls that zero. It costs about a second and re-establishes the only reference the timed model has, so when in doubt, home. Home again after any ST_LIMIT, ST_ABORTED or power cycle.",
+
+  "macros": {
+    "home": "GRIPPER_HOME",
+    "open": "GRIPPER_OPEN",
+    "close": "GRIPPER_CLOSE",
+    "grip": "GRIPPER_GRIP",
+    "release": "GRIPPER_RELEASE",
+    "stop": "GRIPPER_STOP",
+    "abort": "GRIPPER_ABORT",
+    "ping": "GRIPPER_PING",
+    "status": "GRIPPER_STATUS",
+    "imu": "GRIPPER_IMU",
+    "note": "From Gripper/klipper/gripper_macros.cfg, which must be included from printer.cfg and needs the gcode_shell_command extra. GRIPPER_IMU is an ADDITION - the shipped cfg had no IMU macro, so there was no way to ask for a measurement from gcode at all.",
+    "do_not_use": ["GRIPPER_PICK", "GRIPPER_PLACE"],
+    "do_not_use_note": "DANGEROUS ON THIS MACHINE. Both do relative Z moves with the sign convention of a normal printer - GRIPPER_PICK emits G1 Z+40 and calls it a lift. Here +Z is DOWN, so that command drives the gripper 40 mm INTO the plate. This library emits absolute Z through Machine, which knows the convention."
+  },
+
+  "shell_command": {
+    "blocks": null,
+    "guard_dwell_ms": 1500,
+    "guard_dwell_grip_ms": 2000,
+    "note": "Whether RUN_SHELL_COMMAND blocks until the process exits is INSTALL-DEPENDENT and has not been tested here. While blocks is null the library emits a G4 guard dwell after every gripper macro, so a following move cannot start while the gripper is still running. Test it once, set blocks true, and the dwells disappear - that is about 3.5 s a cycle."
+  },
+
   "tips": {
     "required": false,
     "labware": null,
     "eject_supported": false
   },
-  "z_for_labware": {},
+
+  "z_for_labware": {
+    "sbs_96_wellplate": {
+      "grip": null,
+      "lift": null,
+      "uncalibrated": true,
+      "note": "UNMEASURED - this is what blocks a plate-handling protocol today. 'grip' is the commanded Z at which the jaws surround a seated plate; 'lift' is the Z to carry it at, which must be SMALLER (physically higher) than grip. Measure by jogging with the gripper fitted and open: lower until the jaws straddle the plate skirt, record that as grip; raise until the plate clears everything on the deck, record that as lift. Both are per-effector because the jaw reference sits at a different height from the p300 nosecone."
+    }
+  },
+
   "carries_labware": true,
-  "carries_labware_note": "NOT IMPLEMENTED. Unlike a pipette the gripper would change the deck LAYOUT at runtime: picking a plate empties a slot and fills the effector. Nothing tracks that yet - Gripper.held is written by nothing, and the simulator has no notion of a moved placement. Building the gripper means adding that tracking, plus grip/release/move_labware primitives on Machine.",
-  "feedrates": {},
+  "carries_labware_note": "NOT TRACKED. Unlike a pipette, a gripper changes the deck LAYOUT at run time: picking a plate empties a slot and fills the effector. Machine.grip/release track whether something is held and at what Z it was picked, which is enough to enforce 'never release at height', but nothing moves the Placement in the Deck. A protocol that carries a plate to a different slot and dispenses into it there will compute the old coordinates. Transporting between slots needs that tracking first.",
+
+  "feedrates": {
+    "note": "The gripper has no feedrate of its own - the servo is timed, and gantry moves use the deck's."
+  },
+
   "uncalibrated": [
-    "ALL"
+    "z_for_labware.sbs_96_wellplate.grip",
+    "z_for_labware.sbs_96_wellplate.lift",
+    "actuator.open_ms_default",
+    "actuator.close_ms_default",
+    "shell_command.blocks"
   ],
+
   "todo_before_use": [
-    "measure open_pos / closed_pos / grip_pos / pos_max / stroke_margin",
-    "measure jaw spans and approach clearance",
-    "add grip() / release() / move_labware() to lab/machine.py",
-    "teach lab/simulate.py to validate a gripper POS and to track held labware",
-    "decide whether the gripper uses ACTUATOR_MOVE or its own Klipper macro"
+    "measure z_for_labware.sbs_96_wellplate.grip and .lift by jogging",
+    "add GRIPPER_IMU to Gripper/klipper/gripper_macros.cfg (text is in docs/LAB.md)",
+    "test once whether RUN_SHELL_COMMAND blocks, then set shell_command.blocks",
+    "confirm the gripper never uses GRIPPER_PICK or GRIPPER_PLACE on this machine",
+    "teach Deck to move a Placement when a plate is carried between slots"
   ]
 }
