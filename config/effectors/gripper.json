@@ -45,6 +45,9 @@
     "ping": "GRIPPER_PING",
     "status": "GRIPPER_STATUS",
     "imu": "GRIPPER_IMU",
+    "imu_start": "GRIPPER_IMU_START",
+    "imu_mark": "GRIPPER_IMU_MARK",
+    "imu_stop": "GRIPPER_IMU_STOP",
     "note": "From Gripper/klipper/gripper_macros.cfg, which must be included from printer.cfg and needs the gcode_shell_command extra. GRIPPER_IMU is an ADDITION - the shipped cfg had no IMU macro, so there was no way to ask for a measurement from gcode at all.",
     "do_not_use": ["GRIPPER_PICK", "GRIPPER_PLACE"],
     "do_not_use_note": "DANGEROUS ON THIS MACHINE. Both do relative Z moves with the sign convention of a normal printer - GRIPPER_PICK emits G1 Z+40 and calls it a lift. Here +Z is DOWN, so that command drives the gripper 40 mm INTO the plate. This library emits absolute Z through Machine, which knows the convention."
@@ -61,6 +64,15 @@
     "required": false,
     "labware": null,
     "eject_supported": false
+  },
+
+  "z_for_station": {
+    "gripper_pick_9": {
+      "approach": 90.0,
+      "grip": 107.0,
+      "release": 100.0,
+      "note": "Operator-measured 2026-10-06. +Z is DOWN, so: approach 90 is the height the gripper arrives and leaves at; it descends to 107 to close on the part; it releases at 100. RELEASE IS 7 mm ABOVE THE GRIP, so the part falls 7 mm when it is let go. That is deliberate and the protocol declares the drop explicitly - Machine.release refuses any drop it was not told to expect, because releasing at height is the first rule in the gripper's API."
+    }
   },
 
   "z_for_labware": {
