@@ -103,5 +103,11 @@
     "test once whether RUN_SHELL_COMMAND blocks, then set shell_command.blocks",
     "confirm the gripper never uses GRIPPER_PICK or GRIPPER_PLACE on this machine",
     "teach Deck to move a Placement when a plate is carried between slots"
-  ]
+  ],
+  "capture_concurrency": {
+    "commands_during_capture": false,
+    "note": "Can the BOARD service a gripper command while it is streaming IMU samples? False as of firmware 559fbb8. Gripper/API.md documents the spanning sequence with GRIPPER_GRIP inside START/STOP, and the HOST half of that is real - imu_session.py forks the capture, so the Pi does not block. The BOARD half is not: gripnode.imu_read() is a blocking `for i in range(count)` loop, and drain()'s own docstring says 'a motion in progress polls that flag and the queue is not read until the motion returns'. Only ESTOP, ABORT and STOP take effect immediately; everything else is queued up to 8 deep and dispatched when the capture ends.",
+    "evidence": "Observed 2026-10-06: every gripper command before the capture returned (ping, status, home, open); GRIPPER_GRIP sent after GRIPPER_IMU_START never returned, and its log line has no matching 'Command {gripper} finished'. The API.md commit 965823c changed one file, +63 lines, with no accompanying firmware commit.",
+    "to_enable": "Dispatch _pending inside imu_read()'s loop, guarded against a nested imu_read - see board/PROPOSAL_imu_concurrent.md. Flash it, confirm a grip issued mid-capture returns 'grip: done', then set this true. The protocol then emits the spanning sequence with no code change."
+  }
 }
