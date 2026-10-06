@@ -436,10 +436,23 @@ class Machine:
             )
         return self.effector
 
+    # Commands the board handles WHILE streaming IMU samples. Everything
+    # else is queued until the capture ends - see _gripper_macro.
+    _DURING_CAPTURE = frozenset({"imu_mark", "imu_stop", "stop", "abort"})
+
     def _gripper_macro(self, op: str, args: str = "", **detail: Any) -> None:
         """Emit one GRIPPER_* macro, fenced by M400 and a guard dwell."""
         eff = self._gripper()
         name = eff.macro(op)
+        if self._imu_session is not None and op not in self._DURING_CAPTURE:
+            raise ProtocolError(
+                f"{name} cannot be sent while an IMU capture is running. The "
+                f"board streams samples in a blocking loop and does not read "
+                f"the command queue until it finishes - the command would be "
+                f"QUEUED and then fire when the capture ends, long after the "
+                f"gantry has moved on. Only abort, stop and a mark get "
+                f"through. Stop the capture first: gripper_imu_stop()."
+            )
         if name in eff.forbidden_macros:
             raise ProtocolError(
                 f"{name} must never be emitted on this machine. It does a "
@@ -507,7 +520,8 @@ class Machine:
         else:
             self._gripper_macro("close", f"MS={int(ms)}", ms=int(ms))
 
-    def grip(self, ma: Optional[int] = None, what: str = "part") -> None:
+    def grip(self, ma: Optional[int] = None, what: str = "part",
+             log_csv: Optional[str] = None) -> None:
         """Close onto a part and hold at `ma` milliamps.
 
         A grip is a controlled stall, not a clamp: there is no holding torque
@@ -522,14 +536,19 @@ class Machine:
             )
         ma = int(eff.grip_ma_default if ma is None else ma)
         eff.check_grip_ma(ma)
-        self._gripper_macro("grip", f"MA={ma}", ma=ma, what=what)
+        # The IMU cannot record a grip - the board will not stream and move
+        # at once - so the board's OWN current trace is how that transient is
+        # captured instead.
+        args = f"MA={ma}" + (f" LOG={log_csv}" if log_csv else "")
+        self._gripper_macro("grip", args, ma=ma, what=what, log_csv=log_csv)
         self.gripper_holding = what
         self._grip_z = self.g.get_z()
         self._grip_dwell_s = 0.0
         eff.held = what
         self.toggles["grips"] = self.toggles.get("grips", 0) + 1
 
-    def release(self, max_drop_mm: float = 0.0) -> None:
+    def release(self, max_drop_mm: float = 0.0,
+                log_csv: Optional[str] = None) -> None:
         """Stop holding and open enough to let go.
 
         "Never release at height" is the first rule in the gripper's API, and
@@ -572,7 +591,9 @@ class Machine:
                 f"lands on.",
             )
             self.toggles["release_drop_mm"] = drop
-        self._gripper_macro("release", what=self.gripper_holding)
+        self._gripper_macro("release",
+                            f"LOG={log_csv}" if log_csv else "",
+                            what=self.gripper_holding, log_csv=log_csv)
         self.gripper_holding = None
         self._grip_z = None
         self._grip_dwell_s = 0.0
