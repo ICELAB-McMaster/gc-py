@@ -161,7 +161,15 @@ def build(
             f"de-energises and the part drops. Shorten --hold."
         )
 
+    # Can the board take a gripper command while streaming? If it can, the
+    # capture brackets the grip and the release too, which is what API.md
+    # describes. If it cannot, those two go outside and their transients come
+    # from the board's own current trace instead.
+    spanning = bool((eff.spec.get("capture_concurrency") or {})
+                    .get("commands_during_capture"))
+
     m.toggles.update({
+        "spanning_capture": spanning,
         "station": station, "station_xy": list(st.xy),
         "cycles": cycles, "grip_ma": int(grip_ma), "hold_s": hold_s,
         "post_release_s": post_release_s,
@@ -183,8 +191,14 @@ def build(
     if imu:
         m.note(f"IMU captures to {csv_dir}/<name>_NN.csv on the Pi, with "
                f"phase marks in the matching .marks.csv")
-        m.note(f"the capture spans the RELEASE and runs {post_release_s:g} s "
-               f"past it, so the fall and the landing are recorded")
+        if spanning:
+            m.note(f"the capture SPANS the grip and the release, and runs "
+                   f"{post_release_s:g} s past it so the fall is recorded")
+        else:
+            m.note("the capture spans the GANTRY motion only - the board "
+                   "cannot be commanded while it streams, so the grip and "
+                   "release transients come from their own --log CSVs "
+                   "instead (capture_concurrency in the effector config)")
         if dest_dir:
             m.note(f"each capture is copied to {dest_dir} on the Pi when it "
                    f"stops - that must be a MOUNTED share, and the originals "
@@ -213,20 +227,26 @@ def build(
 
         m.move_to_z(z_grip, op="descend")
 
-        # The GRIP goes BEFORE the capture. The board streams IMU samples in
-        # a blocking loop and does not read its command queue until the
-        # capture ends, so a grip sent during one is queued and fires minutes
-        # later. Its own transient is recorded instead by the board's motion
-        # telemetry, which is what --log --csv on the command produces.
-        m.grip(ma=int(grip_ma), what=f"part@{station}",
-               log_csv=(f"{csv_dir}/{name}_{tag}_grip.csv" if imu else None))
-
-        # From here to the stop is GANTRY motion only. Klipper owns that, so
-        # the board is free to stream throughout.
-        if imu:
+        # The capture opens here only if the board can be commanded while it
+        # streams. Otherwise the grip has to happen first - a command sent
+        # during a capture is QUEUED, not refused, and fires when the capture
+        # ends, long after the gantry has moved on.
+        if imu and spanning:
             m.gripper_imu_start(csv=f"{csv_dir}/{name}_{tag}.csv",
                                 label=f"pick{tag}", rate=imu_rate,
                                 dest=dest_dir)
+            m.gripper_imu_mark(f"pick{tag}_before_grip_z{z_grip:g}")
+
+        m.grip(ma=int(grip_ma), what=f"part@{station}",
+               log_csv=(f"{csv_dir}/{name}_{tag}_grip.csv" if imu else None))
+
+        if imu and not spanning:
+            # From here to the stop is GANTRY motion only. Klipper owns that,
+            # so the board is free to stream throughout.
+            m.gripper_imu_start(csv=f"{csv_dir}/{name}_{tag}.csv",
+                                label=f"pick{tag}", rate=imu_rate,
+                                dest=dest_dir)
+        if imu:
             m.gripper_imu_mark(f"pick{tag}_gripped_{int(grip_ma)}ma_z{z_grip:g}")
 
         m.move_to_z(z_approach, op="lift")
@@ -240,14 +260,22 @@ def build(
         m.move_to_z(z_release, op="lower")
         if imu:
             m.gripper_imu_mark(f"pick{tag}_at_release_z{z_release:g}")
-            # Stopped before the release because it HAS to be, not by choice.
-            m.gripper_imu_stop()
+            if not spanning:
+                # Stopped here because it HAS to be, not by choice: the
+                # release would otherwise be queued behind the capture.
+                m.gripper_imu_stop()
 
         m.release(max_drop_mm=drop_mm,
                   log_csv=(f"{csv_dir}/{name}_{tag}_release.csv"
                            if imu else None))
+        if imu and spanning:
+            m.gripper_imu_mark(f"pick{tag}_released_drop{drop_mm:g}mm")
         if post_release_s:
+            # Covers the 7 mm fall. Only inside the capture when the board
+            # can be commanded mid-stream; otherwise it is just a settle.
             m.dwell(post_release_s, op="post_release")
+        if imu and spanning:
+            m.gripper_imu_stop()
 
         m.move_to_z(z_approach, op="retreat")
 
@@ -270,8 +298,12 @@ def summarise(m: Machine, result) -> None:
           f"release {t['z_release']:g}   (+Z is DOWN)")
     print(f"  grip {t['grip_ma']} mA, hold {t['hold_s']:g} s")
     if t.get("imu"):
-        print(f"  capture spans the release, +{t['post_release_s']:g} s past "
-              f"it for the fall and the landing")
+        if t.get("spanning_capture"):
+            print(f"  capture SPANS the grip and release, "
+                  f"+{t['post_release_s']:g} s past it for the fall")
+        else:
+            print(f"  capture spans the gantry motion only; grip and release "
+                  f"transients are in their own --log CSVs")
         print(f"  captures -> {t['csv_dir']} on the Pi"
               + (f", copied to {t['dest_dir']}" if t.get("dest_dir") else ""))
     if t["release_drop_mm"]:

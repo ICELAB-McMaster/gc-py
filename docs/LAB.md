@@ -316,7 +316,16 @@ it. Marks go to `<csv>.marks.csv` as elapsed seconds plus a label; join on
 elapsed time. The capture file is named per pick, so *which pick-up* is the
 filename and *which part of the cycle* is the mark.
 
-### A capture cannot contain a gripper command
+### A capture cannot contain a gripper command - yet
+
+`Gripper/API.md` documents `GRIPPER_IMU_START`/`MARK`/`STOP` recording
+**through** a grip, with the grip inside the pair. Half of that is real and
+half is not, and the half that is not is the half that matters here.
+
+**Real:** the HOST does not block. `imu_session.py` forks the capture, so the
+Pi is free while it runs.
+
+**Not real:** the BOARD cannot be commanded while it streams.
 
 **The board does one thing at a time.** `board/gripnode.py`'s `imu_read()` is
 a blocking `for i in range(count)` loop, and `drain()` states the rule
@@ -330,9 +339,18 @@ minutes later, long after the gantry has moved on. Observed 2026-10-06 as a
 `gripctl` timeout with no reply, which was the mild version of what could
 have happened.
 
-`Machine._gripper_macro` now refuses any gripper command while a session is
+`Machine._gripper_macro` refuses any gripper command while a session is
 open, except the four the board really does service. What a capture CAN span
 is **gantry motion** - Klipper owns that, and the board is idle throughout.
+
+**Both sequences are implemented**, chosen by
+`capture_concurrency.commands_during_capture` in the effector config. It is
+`false` today. Fix the firmware - `Gripper/board/PROPOSAL_imu_concurrent.md`
+has the change, the cost and the test - flash it, flip the flag, and the
+protocol emits API.md's spanning sequence with **no code change**.
+`test_the_spanning_capture_is_emitted_once_the_board_can_take_commands`
+already pins what that output should be, so enabling it is a tested change
+rather than a hopeful one.
 
 That leaves the grip and release transients unrecordable by the IMU. They are
 not lost: `gripctl` takes `--log --csv` on any motion command and streams the

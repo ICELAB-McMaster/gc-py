@@ -60,6 +60,36 @@ check `<csv>.log` is empty and the CSV has rows before trying 15.
 
 ---
 
+## 2026-10-06 (later still) - the capability is documented, not built
+
+`API.md` was updated (`965823c`) to document the spanning capture, with
+`GRIPPER_GRIP` between `IMU_START` and `IMU_STOP`, and the note that "the
+capture runs detached in the background, so it records through the grip and
+the fall".
+
+The host half of that is correct. The board half is not, and three things say
+so independently:
+
+* `gripnode.imu_read()` at HEAD is still the blocking `for i in range(count)`
+  loop, and `drain()` still documents "the queue is not read until the motion
+  returns";
+* `965823c` changed **one file**, `API.md`, +63 lines. No firmware commit
+  accompanied it;
+* the hardware already demonstrated it - every gripper command before the
+  capture returned, and the one after it never did.
+
+The likely reading is that host-side detachment (true, `imu_session.py` forks)
+was taken for board-side concurrency (false, single-threaded, queue dispatched
+only by `run()`).
+
+Both sequences now exist in the protocol behind
+`capture_concurrency.commands_during_capture`, and the firmware change is
+written up in `Gripper/board/PROPOSAL_imu_concurrent.md` - including what it
+costs, which is a 0.3-1.5 s hole in the sample stream while the grip runs,
+visible in the timestamps rather than silently closed up.
+
+---
+
 ## 2026-10-06 (later) - the board cannot command and stream at once
 
 Third attempt. `imu_session 2026-10-06.2` confirmed in the log, the directory

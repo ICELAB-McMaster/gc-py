@@ -381,6 +381,82 @@ def test_station9_heights_run_in_the_order_the_operator_specified():
           "every XY leg must happen at travel height")
 
 
+def _gripper_capability_config(**flags):
+    """Temp LAB_CONFIG with capture_concurrency overridden."""
+    import json as _json, shutil
+    from lab import config as cfgmod
+    d = Path(tempfile.mkdtemp())
+    for src in cfgmod.config_dir().glob("*.json"):
+        shutil.copy(src, d / src.name)
+    shutil.copytree(cfgmod.config_path("effectors"), d / "effectors")
+    spec = _json.loads((d / "effectors" / "gripper.json").read_text())
+    spec.setdefault("capture_concurrency", {}).update(flags)
+    (d / "effectors" / "gripper.json").write_text(_json.dumps(spec))
+    return d
+
+
+def test_the_spanning_capture_is_emitted_once_the_board_can_take_commands():
+    """API.md's sequence, gated on a capability the firmware lacks.
+
+    The host half of that documentation is real - imu_session.py forks, so
+    the Pi does not block. The board half is not: gripnode.imu_read() is a
+    blocking loop and drain() says the queue is not read until it returns.
+    Commit 965823c changed API.md and nothing else.
+
+    So both sequences live here and one flag picks between them. This pins
+    the one that is NOT currently in use, so enabling it is a tested change
+    rather than a hopeful one.
+    """
+    import importlib
+    import gripper_station9_test as g9
+
+    with _WithConfig(_gripper_capability_config(
+            commands_during_capture=True)):
+        importlib.reload(g9)
+        with tempfile.TemporaryDirectory() as td:
+            m, _ = g9.build(outdir=td, layout=TEST_LAYOUT, plot=False)
+
+        def first(op):
+            return next(s.i for s in m.steps
+                        if s.op == op and s.kind == "macro")
+        start, stop = first("gripper:imu_start"), first("gripper:imu_stop")
+        grip, rel = first("gripper:grip"), first("gripper:release")
+
+        check(start < grip < rel < stop,
+              f"the capture must bracket BOTH the grip and the release: "
+              f"start {start}, grip {grip}, release {rel}, stop {stop}")
+        check(m.toggles["spanning_capture"] is True,
+              "the manifest must record which sequence was emitted")
+
+        settle = [s.i for s in m.steps if s.op == "post_release"]
+        check(settle and rel < settle[0] < stop,
+              "the settle after the release belongs inside the capture, or "
+              "the 7 mm fall is not recorded")
+
+        marks = [s.detail.get("label") for s in m.steps
+                 if s.op == "gripper:imu_mark" and s.kind == "macro"]
+        check(any("before_grip" in l for l in marks),
+              f"the spanning sequence should mark before the grip: {marks}")
+        check(any("released" in l for l in marks),
+              f"and after the release: {marks}")
+
+    importlib.reload(g9)
+
+
+def test_the_default_sequence_keeps_the_gripper_commands_outside():
+    """And the shipped config still emits the one the firmware supports."""
+    m = _station9(cycles=1)
+    check(m.toggles["spanning_capture"] is False,
+          "the shipped capability must still be off")
+
+    def first(op):
+        return next(s.i for s in m.steps if s.op == op and s.kind == "macro")
+    check(first("gripper:grip") < first("gripper:imu_start"),
+          "the grip must precede the capture while the board queues commands")
+    check(first("gripper:imu_stop") < first("gripper:release"),
+          "and the capture must be stopped before the release")
+
+
 def test_station9_preflights_before_it_moves():
     """An uninstalled gripper_macros.cfg must show up before G28.
 
