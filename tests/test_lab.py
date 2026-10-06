@@ -200,12 +200,153 @@ def test_one_json_per_effector():
         check(eid in avail, f"{eid} should have its own config/effectors/{eid}.json")
 
 
-def test_gripper_is_a_placeholder():
-    raises(EffectorError, lambda: eff_mod.load("gripper"),
-           "the gripper placeholder should refuse to load for motion")
-    g = eff_mod.load("gripper", allow_placeholder=True)
+def test_gripper_loads_but_refuses_plate_motion():
+    """The command model is real; the geometry is not.
+
+    The gripper used to be a placeholder that would not load at all. Its
+    commands are now taken from the hardware's own API, so it loads - but
+    every z_for_labware value is still null, so anything that would move it
+    to a plate refuses. Loading and being ready are different questions.
+    """
+    g = eff_mod.load("gripper")          # no allow_placeholder needed now
     check(g.kind == "gripper", "gripper should dispatch to the Gripper class")
-    check(g.is_placeholder, "gripper should be flagged as a placeholder")
+    check(not g.is_placeholder,
+          "the gripper is unmeasured, not a placeholder")
+    raises(EffectorError, g.require_ready,
+           "unmeasured plate geometry should refuse to generate motion")
+    check(any("z_for_labware" in u for u in g.uncalibrated()),
+          f"the missing Z values must be on the record: {g.uncalibrated()}")
+
+
+def test_gripper_models_timed_motion_not_position():
+    """The servo has no position, so no *_pos field may come back."""
+    g = eff_mod.load("gripper")
+    a = g.spec["actuator"]
+    pos_fields = [k for k in a if k.endswith("_pos")]
+    check(not pos_fields,
+          f"a positional field is meaningless on open-loop hardware: "
+          f"{pos_fields}")
+    check(g.spec["no_position"]["has_feedback"] is False,
+          "the config must say outright that there is no feedback")
+
+
+def test_gripper_refuses_to_open_past_the_firmware_clamp():
+    """Opening has no hard stop; past full travel the racks leave the pinion."""
+    g = eff_mod.load("gripper")
+    check(g.open_ms_max == 850, f"the clamp is 850 ms, got {g.open_ms_max}")
+    g.check_open_ms(850)                                  # the limit itself is fine
+    raises(EffectorError, lambda: g.check_open_ms(851),
+           "one millisecond past the clamp must refuse")
+    raises(EffectorError, lambda: g.check_open_ms(0),
+           "a zero-length open should raise rather than emit nothing")
+
+
+def test_gripper_refuses_a_current_outside_the_window():
+    g = eff_mod.load("gripper")
+    for ok in (100, 300, 500):
+        g.check_grip_ma(ok)
+    for bad in (99, 501, 570):
+        raises(EffectorError, lambda b=bad: g.check_grip_ma(b),
+               f"{bad} mA is outside 100-500 and must refuse")
+
+
+def test_gripper_will_not_emit_the_relative_move_macros():
+    """GRIPPER_PICK and GRIPPER_PLACE invert Z for this machine.
+
+    Both emit a relative move with a normal printer's sign convention - a
+    positive Z they call a lift. Here +Z is DOWN, so that drives the gripper
+    into the deck. They are named in the config so the library can refuse
+    them by name rather than relying on nobody calling them.
+    """
+    g = eff_mod.load("gripper")
+    check(set(g.forbidden_macros) == {"GRIPPER_PICK", "GRIPPER_PLACE"},
+          f"both relative-move macros must be forbidden, got "
+          f"{g.forbidden_macros}")
+    m = _gripper_machine()
+    m.startup()
+    m.effector.spec["macros"]["status"] = "GRIPPER_PICK"   # force the path
+    raises(ProtocolError, m.gripper_status,
+           "emitting a forbidden macro must refuse")
+
+
+def _gripper_machine(**kw):
+    from lab.machine import Machine
+    return Machine(effector="gripper", name="t", layout=TEST_LAYOUT,
+                   temp_log=False, **kw)
+
+
+def test_gripper_must_be_homed_before_it_moves():
+    m = _gripper_machine()
+    m.startup()
+    raises(ProtocolError, m.gripper_open,
+           "opening before homing must refuse - the firmware refuses it too")
+    raises(ProtocolError, lambda: m.grip(ma=300),
+           "gripping before homing must refuse")
+    m.gripper_home()
+    check(m.gripper_homed, "home should set the flag")
+    m.gripper_open()                                      # now legal
+
+
+def test_every_gripper_macro_is_fenced_by_m400():
+    """Klipper queues moves; without M400 the shell command runs early."""
+    m = _gripper_machine()
+    m.startup()
+    m.gripper_home()
+    emitted = [ln for ln in m.g.getvalue().splitlines() if ln.strip()]
+    i = emitted.index("GRIPPER_HOME")
+    check(emitted[i - 1].startswith("M400"),
+          f"M400 must immediately precede the macro, got {emitted[i - 1]!r}")
+    # And the guard dwell follows, while shell blocking is unproven.
+    check(emitted[i + 1].startswith("G4"),
+          f"a guard dwell should follow the macro, got {emitted[i + 1]!r}")
+
+
+def test_release_above_the_pick_height_is_refused():
+    """"Never release at height" is rule 1 of the gripper's API."""
+    m = _gripper_machine()
+    m.startup()
+    m.gripper_home()
+    m.gripper_open()
+    m._move_z(40.0, 600, "probe")        # +Z is DOWN, so this is low
+    m.grip(ma=300, what="plate")
+    check(m.gripper_holding == "plate", "the grip should be recorded")
+    m._move_z(10.0, 600, "probe")        # lifted 30 mm
+    raises(ProtocolError, m.release,
+           "releasing 30 mm above the pick height would drop the plate")
+    m._move_z(40.0, 600, "probe")        # back down
+    m.release()
+    check(m.gripper_holding is None, "release should clear the hold")
+
+
+def test_a_carried_plate_is_no_fly_over_the_tip_rack():
+    """A plate shears the standing tips off exactly as a fitted tip does."""
+    m = _gripper_machine()
+    m.startup()
+    m.gripper_home()
+    m.gripper_open()
+    m.grip(ma=300, what="plate")
+    rects = m.deck.no_fly_rects()
+    check(rects, "the tip rack should be a no-fly zone")
+    box = rects[0][1]
+    mid_y = (box[2] + box[3]) / 2.0
+    m.goto(box[1] + 20.0, mid_y, op="carry")
+    raises(SimulationError,
+           lambda: m._move_xy(box[0] - 20.0, mid_y, 6000, "carry", order="X"),
+           "carrying a plate straight across the tip rack must fail")
+
+
+def test_a_hold_that_outlasts_its_expiry_is_refused():
+    """A grip is a controlled stall and de-energises at about 140 s."""
+    m = _gripper_machine()
+    m.startup()
+    m.gripper_home()
+    m.gripper_open()
+    m.grip(ma=300, what="plate")
+    m.dwell(30.0)                        # past tier 1, still holding
+    check(any("tier-1" in w for w in m.sim.report.warnings),
+          f"passing tier 1 should warn: {m.sim.report.warnings}")
+    raises(ProtocolError, lambda: m.dwell(120.0),
+           "dwelling past the expiry must refuse rather than drop the plate")
 
 
 def test_unknown_effector():

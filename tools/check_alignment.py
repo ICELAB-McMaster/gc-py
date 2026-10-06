@@ -116,6 +116,18 @@ def identify(deck: Deck, x: float, y: float) -> Optional[str]:
                     label = f"{name}:{well_name(row, col)}" if n_wells > 1 else name
                     best = (d, label + ("" if d < 1e-6 else f" (+{d:.1f}mm)"))
 
+    # A gripper takes a plate by its CENTRE, which is not a well, so a
+    # gripper run would otherwise report every pick as "nothing on the deck
+    # is here". Only labware big enough to grab is worth offering.
+    for name, p in deck.placements.items():
+        if p.labware.rows * p.labware.cols < 2:
+            continue
+        cx, cy = p.grid_center()
+        d = ((cx - x) ** 2 + (cy - y) ** 2) ** 0.5
+        if d <= TOL and (best is None or d < best[0]):
+            best = (d, f"{name}:centre"
+                       + ("" if d < 1e-6 else f" (+{d:.1f}mm)"))
+
     for name, st in deck.stations.items():
         d = ((st.xy[0] - x) ** 2 + (st.xy[1] - y) ** 2) ** 0.5
         if d <= TOL and (best is None or d < best[0]):

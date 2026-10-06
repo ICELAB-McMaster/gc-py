@@ -30,6 +30,7 @@ protocols/
   accuracy_test.py     ISO 8655 accuracy/repeatability, any pipette
   centrifuge_test.py   two plates to equal mass, one liquid source each
   centrifuge_test_v2_1.py  location 2 only, two corner wells
+  gripper_plate_test.py    pick a plate, lift, read the IMU, put it back
 
 tools/compare_gcode.py compare two .gcode files by motion, not bytes
 tests/test_lab.py      regression tests; pins every known-good coordinate
@@ -199,6 +200,55 @@ rack, X across, Y back.
 This was found on hardware. The water station at X 70 sits *underneath* the rack
 in X, so every unrouted approach to water from a high Y ran straight through it:
 six colliding legs in one run, all at travel height.
+
+## The gripper
+
+A Parallax Feedback 360 continuous-rotation servo on a rack and pinion, over
+CAN, commanded through the `GRIPPER_*` Klipper macros in the SDL_Gcode repo.
+`protocols/gripper_plate_test.py` is the bring-up test: pick a plate, lift,
+record the IMU, put it back, `--cycles N` times.
+
+**It has no position.** The servo's feedback output has failed, so the
+firmware runs open loop and every motion is **timed** - "open for 400 ms",
+never "open to 30 degrees". The config models that directly; there is no
+`*_pos` field and a test asserts none comes back.
+
+Five rules the library enforces so a protocol cannot break them:
+
+| rule | where | why |
+|---|---|---|
+| Homed before OPEN / CLOSE / GRIP | `Machine._require_gripper_homed` | the firmware refuses otherwise, and a timed mechanism has no other reference |
+| Never open past 850 ms | `Gripper.check_open_ms` | opening has **no hard stop** - past full travel the racks leave the pinion and it is a hand rebuild |
+| Grip current within 100-500 mA | `Gripper.check_grip_ma` | the firmware silently clamps above 500, so a refusal is more honest |
+| Never release above the pick Z | `Machine.release` | releasing at height drops the plate. +Z is down, so release needs a Z at least as **large** as the grip |
+| A hold expires at ~140 s | `Machine._count_dwell` | a grip is a controlled stall, not a clamp. Dwells are charged against the budget |
+
+The hold check counts **dwells only** - travel time is not modelled - so it is
+a lower bound and says so when it warns.
+
+**`GRIPPER_PICK` and `GRIPPER_PLACE` must never run on this machine.** Both do
+relative Z moves with a normal printer's sign convention: `GRIPPER_PICK` emits
+`G1 Z40` and calls it a lift. Here **+Z is DOWN**, so that drives the gripper
+40 mm *into* the plate. They are listed under `macros.do_not_use` and the
+library refuses them by name. Everything this library emits is absolute Z.
+
+Two things are still unmeasured, and a plate protocol refuses until they are:
+`z_for_labware.sbs_96_wellplate.grip` (where the open jaws straddle a seated
+plate) and `.lift` (the carry height, a **smaller** number). Jog with the
+gripper fitted and open to get both.
+
+Every gripper macro is emitted as `M400`, the macro, then a `G4` guard dwell.
+The `M400` is because Klipper queues moves and the shell command would
+otherwise run while the gantry is still travelling. The guard dwell is because
+whether `RUN_SHELL_COMMAND` blocks until the process exits is
+install-dependent and untested here - set `shell_command.blocks` true once it
+is confirmed and the dwells disappear, about 3.5 s a cycle. Note the guard is
+a `G4` and **not** an `M400`: `M400` drains the *motion* queue, and a shell
+command was never in it.
+
+The IMU is reached through `GRIPPER_IMU`, which this work **added** to
+`gripper_macros.cfg` - the shipped file had no IMU macro, so there was no way
+to ask for a measurement from gcode at all.
 
 ## Conventions that read backwards
 
