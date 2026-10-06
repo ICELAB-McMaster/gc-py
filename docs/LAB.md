@@ -273,8 +273,13 @@ filename and *which part of the cycle* is the mark.
 2026-10-06. XY (69.50, 178.20), which is a **station** rather than a slot
 placement - it is one measured position for a part, not a labware grid.
 
-    approach Z 90 -> descend Z 107 -> grip -> lift Z 90 -> hold 1 s
-        -> lower Z 100 -> stop IMU -> release -> Z 90, repeat
+    approach Z 90 -> descend Z 107 -> IMU start -> grip -> lift Z 90
+        -> hold 1 s -> lower Z 100 -> release -> settle -> IMU stop
+        -> Z 90, repeat
+
+The capture spans the **release**, and runs on past it, because the part
+falls 7 mm and the fall and landing are the interesting part - a capture
+ending at the release command records the jaws opening and nothing after.
 
 **The release is 7 mm above the grip, so the part falls 7 mm.**
 `Machine.release` takes `max_drop_mm`, defaulting to **zero** - an accidental
