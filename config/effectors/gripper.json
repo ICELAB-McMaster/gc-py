@@ -5,12 +5,10 @@
   "display_name": "Parallax Feedback 360 plate gripper (rack and pinion, CAN)",
   "status": "unmeasured",
   "status_note": "The COMMAND model is now real - taken from Gripper/API.md and Gripper/klipper/gripper_macros.cfg in the SDL_Gcode repo, 2026-10-06. What is still missing is GEOMETRY: every z_for_labware value is null, so a protocol that moves the gripper to a plate refuses until they are measured. The previous version of this file modelled the gripper as POSITIONAL (open_pos / closed_pos / grip_pos) and that was simply wrong for this hardware - see no_position below.",
-
   "no_position": {
     "has_feedback": false,
     "note": "THE SERVO HAS NO POSITION. The Parallax Feedback 360's feedback output has failed on two units, so the firmware runs OPEN LOOP and every motion is TIMED, not positional. There is no 'open to 30 degrees', only 'open for 400 ms'. Any position field in a reply reads n/a. This is a hardware fault, not a software choice. Do not reintroduce a *_pos field: a number that cannot be measured or commanded is worse than an absent one."
   },
-
   "actuator": {
     "model": "timed_open_current_grip",
     "open_ms_default": null,
@@ -23,17 +21,14 @@
     "grip_ma_note": "500 is the firmware clamp; the hardware ceiling is about 570 mA. A setpoint above the clamp is SILENTLY reduced by the firmware, which is why the library refuses it instead. --ma is repeatable but UNCALIBRATED against force: it is not newtons.",
     "decimals": 0
   },
-
   "hold": {
     "tier1_s": 20.0,
     "tier2_s": 120.0,
     "expires_s": 140.0,
     "note": "A grip is a CONTROLLED STALL, not a clamp - this servo has no holding torque at rest. Full commanded current for the first 20 s, reduced for the next 120, then de-energised with a fault raised. Design every sequence to put the part down before 140 s. If a plate must be held longer, this actuator is the wrong tool and the fixture needs a mechanical detent."
   },
-
   "requires_home": true,
   "requires_home_note": "OPEN, CLOSE and GRIP are refused by the firmware until HOME has run. Home drives into the closed stop and calls that zero. It costs about a second and re-establishes the only reference the timed model has, so when in doubt, home. Home again after any ST_LIMIT, ST_ABORTED or power cycle.",
-
   "macros": {
     "home": "GRIPPER_HOME",
     "open": "GRIPPER_OPEN",
@@ -49,32 +44,31 @@
     "imu_mark": "GRIPPER_IMU_MARK",
     "imu_stop": "GRIPPER_IMU_STOP",
     "note": "From Gripper/klipper/gripper_macros.cfg, which must be included from printer.cfg and needs the gcode_shell_command extra. GRIPPER_IMU is an ADDITION - the shipped cfg had no IMU macro, so there was no way to ask for a measurement from gcode at all.",
-    "do_not_use": ["GRIPPER_PICK", "GRIPPER_PLACE"],
+    "do_not_use": [
+      "GRIPPER_PICK",
+      "GRIPPER_PLACE"
+    ],
     "do_not_use_note": "DANGEROUS ON THIS MACHINE. Both do relative Z moves with the sign convention of a normal printer - GRIPPER_PICK emits G1 Z+40 and calls it a lift. Here +Z is DOWN, so that command drives the gripper 40 mm INTO the plate. This library emits absolute Z through Machine, which knows the convention."
   },
-
   "imu_storage": {
     "capture_dir": "/home/admin/imu",
-    "dest_dir": "/mnt/ice-nas/GC_ARCCS/GripperIMU",
+    "dest_dir": "/mnt/nas/GC_ARCCS/GripperIMU",
     "unc": "\\\\ICE-NAS\\Data\\GC_ARCCS\\GripperIMU",
     "note": "Captures are written to capture_dir on the Pi's LOCAL disk and copied to dest_dir when the capture stops. Never recorded straight onto the share: a 100 Hz capture writing to a mount that stalls or drops takes the run with it, and it would surface as a short CSV rather than an error. Copy-after means a share that is down costs the copy, not the data.",
-    "mount_note": "dest_dir is a path ON THE PI and the share must already be mounted there - a Windows UNC path means nothing to Linux. The mapping assumed here is the 'Data' share of ICE-NAS mounted at /mnt/ice-nas, so UNC \\\\ICE-NAS\\Data\\GC_ARCCS\\GripperIMU becomes /mnt/ice-nas/GC_ARCCS/GripperIMU. If it is mounted somewhere else, pass --dest-dir; nothing here can check a mount from the slicing machine.",
+    "mount_note": "dest_dir is a path ON THE PI and the share must already be mounted there. Confirmed by the operator 2026-10-06: it is mounted at /mnt/nas, so UNC \\\\ICE-NAS\\Data\\GC_ARCCS\\GripperIMU is /mnt/nas/GC_ARCCS/GripperIMU here. MIND THE SEPARATOR - the operator wrote it as \\mnt\\nas\\..., which is how Windows renders a path, but the capture runs on Linux and backslashes are not separators there. Passed through, \\mnt\\nas\\GC_ARCCS\\GripperIMU would be ONE filename containing backslashes, and the data would be written successfully somewhere nobody looks - which is why Machine.gripper_imu_start refuses any destination containing one. If the share moves, pass --dest-dir with forward slashes; nothing on the slicing machine can check a mount on the Pi.",
     "validated": false
   },
-
   "shell_command": {
     "blocks": null,
     "guard_dwell_ms": 1500,
     "guard_dwell_grip_ms": 2000,
     "note": "Whether RUN_SHELL_COMMAND blocks until the process exits is INSTALL-DEPENDENT and has not been tested here. While blocks is null the library emits a G4 guard dwell after every gripper macro, so a following move cannot start while the gripper is still running. Test it once, set blocks true, and the dwells disappear - that is about 3.5 s a cycle."
   },
-
   "tips": {
     "required": false,
     "labware": null,
     "eject_supported": false
   },
-
   "z_for_station": {
     "gripper_pick_9": {
       "approach": 90.0,
@@ -83,7 +77,6 @@
       "note": "Operator-measured 2026-10-06. +Z is DOWN, so: approach 90 is the height the gripper arrives and leaves at; it descends to 107 to close on the part; it releases at 100. RELEASE IS 7 mm ABOVE THE GRIP, so the part falls 7 mm when it is let go. That is deliberate and the protocol declares the drop explicitly - Machine.release refuses any drop it was not told to expect, because releasing at height is the first rule in the gripper's API."
     }
   },
-
   "z_for_labware": {
     "sbs_96_wellplate": {
       "grip": null,
@@ -92,14 +85,11 @@
       "note": "UNMEASURED - this is what blocks a plate-handling protocol today. 'grip' is the commanded Z at which the jaws surround a seated plate; 'lift' is the Z to carry it at, which must be SMALLER (physically higher) than grip. Measure by jogging with the gripper fitted and open: lower until the jaws straddle the plate skirt, record that as grip; raise until the plate clears everything on the deck, record that as lift. Both are per-effector because the jaw reference sits at a different height from the p300 nosecone."
     }
   },
-
   "carries_labware": true,
   "carries_labware_note": "NOT TRACKED. Unlike a pipette, a gripper changes the deck LAYOUT at run time: picking a plate empties a slot and fills the effector. Machine.grip/release track whether something is held and at what Z it was picked, which is enough to enforce 'never release at height', but nothing moves the Placement in the Deck. A protocol that carries a plate to a different slot and dispenses into it there will compute the old coordinates. Transporting between slots needs that tracking first.",
-
   "feedrates": {
     "note": "The gripper has no feedrate of its own - the servo is timed, and gantry moves use the deck's."
   },
-
   "uncalibrated": [
     "z_for_labware.sbs_96_wellplate.grip",
     "z_for_labware.sbs_96_wellplate.lift",
@@ -107,7 +97,6 @@
     "actuator.close_ms_default",
     "shell_command.blocks"
   ],
-
   "todo_before_use": [
     "measure z_for_labware.sbs_96_wellplate.grip and .lift by jogging",
     "add GRIPPER_IMU to Gripper/klipper/gripper_macros.cfg (text is in docs/LAB.md)",
