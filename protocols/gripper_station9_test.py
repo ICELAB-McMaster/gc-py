@@ -15,16 +15,24 @@ a smaller Z is physically higher:
     rise to Z 90
     dwell 1 s
     descend to Z 100
-    GRIPPER_IMU_STOP
     GRIPPER_RELEASE                   the part falls 7 mm - see below
+    dwell, so the fall and the landing are in the capture
+    GRIPPER_IMU_STOP
     rise to Z 90, and round again
 
-The IMU capture brackets the whole pick, and `GRIPPER_IMU_MARK` is emitted at
-each phase boundary, so the CSV can be cut into `at_pick`, `gripped`,
-`lifted`, `held`, `at_release`. Marks land in `<csv>.marks.csv` as elapsed
-seconds plus a label; join on elapsed time. The capture file is named per
-cycle, so "which pick-up is this" is the filename and "which part of the
-cycle" is the mark.
+The IMU capture brackets the whole pick **including the release**, and
+`GRIPPER_IMU_MARK` is emitted at each phase boundary, so the CSV can be cut
+into `at_grip`, `gripped`, `lifted`, `held`, `at_release`, `released`. Marks
+land in `<csv>.marks.csv` as elapsed seconds plus a label; join on elapsed
+time. The capture file is named per cycle, so "which pick-up is this" is the
+filename and "which part of the cycle" is the mark.
+
+The capture runs on for `--post-release` seconds after the jaws open. That is
+not padding: the part falls 7 mm, and a capture that stopped at the release
+command would record the jaws opening but not the fall or the landing, which
+is the part worth having. The guard dwell after the macro happens to cover it
+today, but that disappears the moment `shell_command.blocks` is set true, so
+the settle is explicit rather than borrowed.
 
 THREE THINGS WORTH KNOWING BEFORE RUNNING IT
 --------------------------------------------
@@ -40,9 +48,6 @@ start or stop, so there was no way to record *through* a pick at all. The
 wrapper forks that capture and SIGINTs it to finish - `cmd_imu` catches the
 interrupt, aborts the board and still closes the CSV. Test it standalone
 before trusting a 15-cycle run to it.
-
-**The IMU stops before the release.** That is as specified, and it means the
-release transient is not in the capture. Swap the two lines if you want it.
 
 Nothing is transported: the part is picked and put back in the same place.
 """
@@ -62,6 +67,8 @@ from lab.machine import Machine, ProtocolError
 STATION = "gripper_pick_9"
 GRIP_MA = 500             # the firmware clamp; ~570 mA is the hardware ceiling
 HOLD_S = 1.0              # at the raised height, between lift and descent
+POST_RELEASE_S = 1.0      # keep recording after the jaws open, so the 7 mm
+                          # fall and the landing are in the capture
 IMU_RATE = None           # samples/s; None lets the host choose
 CSV_DIR = "/home/admin/imu"   # ON THE PI, not on this machine
 CYCLES = 1
@@ -74,6 +81,7 @@ def build(
     cycles: int = CYCLES,
     grip_ma: int = GRIP_MA,
     hold_s: float = HOLD_S,
+    post_release_s: float = POST_RELEASE_S,
     imu_rate: int | None = IMU_RATE,
     csv_dir: str = CSV_DIR,
     imu: bool = True,
@@ -98,6 +106,16 @@ def build(
         raise ProtocolError(f"cycles must be at least 1, got {cycles}")
     if hold_s < 0:
         raise ProtocolError(f"hold_s cannot be negative, got {hold_s}")
+    if post_release_s < 0:
+        raise ProtocolError(
+            f"post_release_s cannot be negative, got {post_release_s}"
+        )
+    if imu and post_release_s == 0:
+        raise ProtocolError(
+            "post_release_s is 0, so the capture would stop the instant the "
+            "jaws open and the 7 mm fall would not be in it. Give it a "
+            "moment, or pass --no-imu if the recording does not matter."
+        )
     eff.check_grip_ma(int(grip_ma))
 
     st = m.deck.station(station)          # raises DeckError if unknown
@@ -140,6 +158,7 @@ def build(
     m.toggles.update({
         "station": station, "station_xy": list(st.xy),
         "cycles": cycles, "grip_ma": int(grip_ma), "hold_s": hold_s,
+        "post_release_s": post_release_s,
         "z_approach": z_approach, "z_grip": z_grip, "z_release": z_release,
         "release_drop_mm": drop_mm,
         "imu": imu, "imu_rate": imu_rate, "csv_dir": csv_dir,
@@ -157,6 +176,8 @@ def build(
     if imu:
         m.note(f"IMU captures to {csv_dir}/<name>_NN.csv on the Pi, with "
                f"phase marks in the matching .marks.csv")
+        m.note(f"the capture spans the RELEASE and runs {post_release_s:g} s "
+               f"past it, so the fall and the landing are recorded")
         m.note("IMU start/stop needs host/imu_session.py, which is NEW and "
                "has never been run on hardware")
 
@@ -198,11 +219,16 @@ def build(
         m.move_to_z(z_release, op="lower")
         if imu:
             m.gripper_imu_mark(f"pick{tag}_at_release_z{z_release:g}")
-            # Stopped BEFORE the release, as specified - so the release
-            # transient is not in the capture.
+
+        # The capture stays open across the release. The part falls 7 mm, and
+        # the fall and the landing are the interesting part - stopping at the
+        # release command would record the jaws opening and nothing after it.
+        m.release(max_drop_mm=drop_mm)
+        if imu:
+            m.gripper_imu_mark(f"pick{tag}_released_drop{drop_mm:g}mm")
+            m.dwell(post_release_s, op="post_release")
             m.gripper_imu_stop()
 
-        m.release(max_drop_mm=drop_mm)
         m.move_to_z(z_approach, op="retreat")
 
     m.park()
@@ -223,6 +249,9 @@ def summarise(m: Machine, result) -> None:
     print(f"  Z  approach {t['z_approach']:g} -> grip {t['z_grip']:g} -> "
           f"release {t['z_release']:g}   (+Z is DOWN)")
     print(f"  grip {t['grip_ma']} mA, hold {t['hold_s']:g} s")
+    if t.get("imu"):
+        print(f"  capture spans the release, +{t['post_release_s']:g} s past "
+              f"it for the fall and the landing")
     if t["release_drop_mm"]:
         print(f"  the part FALLS {t['release_drop_mm']:g} mm on release")
     print(f"  grips {t.get('grips', 0)}, IMU sessions "
@@ -254,6 +283,10 @@ def main(argv=None) -> int:
                     help="grip current, 100-500 mA")
     ap.add_argument("--hold", type=float, default=HOLD_S, dest="hold_s",
                     help="seconds to hold at the raised height")
+    ap.add_argument("--post-release", type=float, default=POST_RELEASE_S,
+                    dest="post_release_s",
+                    help="seconds to keep recording after the jaws open, so "
+                         "the fall and landing are captured")
     ap.add_argument("--imu-rate", type=int, default=IMU_RATE, dest="imu_rate")
     ap.add_argument("--csv-dir", default=CSV_DIR, dest="csv_dir",
                     help="directory ON THE PI for the IMU captures")
@@ -269,6 +302,7 @@ def main(argv=None) -> int:
         m, result = build(
             effector_id=a.effector, name=a.name, station=a.station,
             cycles=a.cycles, grip_ma=a.grip_ma, hold_s=a.hold_s,
+            post_release_s=a.post_release_s,
             imu_rate=a.imu_rate, csv_dir=a.csv_dir, imu=a.imu,
             layout=a.layout, outdir=a.outdir, plot=a.plot, strict=a.strict,
         )

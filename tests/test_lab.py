@@ -395,11 +395,16 @@ def test_station9_imu_brackets_the_pick_and_marks_each_phase():
     check(starts[0] < grips[0],
           "the capture must be running before the grip, or the grip "
           "transient is lost")
-    check(stops[0] < rels[0],
-          "as specified, the capture stops BEFORE the release")
-    check(len(marks) == 5,
-          f"five phase marks - at_grip, gripped, lifted, held, at_release; "
-          f"got {len(marks)}")
+    check(rels[0] < stops[0],
+          "the capture must still be open at the release - the part falls "
+          "7 mm and the fall is the interesting part")
+    dwells = [s.i for s in m.steps if s.op == "post_release"]
+    check(dwells and rels[0] < dwells[0] < stops[0],
+          "the settle after the release belongs inside the capture, or the "
+          "landing is not recorded")
+    check(len(marks) == 6,
+          f"six phase marks - at_grip, gripped, lifted, held, at_release, "
+          f"released; got {len(marks)}")
     check(all(starts[0] < i < stops[0] for i in marks),
           "every mark must fall inside the open capture")
 
@@ -453,7 +458,7 @@ def test_station9_repeats_cleanly_for_fifteen_cycles():
     check(m.toggles["grips"] == 15, f"15 grips, got {m.toggles['grips']}")
     check(m.toggles["imu_sessions"] == 15,
           f"one capture per pick, got {m.toggles['imu_sessions']}")
-    check(m.toggles["imu_marks"] == 75, f"5 marks x 15 picks, got "
+    check(m.toggles["imu_marks"] == 6 * 15, f"6 marks x 15 picks, got "
           f"{m.toggles['imu_marks']}")
     check(m.gripper_holding is None, "the run must not end holding the part")
 
