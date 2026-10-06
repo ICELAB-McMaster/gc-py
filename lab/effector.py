@@ -374,6 +374,36 @@ class Gripper(Effector):
             return int(sc.get("guard_dwell_grip_ms", 2000))
         return int(sc.get("guard_dwell_ms", 1500))
 
+    def station_z(self, station: str, key: str) -> float:
+        """Commanded Z for this effector at a named deck station.
+
+        Separate from z_for_labware because a station is one position rather
+        than a grid - the gripper's pick point in slot 9 is a measurement of
+        where the part is, not of a labware footprint. Same rule as every
+        other Z here: it lives per-effector, because the jaw reference sits
+        at a different height from any pipette nosecone.
+        """
+        table = self.spec.get("z_for_station", {})
+        entry = table.get(station)
+        if entry is None:
+            raise EffectorError(
+                f"effector {self.id} has no Z entry for station {station!r}. "
+                f"Known: {sorted(table)}. Add it to "
+                f"config/effectors/{self.id}.json -> z_for_station."
+            )
+        if key not in entry:
+            raise EffectorError(
+                f"effector {self.id}, station {station!r}: no Z key {key!r}. "
+                f"Known: {sorted(k for k in entry if not k.endswith('note'))}"
+            )
+        v = entry[key]
+        if v is None:
+            raise EffectorError(
+                f"effector {self.id}, station {station!r}, Z {key!r} is null - "
+                f"it has never been measured."
+            )
+        return float(v)
+
     def require_ready(self) -> None:
         """Refuse to generate motion while the geometry is unmeasured.
 

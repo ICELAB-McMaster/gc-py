@@ -78,6 +78,7 @@ class Machine:
         self.gripper_holding: Optional[str] = None
         self._grip_z: Optional[float] = None
         self._grip_dwell_s = 0.0
+        self._imu_session: Optional[str] = None
 
         # ---- records -------------------------------------------------------
         self.steps: List[Step] = []
@@ -528,30 +529,113 @@ class Machine:
         eff.held = what
         self.toggles["grips"] = self.toggles.get("grips", 0) + 1
 
-    def release(self) -> None:
-        """Stop holding and open enough to let go. Refuses above the pick Z.
+    def release(self, max_drop_mm: float = 0.0) -> None:
+        """Stop holding and open enough to let go.
 
         "Never release at height" is the first rule in the gripper's API, and
         it is the one a protocol breaks by accident. +Z is DOWN, so a release
-        is legal only at a commanded Z at least as LARGE as the one the grip
-        was taken at.
+        is legal only at a commanded Z at least as LARGE as the grip was taken
+        at - anything smaller means the part falls the difference.
+
+        `max_drop_mm` is how far the caller has DECIDED the part may fall. It
+        defaults to zero, so an accidental release at height still refuses;
+        a protocol that means to set a part down from a few mm up says so, the
+        number lands in the manifest, and the run warns. The rule is not
+        waived by passing a number - it is moved from "never" to "this far,
+        on purpose".
         """
         self._gripper()
         if self.gripper_holding is None:
             raise ProtocolError("release() with nothing held")
-        z = self.g.get_z()
-        if self._grip_z is not None and z is not None and z < self._grip_z - 1e-6:
+        if max_drop_mm < 0.0:
             raise ProtocolError(
-                f"release at Z {z} would drop {self.gripper_holding!r}: the "
-                f"grip was taken at Z {self._grip_z}, and +Z is DOWN, so this "
-                f"is {self._grip_z - z:g} mm ABOVE where the part was picked "
-                f"up. Lower to at least Z {self._grip_z} first."
+                f"max_drop_mm is a distance the part may fall, so it cannot "
+                f"be negative; got {max_drop_mm}"
             )
+        z = self.g.get_z()
+        drop = 0.0 if (self._grip_z is None or z is None) else self._grip_z - z
+        if drop > max_drop_mm + 1e-6:
+            raise ProtocolError(
+                f"release at Z {z} would drop {self.gripper_holding!r} by "
+                f"{drop:g} mm: the grip was taken at Z {self._grip_z}, and "
+                f"+Z is DOWN, so this is that far ABOVE where it was picked "
+                f"up. Lower to at least Z {self._grip_z}, or pass "
+                f"max_drop_mm={drop:g} if the part is meant to fall that far."
+            )
+        if drop > 1e-6:
+            self.sim.warn(
+                f"release_drop:{drop:g}",
+                f"{self.gripper_holding!r} is released {drop:g} mm above where "
+                f"it was gripped, so it falls that far. Declared by the "
+                f"protocol (max_drop_mm={max_drop_mm:g}), not an accident - "
+                f"but it is still a drop, and nothing here knows what the part "
+                f"lands on.",
+            )
+            self.toggles["release_drop_mm"] = drop
         self._gripper_macro("release", what=self.gripper_holding)
         self.gripper_holding = None
         self._grip_z = None
         self._grip_dwell_s = 0.0
         self.effector.held = None
+
+    def move_to_z(self, z: float, op: str = "move",
+                  feedrate: Optional[int] = None) -> None:
+        """Move Z to an absolute commanded height. Checked like any other move.
+
+        The deliberate exception to "Z is never commanded directly": pipetting
+        depths are derived from labware, but a gripper sequence is a list of
+        measured heights - approach, grip, release - that belong to the part
+        rather than to a well. Routed through _move_z, so the envelope, stage
+        floor, raised-edge and well-bottom checks all still apply.
+
+        +Z is DOWN. A SMALLER z is physically higher.
+        """
+        self._require_homed("move_to_z()")
+        self._move_z(z, feedrate or self.deck.feedrate("travel"), op)
+
+    def gripper_imu_start(self, csv: str, label: Optional[str] = None,
+                          rate: Optional[int] = None) -> None:
+        """Begin an IMU capture that keeps running while the gantry moves.
+
+        Unlike `gripper_imu`, which is one blocking fixed-length capture, this
+        brackets motion: start, move, mark, stop. It needs `imu_session.py` on
+        the Pi - the shipped `gripctl.py imu` is blocking and has no start or
+        stop, so there was no way to record THROUGH a pick.
+        """
+        self._gripper()
+        if self._imu_session is not None:
+            raise ProtocolError(
+                f"an IMU capture is already open ({self._imu_session!r}); "
+                f"stop it before starting another. The host keeps one session "
+                f"at a time and would refuse the second."
+            )
+        args = f"CSV={csv}"
+        if label:
+            args += f" LABEL={label}"
+        if rate:
+            args += f" RATE={int(rate)}"
+        self._gripper_macro("imu_start", args, csv=csv, label=label, rate=rate)
+        self._imu_session = csv
+        self.toggles["imu_sessions"] = self.toggles.get("imu_sessions", 0) + 1
+
+    def gripper_imu_mark(self, label: str) -> None:
+        """Label the current instant, so the capture can be cut into phases."""
+        self._gripper()
+        if self._imu_session is None:
+            raise ProtocolError(
+                f"gripper_imu_mark({label!r}) with no capture open - the mark "
+                f"would be written to nothing"
+            )
+        self._gripper_macro("imu_mark", f"LABEL={label}", label=label)
+        self.toggles["imu_marks"] = self.toggles.get("imu_marks", 0) + 1
+
+    def gripper_imu_stop(self) -> None:
+        """End the capture and let the host close the CSV."""
+        self._gripper()
+        if self._imu_session is None:
+            raise ProtocolError("gripper_imu_stop() with no capture open")
+        self._gripper_macro("imu_stop")
+        self._imu_session = None
 
     def gripper_abort(self) -> None:
         """Clear a latched fault. All motion is refused until this runs."""
