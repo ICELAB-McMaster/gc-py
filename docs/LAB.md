@@ -297,7 +297,7 @@ stalls or drops takes the run with it, and it would surface as a short CSV
 rather than an error. Copy-after means a share that is down costs the copy,
 not the data - the originals stay local and `stop` says so.
 
-The destination is `\ICE-NAS\Data\GC_ARCCS\GripperIMU`, which on the Pi
+The destination is `\\ICE-NAS\Data\GC_ARCCS\GripperIMU`, which on the Pi
 is **`/mnt/ice-nas/GC_ARCCS/GripperIMU`** assuming the `Data` share is
 mounted at `/mnt/ice-nas`. A UNC path cannot be used directly - the capture
 runs on Linux, where it is not a path at all, and `gripper_imu_start` refuses
