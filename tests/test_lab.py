@@ -416,7 +416,7 @@ def test_station9_captures_locally_and_copies_to_the_share():
     csv, dest = start.detail["csv"], start.detail["dest"]
     check(csv.startswith("/home/admin/"),
           f"the capture itself must go to local disk, got {csv}")
-    check(dest == "/mnt/ice-nas/GC_ARCCS/GripperIMU",
+    check(dest == "/mnt/nas/GC_ARCCS/GripperIMU",
           f"the copy destination should be the mounted share, got {dest}")
     check(not dest.startswith(csv.rsplit("/", 1)[0]),
           "capturing and publishing to the same directory defeats the point")
@@ -436,7 +436,7 @@ def test_a_unc_path_is_refused_as_an_imu_destination():
                                        dest=r"\\ICE-NAS\Data\GC_ARCCS"),
            "a Windows UNC destination must refuse")
     m.gripper_imu_start(csv="/home/admin/imu/x.csv",
-                        dest="/mnt/ice-nas/GC_ARCCS/GripperIMU")
+                        dest="/mnt/nas/GC_ARCCS/GripperIMU")
     m.gripper_imu_stop()
 
 

@@ -72,10 +72,10 @@ POST_RELEASE_S = 1.0      # keep recording after the jaws open, so the 7 mm
 IMU_RATE = None           # samples/s; None lets the host choose
 CSV_DIR = "/home/admin/imu"   # ON THE PI. Local disk: the capture is written
                               # here and copied to DEST_DIR when it stops.
-# \\ICE-NAS\Data\GC_ARCCS\GripperIMU as the Pi sees it, assuming the Data
-# share is mounted at /mnt/ice-nas. A UNC path cannot be used directly - the
-# capture runs on Linux.
-DEST_DIR = "/mnt/ice-nas/GC_ARCCS/GripperIMU"
+# \\ICE-NAS\Data\GC_ARCCS\GripperIMU as the Pi sees it: the share is
+# mounted at /mnt/nas (operator, 2026-10-06). FORWARD slashes - the capture
+# runs on Linux, where a backslash is not a separator.
+DEST_DIR = "/mnt/nas/GC_ARCCS/GripperIMU"
 CYCLES = 1
 
 
@@ -309,9 +309,9 @@ def main(argv=None) -> int:
                     help="LOCAL directory on the Pi the capture is written to")
     ap.add_argument("--dest-dir", default=DEST_DIR, dest="dest_dir",
                     help="where finished captures are copied. A MOUNTED path "
-                         "on the Pi - \\\\ICE-NAS\\Data\\GC_ARCCS\\GripperIMU "
-                         "is /mnt/ice-nas/GC_ARCCS/GripperIMU if the Data "
-                         "share is mounted at /mnt/ice-nas")
+                         "on the Pi, with FORWARD slashes - "
+                         "\\\\ICE-NAS\\Data\\GC_ARCCS\\GripperIMU is "
+                         "/mnt/nas/GC_ARCCS/GripperIMU")
     ap.add_argument("--no-dest", dest="dest_dir", action="store_const",
                     const=None, help="keep the captures on the Pi only")
     ap.add_argument("--no-imu", dest="imu", action="store_false",

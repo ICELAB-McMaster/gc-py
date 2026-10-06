@@ -298,12 +298,16 @@ rather than an error. Copy-after means a share that is down costs the copy,
 not the data - the originals stay local and `stop` says so.
 
 The destination is `\\ICE-NAS\Data\GC_ARCCS\GripperIMU`, which on the Pi
-is **`/mnt/ice-nas/GC_ARCCS/GripperIMU`** assuming the `Data` share is
-mounted at `/mnt/ice-nas`. A UNC path cannot be used directly - the capture
-runs on Linux, where it is not a path at all, and `gripper_imu_start` refuses
-one rather than letting it become a filename with backslashes in it. If the
-share is mounted elsewhere, pass `--dest-dir`; nothing on the slicing machine
-can check a mount on the Pi.
+is **`/mnt/nas/GC_ARCCS/GripperIMU`** - mounted at `/mnt/nas`
+(operator, 2026-10-06).
+
+**Mind the separator.** `\mnt\nas\...` is how Windows renders that path;
+on the Pi it must be forward slashes. A UNC or backslashed path passed
+through would not be a path at all on Linux but a single filename with
+backslashes in it - the data would be written successfully somewhere nobody
+looks, which is worse than an error. `gripper_imu_start` refuses any
+destination containing a backslash. If the share moves, pass `--dest-dir`;
+nothing on the slicing machine can check a mount on the Pi.
 
 `imu_session.py` forks the capture and **SIGINT**s it to finish, because
 `cmd_imu` catches `KeyboardInterrupt`, aborts the board and still calls
