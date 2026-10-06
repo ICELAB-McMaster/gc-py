@@ -182,6 +182,9 @@ def build(
                "has never been run on hardware")
 
     # ---- generate --------------------------------------------------------
+    # Before G28, so an uninstalled gripper_macros.cfg shows up with the
+    # machine still parked rather than after a full run of inert motion.
+    m.gripper_preflight()
     m.startup()
     m.goto(st.xy[0], st.xy[1], op=f"goto:{station}")
 

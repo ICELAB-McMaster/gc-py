@@ -151,9 +151,9 @@ def build(
                f"{eff.hold_tier1_s:g} s full-current window")
 
     # ---- generate --------------------------------------------------------
+    m.gripper_preflight()                # before G28 - see Machine.gripper_preflight
     m.startup()
     m.gripper_home()                     # the only reference a timed servo has
-    m.gripper_status()                   # on the record before anything moves
 
     for i in range(cycles):
         m.note(f"--- cycle {i + 1} of {cycles} ---")

@@ -247,6 +247,35 @@ is confirmed and the dwells disappear, about 3.5 s a cycle. Note the guard is
 a `G4` and **not** an `M400`: `M400` drains the *motion* queue, and a shell
 command was never in it.
 
+### Installing the macros
+
+**None of the `GRIPPER_*` commands exist until `gripper_macros.cfg` is
+included from `printer.cfg`.** Observed 2026-10-06: every one came back
+`Unknown command`, and Klipper **carried on** - the gantry executed the whole
+sequence with the gripper inert, which looks like a successful run in the log
+and is not one.
+
+Three steps, on the Pi:
+
+1. The file needs the `gcode_shell_command` extra, which is **not** in stock
+   Klipper. KIAUH installs it (Advanced -> G-Code Shell Command), or copy
+   `gcode_shell_command.py` into `~/klipper/klippy/extras/`.
+2. Copy `gripper_macros.cfg` next to `printer.cfg` and add
+   `[include gripper_macros.cfg]`.
+3. Fix the **two** `command:` paths at the top of it - one for `gripctl.py`,
+   one for `imu_session.py` - then restart Klipper and run `GRIPPER_PING`
+   before anything moves.
+
+If step 1 is skipped, Klipper fails to parse `[gcode_shell_command ...]` and
+will not start at all, which is at least loud. If step 2 is skipped, it starts
+fine and every gripper command is silently a no-op, which is not - hence the
+preflight.
+
+Every gripper protocol emits `GRIPPER_PING` and `GRIPPER_STATUS` **before
+`G28`**. Nothing in a gcode file can force Klipper to abort, but this puts the
+first failure where the machine is still parked. `test_lab.py` pins the
+ordering.
+
 ### Recording through a pick
 
 `gripctl.py imu` is a **blocking, fixed-duration** capture: it runs for

@@ -381,6 +381,29 @@ def test_station9_heights_run_in_the_order_the_operator_specified():
           "every XY leg must happen at travel height")
 
 
+def test_station9_preflights_before_it_moves():
+    """An uninstalled gripper_macros.cfg must show up before G28.
+
+    Klipper does not always stop on an unknown command: observed 2026-10-06,
+    a run with the macros missing reported "Unknown command: GRIPPER_HOME"
+    and carried on, so the gantry did the whole sequence with the gripper
+    inert. Nothing here can force an abort - what it can do is put the first
+    failure before any motion.
+    """
+    m = _station9(cycles=1)
+    first_macro = next(s for s in m.steps if s.kind == "macro")
+    first_move = next(s for s in m.steps
+                      if s.kind in ("move", "home"))
+    check(first_macro.op == "gripper:ping",
+          f"the first command must be the harmless ping, got "
+          f"{first_macro.op}")
+    check(first_macro.i < first_move.i,
+          f"the preflight must precede any motion: ping at {first_macro.i}, "
+          f"first move at {first_move.i}")
+    check(any("Unknown command" in n for n in m.notes),
+          f"the gcode must say what an unknown command means: {m.notes[:3]}")
+
+
 def test_station9_imu_brackets_the_pick_and_marks_each_phase():
     m = _station9(cycles=1)
     ops = [(s.i, s.op) for s in m.steps if s.kind == "macro"]
