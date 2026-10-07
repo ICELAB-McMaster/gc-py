@@ -3,7 +3,7 @@
 Every public function in the library: what it does, what it raises, and - the
 part worth reading - what mistake it exists to prevent.
 
-Regenerated from the source on 2026-09-08. If the code and this file disagree,
+Regenerated from the source on 2026-09-08, with the gripper layer added 2026-10-06. If the code and this file disagree,
 the code is right and this file is stale; `tests/test_lab.py` and
 `tests/test_review_fixes.py` are the executable version of the same claims.
 
@@ -54,6 +54,9 @@ lab/
 protocols/
   accuracy_test.py          ISO 8655 accuracy/repeatability, any pipette
   centrifuge_test.py        two plates, one source each, to equal mass
+  centrifuge_test_v2_1.py   location 2 only, two corner wells
+  gripper_plate_test.py     pick a plate, lift, read the IMU, put it back
+  gripper_station9_test.py  pick at station 9, IMU through the pick
 ```
 
 Data flows one way: `config` -> `labware`/`effector` -> `deck` -> `machine`,
@@ -458,7 +461,7 @@ A nominal Z from the labware's own `z` block.
 - **Returns:** the value as `float`, or `None` if the block or the key is missing.
 - Raises nothing - a missing `z` block yields `None`, not `KeyError`.
 
-**Note:** every `z` value in the shipped `labware.json` is currently `null`, by design. Absolute Z is effector-dependent, so the real numbers live in `effectors/*.json -> z_for_labware` (p300: plate `work` 53.5 / `bottom` 60.8; 1.5 mL tube `work` 35.0 / `mix` 45.0, `bottom` still unmeasured). Do not reach for `Labware.z` when you want a depth to command - it will hand you `None`. It is a placeholder for stage-referenced nominals that would only become useful if a labware-local Z were ever measured.
+**Note:** every `z` value in the shipped `labware.json` is currently `null`, by design. Absolute Z is effector-dependent, so the real numbers live in `effectors/*.json -> z_for_labware` (p300: plate `work` 53.5 / `bottom` 60.8; 1.5 mL tube `work` 35.0, `aspirate` 54.0, `mix` 54.0, `bottom` still unmeasured). Do not reach for `Labware.z` when you want a depth to command - it will hand you `None`. It is a placeholder for stage-referenced nominals that would only become useful if a labware-local Z were ever measured.
 
 ### `class Placement`
 
@@ -790,7 +793,7 @@ True when `spec["z_for_labware"][labware_id]["uncalibrated"]` is truthy - the va
 
 ### `Effector.is_placeholder -> bool`
 
-`spec["status"] == "placeholder"`. True for `gripper.json`, where every numeric field is `null`. `load()` refuses a placeholder unless asked not to.
+`spec["status"] == "placeholder"`. **Nothing is a placeholder today.** `gripper.json` was one until 2026-10-06; its command model is now taken from the hardware's own API and its status is `"unmeasured"` - it loads, and refuses *motion* instead, through `Gripper.require_ready()`. Loading and being ready are different questions and this answers only the first.
 
 ### `Effector.uncalibrated() -> List[str]`
 
@@ -951,21 +954,39 @@ Test volumes as fractions of `nominal_uL`, each rounded to 4 decimals. `fraction
 
 ### `class Gripper(Effector)`
 
-`Gripper(cfg: config.ConfigFile)` - `kind = "gripper"`. **Not built.** `gripper.json` has `status: "placeholder"` and every numeric field `null`, so `load("gripper")` refuses unless `allow_placeholder=True`.
+`Gripper(cfg: config.ConfigFile)` - `kind = "gripper"`. A Parallax Feedback 360 continuous-rotation servo on a rack and pinion, over CAN. Commanded through the `GRIPPER_*` Klipper macros.
 
-Attributes: `open_pos`, `closed_pos`, `grip_pos` (raw from `spec["actuator"]`, all `None` today, deliberately *not* coerced with `float()` so the class can be constructed for inspection); `carries_labware` (bool, default `True`); `held` (`Optional[str]`, initialised `None`).
+**Nothing about it is positional.** The servo's feedback output has failed, so the firmware runs open loop and every motion is **timed** - "open for 400 ms", never "open to 30 degrees". The config has no `*_pos` field and `test_gripper_models_timed_motion_not_position` asserts none comes back. A number that cannot be measured or commanded is worse than an absent one.
 
-**Why the class exists at all:** so `load()` has something to dispatch to and `available()` lists the file. That is the whole of the integration - it has no motion methods, `lab/deck.py` does not reference effectors, and `lab/simulate.py` validates plunger POS only for `Pipette`, so a gripper POS would reach disk unvalidated. `tests/test_lab.py::test_gripper_is_a_placeholder` pins both halves: the refusal for motion, and the successful dispatch to this class under `allow_placeholder=True`.
+Attributes, all from `spec`: `open_ms_max` (850), `grip_ma_default` / `grip_ma_min` / `grip_ma_max` (300 / 100 / 500), `hold_expires_s` (140.0) and `hold_tier1_s` (20.0), `requires_home` (True), `carries_labware` (True), `held` (`Optional[str]`).
 
-**Why `held` is here and not on `Machine`:** a gripper changes the deck *layout* at run time - picking a plate empties a slot and fills the effector - which a pipette never does. Naming the state now marks where that tracking will have to live. Nothing writes `held` today, and nothing reads `carries_labware`; both are declarations of intent. `gripper.json -> todo_before_use` lists what building this actually requires (measure the positions, add `grip()`/`release()`/`move_labware()` to `Machine`, teach `Simulator` to validate a gripper POS and track held labware, decide whether it drives `ACTUATOR_MOVE` or its own macro).
+#### `Gripper.macro(name) -> str`
 
-### `Gripper.require_ready() -> None`
+The `GRIPPER_*` macro for an operation - `home`, `open`, `close`, `grip`, `release`, `stop`, `abort`, `ping`, `status`, `version`, `imu`, `imu_start`, `imu_mark`, `imu_stop`. Raises `EffectorError` listing the known names rather than defaulting: a fallback literal would mean a renamed macro emits a command Klipper does not recognise, and the run stops mid-sequence with a part in the jaws.
 
-Raises `EffectorError` listing whichever of `open_pos`, `closed_pos`, `grip_pos` are still `None`, naming the file to measure them into. Returns `None` when all three are set.
+#### `Gripper.forbidden_macros -> list[str]`
 
-**Note:** no caller exists yet. It is the guard the future `grip()` / `release()` primitives are expected to call first, so that motion generation cannot begin from placeholder numbers.
+`["GRIPPER_PICK", "GRIPPER_PLACE"]`. Both exist in the shipped cfg and **must never run on this machine**: they emit relative Z with a normal printer's sign convention - `GRIPPER_PICK` sends `G1 Z40` and calls it a lift. Here **+Z is DOWN**, so that drives the gripper 40 mm *into* the part. `Machine._gripper_macro` refuses them by name.
 
----
+#### `Gripper.check_open_ms(ms)`
+
+Raises `EffectorError` for `ms <= 0` or `ms > open_ms_max` (850). **Closing self-references, opening does not:** closing ends at a hard stop, which is what makes `HOME` meaningful, but opening ends at *nothing* - past full travel the racks leave the pinion and the mechanism is a hand rebuild. The firmware would clamp an over-long request silently; refusing keeps the gcode an honest record, and an assumption that asks for more than the clamp is already wrong.
+
+#### `Gripper.check_grip_ma(ma)`
+
+Raises `EffectorError` outside 100-500 mA. 500 is the firmware clamp and ~570 mA the hardware ceiling; a setpoint above the clamp is **silently reduced**, which is why this refuses rather than passing it on. `--ma` is repeatable but uncalibrated against force - it is not newtons.
+
+#### `Gripper.guard_dwell_ms(op) -> int | None`
+
+How long to stall after a macro while `shell_command.blocks` is unproven: 2000 ms after a grip, 1500 otherwise, `None` once blocking is confirmed. Whether `RUN_SHELL_COMMAND` blocks until the process exits is install-dependent and untested here, and without the stall a move following a gripper macro can start while the gripper is still running - during a grip, that means lifting before the jaws have closed.
+
+#### `Gripper.station_z(station, key) -> float`
+
+Commanded Z for this effector at a named deck station - `gripper_pick_9` has `approach` 90.0, `grip` 107.0, `release` 100.0. Separate from `z_for_labware` because a station is one position rather than a grid: what was measured is where the *part* is, not a labware footprint. Per-effector like every Z here, because the jaw reference is not the p300 nosecone. Raises `EffectorError` naming the station, the key or the null.
+
+#### `Gripper.require_ready()`
+
+Raises `EffectorError` listing every `z_for_labware` value that is still `null`. Checks the **values, not** the config's own `uncalibrated` list - that list is a human declaration and goes stale both ways: a filled-in number nobody removed from it would block forever, and a field quietly nulled but never added would sail through. The null is the machine-checkable fact.
 
 ### `load(effector_id: str, allow_placeholder: bool = False) -> Effector`
 
@@ -976,11 +997,13 @@ The only way a protocol should obtain an effector. Loads `config/effectors/<effe
 
 Returns a `Pipette` or `Gripper` (`_KINDS = {"pipette": Pipette, "gripper": Gripper}`). Raises `EffectorError` for an unknown id (listing what is available), an unrecognised `kind` (telling you to add a class to this module), or a placeholder without the override. Constructor validation - the calibration model, the air-gap identity - fires here too, so a bad config is caught at load rather than at the first aspirate.
 
-**Why the placeholder gate:** the failure mode being blocked is generating a full gcode file from `null`-derived numbers and only discovering it at the machine. `tests/test_lab.py::test_unknown_effector` and `::test_gripper_is_a_placeholder` cover both refusals.
+**No effector is a placeholder today**, so `allow_placeholder` currently gates nothing. `load("gripper")` succeeds; what refuses is `Gripper.require_ready()`, at the point motion would be generated.
+
+**Why the placeholder gate:** the failure mode being blocked is generating a full gcode file from `null`-derived numbers and only discovering it at the machine. That job has moved down a level - `test_gripper_loads_but_refuses_plate_motion` pins that the gripper now loads and that unmeasured geometry still refuses.
 
 ### `available() -> List[str]`
 
-Sorted ids of every effector JSON on disk - `["gripper", "p125", "p300"]` today. Discovery only; says nothing about whether an id is usable (`gripper` is listed and will not load for motion).
+Sorted ids of every effector JSON on disk - `["gripper", "p125", "p300"]` today. Discovery only; says nothing about whether an id is *ready* - the gripper loads, and refuses motion later if its geometry is unmeasured.
 
 Used as the `choices` for the `--effector` argument in `protocols/accuracy_test.py` and `protocols/centrifuge_test.py`, so adding a file to `config/effectors/` makes it selectable on the command line with no code change. That is the "one JSON per end effector" seam, pinned by `tests/test_lab.py::test_one_json_per_effector`.
 
@@ -1812,7 +1835,7 @@ The mirror case for X doglegs is a band-to-band move: 0.65 mL tube column 2 at X
 
 #### `_route_problem(legs) -> str | None` *(private)*
 
-Returns a sentence explaining why a sequence of `(frm, to)` legs is unsafe, or `None` if clear. Checks, per leg: the destination is inside the envelope; the leg does not sweep a no-fly rect (only when `tip_fitted` - `no_fly_rects()` is empty otherwise); and, for any leg that changes Y, that the Y motion's X is not inside a keep-out band (an error unconditionally when tipped, and when bare only if travel Z is not safe - at Z 5.0 versus `safe_when_z_below` 60.0 it always is).
+Returns a sentence explaining why a sequence of `(frm, to)` legs is unsafe, or `None` if clear. Checks, per leg: the destination is inside the envelope; the leg does not sweep a no-fly rect (only when something is carried - a fitted tip **or a gripped plate**, which shears the standing tips off exactly as a tip does); and, for any leg that changes Y, that the Y motion's X is not inside a keep-out band (an error unconditionally when tipped, and when bare only if travel Z is not safe - at Z 5.0 versus `safe_when_z_below` 60.0 it always is).
 
 It evaluates against `deck.z_travel`, not the current Z, because `goto()` guarantees the lift has already happened before routing.
 
@@ -1862,7 +1885,9 @@ Writes `; <text>` into the gcode, appends to `self.notes`, and records a `Step`.
 
 #### `home(op="home")`
 
-Homes Z first, then XY, then the actuator via `deck.macro("home_actuator")`, and sets `self.homed = True`. Two separate `Step`s for the axis groups.
+Homes Z first, then XY, then - **for a `Pipette` only** - the plunger via `deck.macro("home_actuator")`, and sets `self.homed = True`. Two separate `Step`s for the axis groups.
+
+`HOME_ACTUATOR` references the pipette plunger. With a gripper fitted that axis is not on the machine, so homing it is at best meaningless and at worst drives something that is not there.
 
 **Why Z first:** the effector must be at the top before X or Y move, and X homes at max (420) - a long traverse.
 
@@ -2053,7 +2078,146 @@ It stays legal against the raised-edge rule (Z 53.0 tipped) only because it neve
 
 ---
 
-### Finalize
+### Gripper
+
+The gripper layer on `Machine`. Every entry below narrows the effector
+through **`_gripper()`**, which returns `self.effector` as a `Gripper` or
+raises `ProtocolError` naming the actual `kind` - the mirror of `_pipette()`,
+so asking a pipette to grip fails with a sentence rather than an
+`AttributeError`.
+
+**Every one of these emits `M400` first.** Klipper queues moves, so without it
+the shell command runs while the gantry is still travelling - gripping before
+arriving, or lifting before the jaws have closed.
+
+### `_gripper_macro(op, args="", **detail)` *(private)*
+
+Emits one `GRIPPER_*` macro, fenced by `M400` and a guard dwell. Three refusals
+live here:
+
+* a macro in `Gripper.forbidden_macros` (`GRIPPER_PICK`, `GRIPPER_PLACE`) -
+  their relative Z has the opposite sign convention and would drive into the
+  deck;
+* any gripper command while an IMU capture is open, unless the capture is
+  plate-only or the firmware has learned to service commands mid-stream. See
+  **Captures and commands** below;
+* implicitly, an unknown op, via `Gripper.macro`.
+
+The trailing guard is a `G4` and deliberately **not** an `M400`: `M400` drains
+the *motion* queue, and a `RUN_SHELL_COMMAND` was never in it, so an `M400`
+there would wait for nothing.
+
+### `gripper_preflight()`
+
+Emits `GRIPPER_MACROS_VERSION`, `GRIPPER_PING` and `GRIPPER_STATUS` - all of
+which move nothing - plus a note saying what an `Unknown command` reply means.
+Protocols call it **before `G28`**.
+
+It cannot make Klipper abort, and does not claim to. Observed 2026-10-06: a run
+whose `gripper_macros.cfg` was never included reported `Unknown command` for
+every macro and **carried on**, so the gantry performed the whole sequence with
+the gripper inert - which reads as a completed run in the log. All this buys is
+that the first failure arrives with the machine still parked. The version line
+covers the second way it fails: an *installed* cfg that has drifted from the
+repo, which once kept an obsolete `needs CSV=` guard for days.
+
+### `gripper_ping()` / `gripper_status()` / `gripper_abort()`
+
+Move nothing. `ping` checks the node is alive, `status` prints current and
+flags, `abort` clears a latched fault - **all motion is refused until it
+does**. Note `status` reporting `n/a deg` is the expected reading, not a
+fault: there is no position to report.
+
+### `_require_gripper_homed(what) -> Gripper` *(private)*
+
+Raises `ProtocolError` naming the caller if `Gripper.requires_home` and the
+gripper has not been homed. The firmware refuses `OPEN`, `CLOSE` and `GRIP`
+until `HOME` has run, so this turns a reply nobody reads into a refusal at
+generation time.
+
+### `gripper_home()` / `gripper_open(ms=None)` / `gripper_close(ms=None)`
+
+`gripper_home` drives into the closed stop and calls it zero, the only
+reference a timed open-loop mechanism has. It refuses while something is held -
+homing drives into the stop and the part is in the way.
+
+`gripper_open` refuses past the 850 ms clamp (`Gripper.check_open_ms`). Both
+open and close refuse until homed, as the firmware does.
+
+### `grip(ma=None, what="part", log_csv=None)`
+
+Closes onto a part and holds at `ma` mA. Records the Z the grip was taken at,
+because releasing above it drops the part. Refuses while already holding.
+
+A grip is a **controlled stall, not a clamp** - no holding torque at rest - and
+it expires: full current 20 s, reduced 120 s, then de-energised. `log_csv`
+passes `LOG=` through to `--log --csv`, which streams the board's own current
+trace for the motion. That is not a consolation prize: the stall current *is*
+the grip force, sampled on the board with no bus latency.
+
+### `release(max_drop_mm=0.0, log_csv=None)`
+
+Stops holding. **"Never release at height" is the first rule in the gripper's
+API** and the one a protocol breaks by accident; +Z is DOWN, so a release is
+legal only at a Z at least as large as the grip was taken at.
+
+`max_drop_mm` is how far the caller has **decided** the part may fall. It
+defaults to zero, so an accidental release at height still refuses outright. A
+protocol that means to set a part down from a few mm up says so, the distance
+lands in the manifest, and the run warns anyway. The rule moved from "never" to
+"this far, on purpose" - it did not go away.
+
+### `move_to_z(z, op="move", feedrate=None)`
+
+The deliberate exception to "Z is never commanded directly". Pipetting depths
+are derived from labware; a gripper sequence is a list of measured heights that
+belong to the **part** - approach, grip, release. Routed through `_move_z`, so
+the envelope, stage-floor, raised-edge and well-bottom checks all still apply.
+
+### `pick_plate(placement, ma=None)` / `place_plate(placement)`
+
+Traverse to a placement's **grid centre**, descend to the effector's `grip` Z,
+grip, lift to its `lift` Z - and the reverse, with the descent before the
+release. `pick_plate` refuses a carry height that is not above the grip height:
++Z is DOWN, so `lift` must be the smaller number, and as written the plate
+would be "lifted" further into the deck.
+
+Both call `Gripper.require_ready()`, so they refuse while the plate geometry is
+unmeasured - which it still is.
+
+### `_count_dwell(seconds)` *(private)*
+
+Charges every commanded dwell against an open grip's expiry budget. Warns past
+tier 1 (20 s), raises past expiry (140 s). It says plainly that it counts
+**dwells only** - travel time is not modelled - so the figure is a lower bound.
+
+### Captures and commands
+
+`gripper_imu_start(label=None, csv=None, rate=None, dest=None,
+plate_only=False)`, `gripper_imu_mark(label)`, `gripper_imu_stop()`.
+
+A capture brackets motion, unlike `gripper_imu(seconds)` which blocks. `label`
+or `csv` is required - the host names the capture from one of them, adds a
+timestamp so a loop never overwrites itself, and copies to
+`/mnt/nas/GC_ARCCS/GripperIMU` on stop. An unnamed capture cannot be found
+again.
+
+**Which IMU decides whether a command can run.** The board IMU goes over CAN,
+so capturing it means `CMD_IMU_READ`, which the board runs as a **blocking
+loop**; `gripnode.drain()` states the consequence itself - *"the queue is not
+read until the motion returns"*. A `GRIPPER_GRIP` sent during such a capture is
+not refused by the board, it is **queued**, and fires when the capture ends.
+Observed 2026-10-06 as a `gripctl` timeout with no reply, which was the mild
+version.
+
+The **plate** IMU is a local I2C read on the Pi and touches the bus not at all,
+so `plate_only=True` yields a capture that *can* span a grip and a release.
+`_gripper_macro` consults `capture_concurrency`: `commands_during_capture`
+(false - the board blocks) or `plate_only_spans_commands` (true). Only
+`imu_mark`, `imu_stop`, `stop` and `abort` are ever exempt, because only
+`ESTOP`/`ABORT`/`STOP` set the board's abort flag immediately.
+
+## Finalize
 
 #### `simulate() -> Report`
 

@@ -53,7 +53,9 @@ Measured 2026-08-26, referenced to the **p300 bare nosecone**:
 
 Slots are 3x3, row-major: **1-3 front** (Y 365), 4-6 middle (Y 272), **7-9 back**
 (Y 178.5); X descends within a row (336 / 200 / 65). Loaded now: tip rack slot 3,
-0.65 mL tube holder slot 8, water slot 9.
+96-well plates in slots 1 and 2, 1.5 mL tube holder slot 5, water at the station
+near slot 9. `config/layout_test.json` is the fixture the suite uses, so tests do
+not move when the bench does.
 
 The stage surface exists only over the slot area, which is why the ejector's
 Z 145 at Y 89 is legal - it hangs past the front edge.
@@ -64,10 +66,28 @@ holder difficult, so the effector reaches its Y while still clear in X.
 The tip ejection routine has **never been validated on hardware**
 (`deck.stations.tip_eject.validated: false`) and is off by default.
 
+## The gripper
+
+A Parallax Feedback 360 servo on a rack and pinion, over CAN, driven through the
+`GRIPPER_*` macros in the SDL_Gcode repo. Three things that bite:
+
+1. **It has no position.** Feedback has failed, so motion is **timed** and
+   gripping is a current-controlled stall that **expires after ~140 s**.
+2. **`GRIPPER_PICK` / `GRIPPER_PLACE` must never run here.** They emit relative
+   Z with a normal printer's sign; +Z is DOWN on this machine, so their "lift"
+   drives into the part. The library refuses them by name.
+3. **An IMU capture including the board sensor blocks commands.** The board runs
+   that capture as a blocking loop and *queues* anything it receives. Only a
+   `--plate-only` capture can span a grip. See `capture_concurrency` in
+   `config/effectors/gripper.json`.
+
+Plate geometry is still unmeasured, so `gripper_plate_test.py` refuses; station
+9 is measured and `gripper_station9_test.py` runs.
+
 ## Running things
 
 ```bash
-python tests/test_lab.py            # 44 tests
+python tests/test_lab.py            # 93 tests
 python tests/test_review_fixes.py   # 22 tests, one per confirmed past defect
 python tests/smoke_geometry.py      # resolve every placement and coordinate
 
