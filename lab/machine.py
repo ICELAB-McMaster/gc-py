@@ -79,6 +79,7 @@ class Machine:
         self._grip_z: Optional[float] = None
         self._grip_dwell_s = 0.0
         self._imu_session: Optional[str] = None
+        self._imu_plate_only = False
 
         # ---- records -------------------------------------------------------
         self.steps: List[Step] = []
@@ -444,8 +445,11 @@ class Machine:
         """Emit one GRIPPER_* macro, fenced by M400 and a guard dwell."""
         eff = self._gripper()
         name = eff.macro(op)
-        concurrent = bool((eff.spec.get("capture_concurrency") or {})
-                          .get("commands_during_capture"))
+        cc = eff.spec.get("capture_concurrency") or {}
+        # A plate-only capture never touches CAN, so the board stays in its
+        # dispatch loop and commands run normally.
+        concurrent = bool(cc.get("commands_during_capture")) or (
+            self._imu_plate_only and bool(cc.get("plate_only_spans_commands")))
         if (self._imu_session is not None and not concurrent
                 and op not in self._DURING_CAPTURE):
             raise ProtocolError(
@@ -457,7 +461,9 @@ class Machine:
                 f"through. Stop the capture first: gripper_imu_stop(). If "
                 f"the firmware has since been fixed, set "
                 f"capture_concurrency.commands_during_capture true in "
-                f"config/effectors/{eff.id}.json."
+                f"config/effectors/{eff.id}.json. A --plate-only capture does "
+                f"not have this problem: the plate IMU is a local I2C read "
+                f"and never touches the bus."
             )
         if name in eff.forbidden_macros:
             raise ProtocolError(
@@ -620,9 +626,11 @@ class Machine:
         self._require_homed("move_to_z()")
         self._move_z(z, feedrate or self.deck.feedrate("travel"), op)
 
-    def gripper_imu_start(self, csv: str, label: Optional[str] = None,
+    def gripper_imu_start(self, label: Optional[str] = None,
+                          csv: Optional[str] = None,
                           rate: Optional[int] = None,
-                          dest: Optional[str] = None) -> None:
+                          dest: Optional[str] = None,
+                          plate_only: bool = False) -> None:
         """Begin an IMU capture that keeps running while the gantry moves.
 
         Unlike `gripper_imu`, which is one blocking fixed-length capture, this
@@ -650,16 +658,23 @@ class Machine:
                 f"- it would become a filename with backslashes in it. Mount "
                 f"the share and give the mounted directory instead."
             )
-        args = f"CSV={csv}"
-        if label:
-            args += f" LABEL={label}"
-        if rate:
-            args += f" RATE={int(rate)}"
-        if dest:
-            args += f" DEST={dest}"
+        if not (label or csv):
+            raise ProtocolError(
+                "gripper_imu_start() needs a LABEL or a CSV - the host names "
+                "the capture from one of them, and an unnamed capture cannot "
+                "be found again afterwards."
+            )
+        args = " ".join(filter(None, [
+            f"LABEL={label}" if label else "",
+            f"CSV={csv}" if csv else "",
+            f"RATE={int(rate)}" if rate else "",
+            f"DEST={dest}" if dest else "",
+            "PLATE_ONLY=1" if plate_only else "",
+        ]))
         self._gripper_macro("imu_start", args, csv=csv, label=label,
-                            rate=rate, dest=dest)
-        self._imu_session = csv
+                            rate=rate, dest=dest, plate_only=plate_only)
+        self._imu_session = label or csv
+        self._imu_plate_only = plate_only
         self.toggles["imu_sessions"] = self.toggles.get("imu_sessions", 0) + 1
 
     def gripper_imu_mark(self, label: str) -> None:
@@ -680,6 +695,7 @@ class Machine:
             raise ProtocolError("gripper_imu_stop() with no capture open")
         self._gripper_macro("imu_stop")
         self._imu_session = None
+        self._imu_plate_only = False
 
     def gripper_abort(self) -> None:
         """Clear a latched fault. All motion is refused until this runs."""
