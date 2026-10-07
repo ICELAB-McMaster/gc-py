@@ -70,12 +70,22 @@ HOLD_S = 1.0              # at the raised height, between lift and descent
 POST_RELEASE_S = 1.0      # keep recording after the jaws open, so the 7 mm
                           # fall and the landing are in the capture
 IMU_RATE = None           # samples/s; None lets the host choose
-CSV_DIR = "/home/admin/imu"   # ON THE PI. Local disk: the capture is written
-                              # here and copied to DEST_DIR when it stops.
+# Both None by default now: the host names the capture from LABEL, adds a
+# timestamp so a loop never overwrites itself, writes to ~/gripper_captures
+# and copies to /mnt/nas/GC_ARCCS/GripperIMU on stop. Set either only to
+# override that.
+CSV_DIR = None
 # \\ICE-NAS\Data\GC_ARCCS\GripperIMU as the Pi sees it: the share is
 # mounted at /mnt/nas (operator, 2026-10-06). FORWARD slashes - the capture
 # runs on Linux, where a backslash is not a separator.
-DEST_DIR = "/mnt/nas/GC_ARCCS/GripperIMU"
+DEST_DIR = None
+
+# gantry   both IMUs, but the gripper commands sit OUTSIDE the capture,
+#          because capturing the board IMU locks the board.
+# spanning the capture covers the grip, the release and the fall - at the
+#          cost of the board IMU, since only the plate IMU can record
+#          through a command.
+IMU_MODE = "gantry"
 CYCLES = 1
 
 
@@ -88,9 +98,10 @@ def build(
     hold_s: float = HOLD_S,
     post_release_s: float = POST_RELEASE_S,
     imu_rate: int | None = IMU_RATE,
-    csv_dir: str = CSV_DIR,
+    csv_dir: str | None = CSV_DIR,
     dest_dir: str | None = DEST_DIR,
     imu: bool = True,
+    imu_mode: str = IMU_MODE,
     layout: str = "layout.json",
     outdir: str = ".",
     plot: bool = True,
@@ -161,15 +172,35 @@ def build(
             f"de-energises and the part drops. Shorten --hold."
         )
 
-    # Can the board take a gripper command while streaming? If it can, the
-    # capture brackets the grip and the release too, which is what API.md
-    # describes. If it cannot, those two go outside and their transients come
-    # from the board's own current trace instead.
-    spanning = bool((eff.spec.get("capture_concurrency") or {})
-                    .get("commands_during_capture"))
+    if imu_mode not in ("gantry", "spanning"):
+        raise ProtocolError(
+            f"imu_mode must be 'gantry' or 'spanning', got {imu_mode!r}"
+        )
+
+    # Which IMUs can be captured depends on where the gripper commands sit.
+    # The board IMU goes over CAN, and the board runs that capture as a
+    # blocking loop - so a command issued during it is QUEUED, not executed.
+    # The plate IMU is a local I2C read on the Pi and has no such problem.
+    cc = eff.spec.get("capture_concurrency") or {}
+    both_ok = bool(cc.get("commands_during_capture"))
+    plate_spans = bool(cc.get("plate_only_spans_commands"))
+    spanning = imu_mode == "spanning" or both_ok
+    # Plate-only is needed to span, unless the firmware has since learned to
+    # service commands mid-capture, in which case both IMUs can span.
+    plate_only = spanning and not both_ok
+    if spanning and plate_only and not plate_spans:
+        raise ProtocolError(
+            "a spanning capture needs either firmware that services commands "
+            "while streaming (capture_concurrency.commands_during_capture) or "
+            "a plate-only capture (plate_only_spans_commands). Neither is set "
+            "for this effector, so the grip would be queued behind the "
+            "capture and fire minutes late."
+        )
 
     m.toggles.update({
+        "imu_mode": imu_mode,
         "spanning_capture": spanning,
+        "plate_only": plate_only,
         "station": station, "station_xy": list(st.xy),
         "cycles": cycles, "grip_ma": int(grip_ma), "hold_s": hold_s,
         "post_release_s": post_release_s,
@@ -191,14 +222,20 @@ def build(
     if imu:
         m.note(f"IMU captures to {csv_dir}/<name>_NN.csv on the Pi, with "
                f"phase marks in the matching .marks.csv")
-        if spanning:
-            m.note(f"the capture SPANS the grip and the release, and runs "
-                   f"{post_release_s:g} s past it so the fall is recorded")
+        if spanning and plate_only:
+            m.note(f"PLATE IMU ONLY, spanning the grip and the release and "
+                   f"{post_release_s:g} s past it. The board IMU is not "
+                   f"captured: it goes over CAN, and the board runs that "
+                   f"capture as a blocking loop, so a grip sent during one "
+                   f"would be queued rather than executed")
+        elif spanning:
+            m.note(f"both IMUs, spanning the grip and the release and "
+                   f"{post_release_s:g} s past it")
         else:
-            m.note("the capture spans the GANTRY motion only - the board "
-                   "cannot be commanded while it streams, so the grip and "
-                   "release transients come from their own --log CSVs "
-                   "instead (capture_concurrency in the effector config)")
+            m.note("both IMUs, spanning the GANTRY motion only - the grip "
+                   "and release sit outside the capture and their transients "
+                   "come from their own --log CSVs. --imu-mode spanning "
+                   "trades the board IMU for a capture that covers them")
         if dest_dir:
             m.note(f"each capture is copied to {dest_dir} on the Pi when it "
                    f"stops - that must be a MOUNTED share, and the originals "
@@ -210,6 +247,10 @@ def build(
     # Before G28, so an uninstalled gripper_macros.cfg shows up with the
     # machine still parked rather than after a full run of inert motion.
     m.gripper_preflight()
+    # gripctl's --csv does NOT get the host's default directory treatment,
+    # so the motion traces need a real path of their own.
+    log_dir = csv_dir or "~/gripper_captures"
+
     m.startup()
     m.goto(st.xy[0], st.xy[1], op=f"goto:{station}")
 
@@ -232,20 +273,22 @@ def build(
         # during a capture is QUEUED, not refused, and fires when the capture
         # ends, long after the gantry has moved on.
         if imu and spanning:
-            m.gripper_imu_start(csv=f"{csv_dir}/{name}_{tag}.csv",
-                                label=f"pick{tag}", rate=imu_rate,
-                                dest=dest_dir)
+            m.gripper_imu_start(label=f"{name}_{tag}", rate=imu_rate,
+                                csv=(f"{csv_dir}/{name}_{tag}" if csv_dir
+                                     else None),
+                                dest=dest_dir, plate_only=plate_only)
             m.gripper_imu_mark(f"pick{tag}_before_grip_z{z_grip:g}")
 
         m.grip(ma=int(grip_ma), what=f"part@{station}",
-               log_csv=(f"{csv_dir}/{name}_{tag}_grip.csv" if imu else None))
+               log_csv=(f"{log_dir}/{name}_{tag}_grip.csv" if imu else None))
 
         if imu and not spanning:
             # From here to the stop is GANTRY motion only. Klipper owns that,
             # so the board is free to stream throughout.
-            m.gripper_imu_start(csv=f"{csv_dir}/{name}_{tag}.csv",
-                                label=f"pick{tag}", rate=imu_rate,
-                                dest=dest_dir)
+            m.gripper_imu_start(label=f"{name}_{tag}", rate=imu_rate,
+                                csv=(f"{csv_dir}/{name}_{tag}" if csv_dir
+                                     else None),
+                                dest=dest_dir, plate_only=plate_only)
         if imu:
             m.gripper_imu_mark(f"pick{tag}_gripped_{int(grip_ma)}ma_z{z_grip:g}")
 
@@ -266,7 +309,7 @@ def build(
                 m.gripper_imu_stop()
 
         m.release(max_drop_mm=drop_mm,
-                  log_csv=(f"{csv_dir}/{name}_{tag}_release.csv"
+                  log_csv=(f"{log_dir}/{name}_{tag}_release.csv"
                            if imu else None))
         if imu and spanning:
             m.gripper_imu_mark(f"pick{tag}_released_drop{drop_mm:g}mm")
@@ -298,14 +341,18 @@ def summarise(m: Machine, result) -> None:
           f"release {t['z_release']:g}   (+Z is DOWN)")
     print(f"  grip {t['grip_ma']} mA, hold {t['hold_s']:g} s")
     if t.get("imu"):
+        which = "PLATE IMU only" if t.get("plate_only") else "both IMUs"
         if t.get("spanning_capture"):
-            print(f"  capture SPANS the grip and release, "
+            print(f"  {which}, spanning the grip and release, "
                   f"+{t['post_release_s']:g} s past it for the fall")
         else:
-            print(f"  capture spans the gantry motion only; grip and release "
-                  f"transients are in their own --log CSVs")
-        print(f"  captures -> {t['csv_dir']} on the Pi"
-              + (f", copied to {t['dest_dir']}" if t.get("dest_dir") else ""))
+            print(f"  {which}, spanning the gantry motion only; grip and "
+                  f"release transients are in their own --log CSVs")
+        print(f"  captures -> "
+              + (f"{t['csv_dir']} on the Pi" if t.get("csv_dir")
+                 else "~/gripper_captures on the Pi (host default)")
+              + (f", copied to {t['dest_dir']}" if t.get("dest_dir")
+                 else ", copied to /mnt/nas/GC_ARCCS/GripperIMU (host default)"))
     if t["release_drop_mm"]:
         print(f"  the part FALLS {t['release_drop_mm']:g} mm on release")
     print(f"  grips {t.get('grips', 0)}, IMU sessions "
@@ -353,6 +400,12 @@ def main(argv=None) -> int:
                     const=None, help="keep the captures on the Pi only")
     ap.add_argument("--no-imu", dest="imu", action="store_false",
                     help="run the motion without recording")
+    ap.add_argument("--imu-mode", default=IMU_MODE, dest="imu_mode",
+                    choices=("gantry", "spanning"),
+                    help="gantry: both IMUs, gripper commands outside the "
+                         "capture. spanning: the capture covers the grip, "
+                         "release and fall, at the cost of the board IMU - "
+                         "only the plate IMU can record through a command")
     ap.add_argument("--layout", default="layout.json")
     ap.add_argument("--outdir", default=".")
     ap.add_argument("--no-plot", dest="plot", action="store_false")
@@ -365,7 +418,7 @@ def main(argv=None) -> int:
             cycles=a.cycles, grip_ma=a.grip_ma, hold_s=a.hold_s,
             post_release_s=a.post_release_s,
             imu_rate=a.imu_rate, csv_dir=a.csv_dir, dest_dir=a.dest_dir,
-            imu=a.imu,
+            imu=a.imu, imu_mode=a.imu_mode,
             layout=a.layout, outdir=a.outdir, plot=a.plot, strict=a.strict,
         )
     except LabError as exc:

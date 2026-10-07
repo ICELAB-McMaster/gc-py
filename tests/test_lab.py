@@ -457,6 +457,70 @@ def test_the_default_sequence_keeps_the_gripper_commands_outside():
           "and the capture must be stopped before the release")
 
 
+def test_spanning_mode_uses_a_plate_only_capture():
+    """Only the plate IMU can record through a gripper command.
+
+    The board IMU goes over CAN, so capturing it means CMD_IMU_READ, which
+    gripnode runs as a blocking loop - a command sent during one is queued,
+    not executed. The plate IMU is a local I2C read on the Pi.
+    """
+    import importlib
+    import gripper_station9_test as g9
+    importlib.reload(g9)
+    with tempfile.TemporaryDirectory() as td:
+        m, _ = g9.build(outdir=td, layout=TEST_LAYOUT, plot=False,
+                        imu_mode="spanning")
+
+    check(m.toggles["plate_only"] is True,
+          "spanning must use a plate-only capture while the board blocks")
+    start = next(s for s in m.steps
+                 if s.op == "gripper:imu_start" and s.kind == "macro")
+    check(start.detail["plate_only"] is True,
+          "the macro must carry PLATE_ONLY")
+    emitted = [ln for ln in m.g.getvalue().splitlines() if "IMU_START" in ln]
+    check(emitted and "PLATE_ONLY=1" in emitted[0],
+          f"PLATE_ONLY=1 must reach the gcode, got {emitted[:1]}")
+
+    def first(op):
+        return next(s.i for s in m.steps if s.op == op and s.kind == "macro")
+    check(first("gripper:imu_start") < first("gripper:grip")
+          < first("gripper:release") < first("gripper:imu_stop"),
+          "a plate-only capture must bracket both the grip and the release")
+
+
+def test_spanning_is_refused_without_a_capability_that_allows_it():
+    """Neither route available means the grip would be queued."""
+    import importlib
+    import gripper_station9_test as g9
+    with _WithConfig(_gripper_capability_config(
+            commands_during_capture=False, plate_only_spans_commands=False)):
+        importlib.reload(g9)
+        with tempfile.TemporaryDirectory() as td:
+            raises(ProtocolError,
+                   lambda: g9.build(outdir=td, layout=TEST_LAYOUT,
+                                    plot=False, imu_mode="spanning"),
+                   "spanning with no route to it must refuse, not emit a "
+                   "sequence whose grip never runs")
+    importlib.reload(g9)
+
+
+def test_a_plate_only_session_allows_gripper_commands():
+    m = _gripper_machine()
+    m.startup()
+    m.gripper_home()
+    m.gripper_open()
+    m.gripper_imu_start(label="spanning01", plate_only=True)
+    m.grip(ma=300)                       # allowed: nothing is on the bus
+    m.release()
+    m.gripper_imu_stop()
+
+    # and a capture that includes the board IMU still refuses
+    m.gripper_imu_start(label="both01")
+    raises(ProtocolError, lambda: m.grip(ma=300),
+           "a capture including the board IMU still blocks commands")
+    m.gripper_imu_stop()
+
+
 def test_station9_preflights_before_it_moves():
     """An uninstalled gripper_macros.cfg must show up before G28.
 
@@ -480,22 +544,38 @@ def test_station9_preflights_before_it_moves():
           f"the gcode must say what an unknown command means: {m.notes[:3]}")
 
 
-def test_station9_captures_locally_and_copies_to_the_share():
-    """The capture is written to local disk, then copied. Never onto a mount.
+def test_station9_lets_the_host_name_and_publish_the_capture():
+    """LABEL is enough: the host adds the timestamp and copies to the NAS.
 
-    A 100 Hz capture writing to a share that stalls takes the run with it,
-    and it surfaces as a short CSV rather than an error.
+    It used to be told an explicit CSV and DEST. Both are host defaults now
+    (~/gripper_captures, then /mnt/nas/GC_ARCCS/GripperIMU), and a timestamp
+    is always appended - so forcing a path here would only create a second
+    place for the two to disagree. What this still has to pin is that a
+    capture is NAMED, because an unnamed one cannot be found afterwards.
     """
     m = _station9(cycles=1)
     start = next(s for s in m.steps
                  if s.op == "gripper:imu_start" and s.kind == "macro")
-    csv, dest = start.detail["csv"], start.detail["dest"]
-    check(csv.startswith("/home/admin/"),
-          f"the capture itself must go to local disk, got {csv}")
-    check(dest == "/mnt/nas/GC_ARCCS/GripperIMU",
-          f"the copy destination should be the mounted share, got {dest}")
-    check(not dest.startswith(csv.rsplit("/", 1)[0]),
-          "capturing and publishing to the same directory defeats the point")
+    check(start.detail.get("label"),
+          f"every capture must carry a label, got {start.detail}")
+    check(start.detail.get("csv") is None and start.detail.get("dest") is None,
+          f"neither path should be forced while the host defaults are right: "
+          f"csv={start.detail.get('csv')} dest={start.detail.get('dest')}")
+    emitted = [ln for ln in m.g.getvalue().splitlines() if "IMU_START" in ln]
+    check(emitted and "CSV=" not in emitted[0] and "DEST=" not in emitted[0],
+          f"and neither should reach the gcode: {emitted[:1]}")
+
+    # An override still works, and still goes somewhere local.
+    import importlib
+    import gripper_station9_test as g9
+    importlib.reload(g9)
+    with tempfile.TemporaryDirectory() as td:
+        m2, _ = g9.build(outdir=td, layout=TEST_LAYOUT, plot=False,
+                         csv_dir="/home/admin/imu")
+    s2 = next(s for s in m2.steps
+              if s.op == "gripper:imu_start" and s.kind == "macro")
+    check(s2.detail["csv"].startswith("/home/admin/"),
+          f"an overridden capture path must stay local, got {s2.detail['csv']}")
 
 
 def test_a_unc_path_is_refused_as_an_imu_destination():
@@ -639,12 +719,12 @@ def test_station9_repeats_cleanly_for_fifteen_cycles():
     check(len(homes) == 15, f"one re-home per cycle, got {len(homes)}")
 
     # And each capture is named for its own pick, so the files do not collide.
-    csvs = [s.detail.get("csv") for s in m.steps
-            if s.op == "gripper:imu_start" and s.kind == "macro"]
-    check(len(set(csvs)) == 15, f"15 distinct capture files, got "
-          f"{len(set(csvs))}")
-    check(csvs[0].endswith("_01.csv") and csvs[-1].endswith("_15.csv"),
-          f"captures should be numbered per pick: {csvs[0]} .. {csvs[-1]}")
+    labels = [s.detail.get("label") for s in m.steps
+              if s.op == "gripper:imu_start" and s.kind == "macro"]
+    check(len(set(labels)) == 15,
+          f"15 distinctly labelled captures, got {len(set(labels))}")
+    check(labels[0].endswith("_01") and labels[-1].endswith("_15"),
+          f"captures should be numbered per pick: {labels[0]} .. {labels[-1]}")
 
 
 def _gripper_station_config(**z):

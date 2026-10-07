@@ -343,9 +343,22 @@ have happened.
 open, except the four the board really does service. What a capture CAN span
 is **gantry motion** - Klipper owns that, and the board is idle throughout.
 
-**Both sequences are implemented**, chosen by
-`capture_concurrency.commands_during_capture` in the effector config. It is
-`false` today. Fix the firmware - `Gripper/board/PROPOSAL_imu_concurrent.md`
+**Which IMU decides whether a command can run.** The board IMU goes over
+CAN, so capturing it means `CMD_IMU_READ`, which the board runs as a blocking
+loop. The **plate** IMU is a local I2C read on the Pi and touches the bus not
+at all - so a `--plate-only` capture *can* span a grip and a release.
+
+    --imu-mode gantry     both IMUs, gripper commands OUTSIDE the capture
+    --imu-mode spanning   plate IMU only, capture covers grip, release, fall
+
+That is the trade: board attitude, or a capture that spans the commands. The
+grip and release keep their `--log` current traces in both, so "how hard did
+it hold" is never lost either way.
+
+`capture_concurrency` carries both facts - `commands_during_capture` (false:
+the board blocks) and `plate_only_spans_commands` (true). If the firmware
+learns to service commands mid-capture, set the first one and `spanning`
+captures both IMUs with no code change. Fix the firmware - `Gripper/board/PROPOSAL_imu_concurrent.md`
 has the change, the cost and the test - flash it, flip the flag, and the
 protocol emits API.md's spanning sequence with **no code change**.
 `test_the_spanning_capture_is_emitted_once_the_board_can_take_commands`
