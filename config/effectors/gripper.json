@@ -52,10 +52,10 @@
     "version": "GRIPPER_MACROS_VERSION"
   },
   "imu_storage": {
-    "capture_dir": "/home/admin/imu",
+    "capture_dir": "/home/admin/gripper_captures",
     "dest_dir": "/mnt/nas/GC_ARCCS/GripperIMU",
     "unc": "\\\\ICE-NAS\\Data\\GC_ARCCS\\GripperIMU",
-    "note": "Captures are written to capture_dir on the Pi's LOCAL disk and copied to dest_dir when the capture stops. Never recorded straight onto the share: a 100 Hz capture writing to a mount that stalls or drops takes the run with it, and it would surface as a short CSV rather than an error. Copy-after means a share that is down costs the copy, not the data.",
+    "note": "Captures are written to capture_dir on the Pi's LOCAL disk and copied to dest_dir when the capture stops. Never recorded straight onto the share: a 100 Hz capture writing to a mount that stalls or drops takes the run with it, and it would surface as a short CSV rather than an error. Copy-after means a share that is down costs the copy, not the data. The macro layer owns both paths now: _GRIPPER_IMU_CFG in gripper_macros.cfg holds local_dir and nas_dir, and GRIPPER_IMU_START passes --csv and --dest explicitly rather than letting imu_session's own defaults apply. A protocol that sends no csv_dir/dest_dir therefore still lands here, and the macro echoes both paths before the capture starts - the run that could not be found on 2026-10-06 said neither.",
     "mount_note": "dest_dir is a path ON THE PI and the share must already be mounted there. Confirmed by the operator 2026-10-06: it is mounted at /mnt/nas, so UNC \\\\ICE-NAS\\Data\\GC_ARCCS\\GripperIMU is /mnt/nas/GC_ARCCS/GripperIMU here. MIND THE SEPARATOR - the operator wrote it as \\mnt\\nas\\..., which is how Windows renders a path, but the capture runs on Linux and backslashes are not separators there. Passed through, \\mnt\\nas\\GC_ARCCS\\GripperIMU would be ONE filename containing backslashes, and the data would be written successfully somewhere nobody looks - which is why Machine.gripper_imu_start refuses any destination containing one. If the share moves, pass --dest-dir with forward slashes; nothing on the slicing machine can check a mount on the Pi.",
     "validated": false
   },
