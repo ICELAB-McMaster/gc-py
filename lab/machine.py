@@ -79,6 +79,7 @@ class Machine:
         self._grip_z: Optional[float] = None
         self._grip_dwell_s = 0.0
         self._imu_session: Optional[str] = None
+        self._imu_run: Optional[str] = None
         self._imu_plate_only = False
 
         # ---- records -------------------------------------------------------
@@ -626,11 +627,55 @@ class Machine:
         self._require_homed("move_to_z()")
         self._move_z(z, feedrate or self.deck.feedrate("travel"), op)
 
+    def gripper_imu_run_begin(self, name: str,
+                              dest: Optional[str] = None) -> None:
+        """Open a run: one CSV that every capture in this program appends to.
+
+        A multi-cycle program cannot be one capture while the board IMU is
+        recorded - the board runs that capture as a blocking loop, so it has
+        to stop before every grip. The run file is what makes the program
+        still produce a single CSV.
+
+        The Pi applies the timestamp, not this. A name stamped here would
+        change the generated gcode on every slice, so the program would never
+        diff clean against its committed reference; a name with no stamp at
+        all would have the second run of a program append invisibly onto the
+        first.
+        """
+        self._gripper()
+        if self._imu_run is not None:
+            raise ProtocolError(
+                f"an IMU run is already open ({self._imu_run!r}). Two open "
+                f"runs would mean captures appending to whichever the host "
+                f"recorded last."
+            )
+        args = " ".join(filter(None, [f"NAME={name}",
+                                      f"DEST={dest}" if dest else ""]))
+        self._gripper_macro("imu_run_begin", args, name=name, dest=dest)
+        self._imu_run = name
+
+    def gripper_imu_run_end(self) -> None:
+        """Close the run and copy its one CSV to the share."""
+        self._gripper()
+        if self._imu_run is None:
+            raise ProtocolError(
+                "gripper_imu_run_end() with no run open"
+            )
+        if self._imu_session is not None:
+            raise ProtocolError(
+                f"the capture {self._imu_session!r} is still open - ending "
+                f"the run now would copy a file the capture has not been "
+                f"merged into yet. Stop the capture first."
+            )
+        self._gripper_macro("imu_run_end")
+        self._imu_run = None
+
     def gripper_imu_start(self, label: Optional[str] = None,
                           csv: Optional[str] = None,
                           rate: Optional[int] = None,
                           dest: Optional[str] = None,
-                          plate_only: bool = False) -> None:
+                          plate_only: bool = False,
+                          into: Optional[str] = None) -> None:
         """Begin an IMU capture that keeps running while the gantry moves.
 
         Unlike `gripper_imu`, which is one blocking fixed-length capture, this
@@ -643,6 +688,17 @@ class Machine:
         nothing here can verify it is mounted. The capture is never written
         straight to a share: a stalled mount would truncate the run and look
         like a short recording rather than an error.
+
+        `into` appends this capture to one run file. A multi-cycle run cannot
+        be one capture while the board IMU is recorded - the board runs that
+        capture as a blocking loop, so the capture has to stop before every
+        grip - and `into` is what still makes the run produce a single CSV.
+        The `capture` column says which capture a row came from.
+
+        `rate` applies to BOTH sensors. Leaving it None lets the host pick,
+        which is 50 Hz; what must not happen is the two sensors running at
+        different rates in one file, which is what an omitted rate used to
+        mean.
         """
         self._gripper()
         if self._imu_session is not None:
@@ -669,10 +725,12 @@ class Machine:
             f"CSV={csv}" if csv else "",
             f"RATE={int(rate)}" if rate else "",
             f"DEST={dest}" if dest else "",
+            f"INTO={into}" if into else "",
             "PLATE_ONLY=1" if plate_only else "",
         ]))
         self._gripper_macro("imu_start", args, csv=csv, label=label,
-                            rate=rate, dest=dest, plate_only=plate_only)
+                            rate=rate, dest=dest, plate_only=plate_only,
+                            into=into)
         self._imu_session = label or csv
         self._imu_plate_only = plate_only
         self.toggles["imu_sessions"] = self.toggles.get("imu_sessions", 0) + 1

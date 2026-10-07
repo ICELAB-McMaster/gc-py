@@ -2049,6 +2049,105 @@ def test_simulation_failure_writes_nothing():
               "no gcode should be written when simulation fails")
 
 
+def test_imu_run_brackets_every_capture_in_one_file():
+    """One program, one CSV - even though it is several captures.
+
+    The board IMU cannot be commanded while it streams, so in gantry mode
+    the capture must stop before every grip and a multi-cycle run is
+    necessarily several captures. The run scope is what still makes it one
+    file, so the pairing is checked rather than assumed.
+    """
+    m = _gripper_machine()
+    m.startup()
+    m.gripper_imu_run_begin("run_a")
+    raises(ProtocolError, lambda: m.gripper_imu_run_begin("run_b"),
+           "a second open run must refuse - captures would append to "
+           "whichever the host recorded last")
+    m.gripper_imu_start(label="cycle01")
+    raises(ProtocolError, m.gripper_imu_run_end,
+           "ending a run with a capture still open must refuse - the file "
+           "would be copied before that capture had been merged into it")
+    m.gripper_imu_stop()
+    m.gripper_imu_run_end()
+    raises(ProtocolError, m.gripper_imu_run_end,
+           "closing a run twice must refuse")
+
+    # ops are named "<effector>:<op>"; the prefix is not what is under test.
+    ops = [s.op.split(":")[-1] for s in m.steps
+           if getattr(s, "kind", "") == "macro"]
+    check(ops.count("imu_run_begin") == 1, f"one run begin, got {ops}")
+    check(ops.count("imu_run_end") == 1, f"one run end, got {ops}")
+    check(ops.index("imu_run_begin") < ops.index("imu_start")
+          < ops.index("imu_stop") < ops.index("imu_run_end"),
+          f"the run must bracket the capture, got {ops}")
+
+
+def test_station9_emits_one_run_and_a_capture_per_cycle():
+    """The shape of the real program, at the cycle count that will be run."""
+    import protocols.gripper_station9_test as prot
+    m, _ = prot.build(cycles=3, layout=TEST_LAYOUT, outdir=tempfile.mkdtemp(),
+                      plot=False)
+    ops = [s.op.split(":")[-1] for s in m.steps
+           if getattr(s, "kind", "") == "macro"]
+    check(ops.count("imu_run_begin") == 1,
+          f"exactly one run for the whole program, got "
+          f"{ops.count('imu_run_begin')}")
+    check(ops.count("imu_run_end") == 1,
+          f"exactly one run end, got {ops.count('imu_run_end')}")
+    check(ops.count("imu_start") == ops.count("imu_stop") == 3,
+          f"one capture per cycle: {ops.count('imu_start')} starts, "
+          f"{ops.count('imu_stop')} stops")
+    # Every capture inside the run, and every grip outside a capture.
+    begin, end = ops.index("imu_run_begin"), ops.index("imu_run_end")
+    for i, op in enumerate(ops):
+        if op in ("imu_start", "imu_stop", "imu_mark"):
+            check(begin < i < end, f"{op} at {i} is outside the run")
+
+
+def test_both_imus_are_captured_unless_spanning_is_asked_for():
+    """PLATE_ONLY drops the board IMU, so it must not arrive by accident.
+
+    A capture missing half its sensors is not visible in the gcode - it is
+    one absent token - and shows up only as a CSV with no source=PCB rows
+    after the run is over.
+    """
+    import protocols.gripper_station9_test as prot
+    m, _ = prot.build(layout=TEST_LAYOUT, outdir=tempfile.mkdtemp(), plot=False)
+    # kind must be filtered: a macro's guard dwell carries the macro's op
+    # name, so op alone matches twice per capture.
+    starts = [s for s in m.steps if s.kind == "macro"
+              and s.op.endswith(":imu_start")]
+    check(starts, "the default protocol should open a capture")
+    for s in starts:
+        check(not s.detail.get("plate_only"),
+              "the DEFAULT mode must capture both IMUs - plate-only would "
+              f"silently drop source=PCB: {s.detail}")
+        check("PLATE_ONLY" not in s.detail["line"],
+              f"and nothing should emit PLATE_ONLY: {s.detail['line']}")
+    check(not m.toggles["plate_only"], "default must not be plate-only")
+
+    sp, _ = prot.build(imu_mode="spanning", layout=TEST_LAYOUT,
+                       outdir=tempfile.mkdtemp(), plot=False)
+    check(sp.toggles["plate_only"],
+          "spanning trades the board IMU away - that is the whole trade")
+
+
+def test_imu_rate_is_set_and_is_one_rate_for_both_sensors():
+    """An omitted rate meant the two sensors ran at different rates."""
+    import protocols.gripper_station9_test as prot
+    check(prot.IMU_RATE == 50,
+          f"orientation work is specified at 50 Hz, got {prot.IMU_RATE}")
+    m, _ = prot.build(layout=TEST_LAYOUT, outdir=tempfile.mkdtemp(), plot=False)
+    starts = [s for s in m.steps if s.kind == "macro"
+              and s.op.endswith(":imu_start")]
+    check(starts, "the protocol should open a capture")
+    for s in starts:
+        check(s.detail.get("rate") == 50,
+              f"the capture must carry its rate, got {s.detail}")
+        check("RATE=50" in s.detail["line"],
+              f"and must emit it, got {s.detail['line']!r}")
+
+
 # ==========================================================================
 
 def main() -> int:

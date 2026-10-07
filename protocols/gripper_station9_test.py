@@ -69,7 +69,12 @@ GRIP_MA = 500             # the firmware clamp; ~570 mA is the hardware ceiling
 HOLD_S = 1.0              # at the raised height, between lift and descent
 POST_RELEASE_S = 1.0      # keep recording after the jaws open, so the 7 mm
                           # fall and the landing are in the capture
-IMU_RATE = None           # samples/s; None lets the host choose
+IMU_RATE = 50             # samples/s, BOTH sensors. Orientation work:
+                          # enough to place an event in time and to see the
+                          # attitude it ends at, without the volume of a
+                          # vibration capture. One rate for both sensors is
+                          # the point - two rates in one file, with only a
+                          # `source` column telling them apart, is a trap.
 # Both None by default now: the host names the capture from LABEL, adds a
 # timestamp so a loop never overwrites itself, writes to ~/gripper_captures
 # and copies to /mnt/nas/GC_ARCCS/GripperIMU on stop. Set either only to
@@ -220,8 +225,18 @@ def build(
         m.note(f"WARNING the release is {drop_mm:g} mm ABOVE the grip, so the "
                f"part FALLS {drop_mm:g} mm. Declared deliberately.")
     if imu:
-        m.note(f"IMU captures to {csv_dir}/<name>_NN.csv on the Pi, with "
-               f"phase marks in the matching .marks.csv")
+        m.note(f"IMU -> ONE csv for the whole run, "
+               f"{csv_dir or '~/gripper_captures'}/{name}_<stamp>.csv, at "
+               f"{imu_rate or 50} Hz on both sensors. Long format: every row "
+               f"has source=PCB (board IMU, over CAN), source=plate (the Pi's "
+               f"I2C IMU on the plate carrier) or source=mark (a phase "
+               f"label). There is no separate marks file")
+        if cycles > 1:
+            m.note(f"the {cycles} cycles are {cycles} separate captures - the "
+                   f"board cannot be commanded while it streams, so each one "
+                   f"ends before its grip - appended into that one file. The "
+                   f"`capture` column names the cycle and t_s restarts within "
+                   f"each; order the run by wall_clock")
         if spanning and plate_only:
             m.note(f"PLATE IMU ONLY, spanning the grip and the release and "
                    f"{post_release_s:g} s past it. The board IMU is not "
@@ -252,6 +267,11 @@ def build(
     log_dir = csv_dir or "~/gripper_captures"
 
     m.startup()
+    if imu:
+        # Opens the ONE csv this program appends every capture to. The Pi
+        # names it <name>_<stamp>.csv; nothing here can know that stamp,
+        # which is deliberate - see Machine.gripper_imu_run_begin.
+        m.gripper_imu_run_begin(name, dest=dest_dir)
     m.goto(st.xy[0], st.xy[1], op=f"goto:{station}")
 
     for i in range(cycles):
@@ -322,6 +342,13 @@ def build(
 
         m.move_to_z(z_approach, op="retreat")
 
+    if imu:
+        # Closes the run file and copies it. Every capture has already been
+        # merged into it, so this reports the row count for the whole run -
+        # a run that recorded nothing says so here rather than finishing
+        # quietly and leaving an empty share to be discovered later.
+        m.gripper_imu_run_end()
+
     m.park()
     return m, m.finalize(outdir=outdir, plot=plot)
 
@@ -348,11 +375,20 @@ def summarise(m: Machine, result) -> None:
         else:
             print(f"  {which}, spanning the gantry motion only; grip and "
                   f"release transients are in their own --log CSVs")
-        print(f"  captures -> "
-              + (f"{t['csv_dir']} on the Pi" if t.get("csv_dir")
-                 else "~/gripper_captures on the Pi (host default)")
+        where = (t["csv_dir"] if t.get("csv_dir")
+                 else "~/gripper_captures (host default)")
+        print(f"  ONE csv for the run -> {where}/"
+              f"{m.name}_<stamp>.csv on the Pi"
               + (f", copied to {t['dest_dir']}" if t.get("dest_dir")
-                 else ", copied to /mnt/nas/GC_ARCCS/GripperIMU (host default)"))
+                 else ", copied to /mnt/nas/GC_ARCCS/GripperIMU (host "
+                      "default)"))
+        print(f"  {t.get('imu_sessions', 0)} capture(s) appended into it at "
+              f"{t.get('imu_rate') or 50} Hz, both sensors; rows are "
+              f"source=PCB / plate / mark")
+        if t.get("plate_only"):
+            print("  NOTE no source=PCB rows will exist - plate-only was "
+                  "asked for, and the board IMU cannot stream while the "
+                  "board is commanded")
     if t["release_drop_mm"]:
         print(f"  the part FALLS {t['release_drop_mm']:g} mm on release")
     print(f"  grips {t.get('grips', 0)}, IMU sessions "
