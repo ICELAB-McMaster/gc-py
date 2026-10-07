@@ -723,10 +723,12 @@ class Machine:
         parked instead of after fifteen cycles of pantomime. Both commands
         move nothing, so emitting them before homing is safe.
         """
-        self.note("PREFLIGHT - if either line below reports "
-                  "'Unknown command', STOP: gripper_macros.cfg is not "
-                  "included from printer.cfg and nothing in this file will "
-                  "actually grip. See docs/LAB.md.")
+        self.note("PREFLIGHT - if any line below reports 'Unknown command', "
+                  "STOP: gripper_macros.cfg is not included from printer.cfg "
+                  "and nothing in this file will actually grip. If the "
+                  "version printed is older than you expect, the INSTALLED "
+                  "copy has drifted from the repo. See docs/LAB.md.")
+        self._gripper_macro("version")
         self.gripper_ping()
         self.gripper_status()
 

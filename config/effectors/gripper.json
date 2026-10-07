@@ -43,12 +43,13 @@
     "imu_start": "GRIPPER_IMU_START",
     "imu_mark": "GRIPPER_IMU_MARK",
     "imu_stop": "GRIPPER_IMU_STOP",
-    "note": "From Gripper/klipper/gripper_macros.cfg, which must be included from printer.cfg and needs the gcode_shell_command extra. GRIPPER_IMU is an ADDITION - the shipped cfg had no IMU macro, so there was no way to ask for a measurement from gcode at all.",
+    "note": "From Gripper/klipper/gripper_macros.cfg, which must be included from printer.cfg and needs the gcode_shell_command extra. GRIPPER_IMU is an ADDITION - the shipped cfg had no IMU macro, so there was no way to ask for a measurement from gcode at all. GRIPPER_MACROS_VERSION prints which copy of the cfg Klipper loaded: the installed copy sits next to printer.cfg and drifted from the repo once already, keeping an obsolete 'needs CSV=' guard after CSV had become optional. Symlink the cfg rather than copying it.",
     "do_not_use": [
       "GRIPPER_PICK",
       "GRIPPER_PLACE"
     ],
-    "do_not_use_note": "DANGEROUS ON THIS MACHINE. Both do relative Z moves with the sign convention of a normal printer - GRIPPER_PICK emits G1 Z+40 and calls it a lift. Here +Z is DOWN, so that command drives the gripper 40 mm INTO the plate. This library emits absolute Z through Machine, which knows the convention."
+    "do_not_use_note": "DANGEROUS ON THIS MACHINE. Both do relative Z moves with the sign convention of a normal printer - GRIPPER_PICK emits G1 Z+40 and calls it a lift. Here +Z is DOWN, so that command drives the gripper 40 mm INTO the plate. This library emits absolute Z through Machine, which knows the convention.",
+    "version": "GRIPPER_MACROS_VERSION"
   },
   "imu_storage": {
     "capture_dir": "/home/admin/imu",

@@ -534,9 +534,13 @@ def test_station9_preflights_before_it_moves():
     first_macro = next(s for s in m.steps if s.kind == "macro")
     first_move = next(s for s in m.steps
                       if s.kind in ("move", "home"))
-    check(first_macro.op == "gripper:ping",
-          f"the first command must be the harmless ping, got "
-          f"{first_macro.op}")
+    check(first_macro.op == "gripper:version",
+          f"the version must come first - a stale INSTALLED cfg is the "
+          f"other way this fails, and it fails on a line the repo has "
+          f"already fixed. Got {first_macro.op}")
+    ops = [s.op for s in m.steps if s.kind == "macro"][:3]
+    check(ops == ["gripper:version", "gripper:ping", "gripper:status"],
+          f"preflight should be version, ping, status; got {ops}")
     check(first_macro.i < first_move.i,
           f"the preflight must precede any motion: ping at {first_macro.i}, "
           f"first move at {first_move.i}")
