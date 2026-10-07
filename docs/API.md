@@ -2202,6 +2202,16 @@ timestamp so a loop never overwrites itself, and copies to
 `/mnt/nas/GC_ARCCS/GripperIMU` on stop. An unnamed capture cannot be found
 again.
 
+**One capture is one file.** `stop` merges both sensors and every mark into a
+single `<label>_<stamp>.csv` in long format - one row per sample, with a
+`source` column of `pcb`, `plate` or `mark`. Wide format would need the two
+free-running sensors resampled onto a shared grid, and an interpolated row is
+an invented measurement that reads exactly like a recorded one. The join key
+is `wall_clock`, the only clock both sensors share; `t_s` is recomputed from
+the first sample. A `pcb` row's `wall_clock` is stamped on arrival at the Pi,
+so it carries CAN latency - good for comparing when an event appears on each
+sensor, not for absolute phase to a few ms.
+
 **Which IMU decides whether a command can run.** The board IMU goes over CAN,
 so capturing it means `CMD_IMU_READ`, which the board runs as a **blocking
 loop**; `gripnode.drain()` states the consequence itself - *"the queue is not
