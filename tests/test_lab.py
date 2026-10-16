@@ -233,9 +233,11 @@ def test_gripper_models_timed_motion_not_position():
 def test_gripper_refuses_to_open_past_the_firmware_clamp():
     """Opening has no hard stop; past full travel the racks leave the pinion."""
     g = eff_mod.load("gripper")
-    check(g.open_ms_max == 850, f"the clamp is 850 ms, got {g.open_ms_max}")
-    g.check_open_ms(850)                                  # the limit itself is fine
-    raises(EffectorError, lambda: g.check_open_ms(851),
+    # 765 is the firmware's OPEN_LIMIT_MS: 850 "still ran slightly long and
+    # the jaws came off the racks" (boardpins.py).
+    check(g.open_ms_max == 765, f"the clamp is 765 ms, got {g.open_ms_max}")
+    g.check_open_ms(765)                                  # the limit itself is fine
+    raises(EffectorError, lambda: g.check_open_ms(766),
            "one millisecond past the clamp must refuse")
     raises(EffectorError, lambda: g.check_open_ms(0),
            "a zero-length open should raise rather than emit nothing")

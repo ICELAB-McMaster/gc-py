@@ -12,8 +12,8 @@
   "actuator": {
     "model": "timed_open_current_grip",
     "open_ms_default": null,
-    "open_ms_max": 850,
-    "open_ms_max_note": "FIRMWARE CLAMP, and the single most dangerous number in this file. Closing ends at a hard stop; opening ends at NOTHING. Past full travel the racks disengage from the pinion and the mechanism must be reassembled by hand. There is no software recovery. Machine.gripper_open refuses anything above this rather than letting the firmware silently clamp, so the gcode says what was asked for.",
+    "open_ms_max": 765,
+    "open_ms_max_note": "FIRMWARE CLAMP, and the single most dangerous number in this file. Closing ends at a hard stop; opening ends at NOTHING. Past full travel the racks disengage from the pinion and the mechanism must be reassembled by hand. There is no software recovery. Machine.gripper_open refuses anything above this rather than letting the firmware silently clamp, so the gcode says what was asked for. 765 since 2026-10-16, matching OPEN_LIMIT_MS in the firmware (SDL_Gcode Gripper/board/boardpins.py). The history there: 1200 -> 950 -> 850 -> 765 against a measured 1000 ms disengagement point, and '850 still ran slightly long and the jaws came off the racks'. This file still said 850, so the library would have passed an open the firmware had already found unsafe - and the firmware's silent clamp would have hidden it.",
     "close_ms_default": null,
     "grip_ma_default": 300,
     "grip_ma_min": 100,
@@ -25,7 +25,10 @@
     "tier1_s": 20.0,
     "tier2_s": 120.0,
     "expires_s": 140.0,
-    "note": "A grip is a CONTROLLED STALL, not a clamp - this servo has no holding torque at rest. Full commanded current for the first 20 s, reduced for the next 120, then de-energised with a fault raised. Design every sequence to put the part down before 140 s. If a plate must be held longer, this actuator is the wrong tool and the fixture needs a mechanical detent."
+    "note": "A grip is a CONTROLLED STALL, not a clamp - this servo has no holding torque at rest. Full commanded current for the first 20 s, reduced for the next 120, then de-energised with a fault raised. Design every sequence to put the part down before 140 s. If a plate must be held longer, this actuator is the wrong tool and the fixture needs a mechanical detent.",
+    "duty_window_s": 300.0,
+    "duty_max_s": 150.0,
+    "duty_note": "HOLD_DUTY_MAX_MS of energised hold is permitted in any HOLD_DUTY_WINDOW_MS (boardpins.py: 150 s in 300 s). Past it the board raises FLT_HOLD_EXPIRED and de-energises - with a plate in the jaws, if the timing is unlucky. A repeated-grip program has to pace itself against this; gripper_offset_trials.py inserts cooldown dwells at slice time."
   },
   "requires_home": true,
   "requires_home_note": "OPEN, CLOSE and GRIP are refused by the firmware until HOME has run. Home drives into the closed stop and calls that zero. It costs about a second and re-establishes the only reference the timed model has, so when in doubt, home. Home again after any ST_LIMIT, ST_ABORTED or power cycle.",
@@ -43,7 +46,7 @@
     "imu_start": "GRIPPER_IMU_START",
     "imu_mark": "GRIPPER_IMU_MARK",
     "imu_stop": "GRIPPER_IMU_STOP",
-    "note": "From Gripper/klipper/gripper_macros.cfg, which must be included from printer.cfg and needs the gcode_shell_command extra. GRIPPER_IMU is an ADDITION - the shipped cfg had no IMU macro, so there was no way to ask for a measurement from gcode at all. GRIPPER_MACROS_VERSION prints which copy of the cfg Klipper loaded: the installed copy sits next to printer.cfg and drifted from the repo once already, keeping an obsolete 'needs CSV=' guard after CSV had become optional. Symlink the cfg rather than copying it.",
+    "note": "From Gripper/klipper/gripper_macros.cfg, which must be included from printer.cfg and needs the gcode_shell_command extra. GRIPPER_IMU is an ADDITION - the shipped cfg had no IMU macro, so there was no way to ask for a measurement from gcode at all. GRIPPER_MACROS_VERSION prints which copy of the cfg Klipper loaded: the installed copy sits next to printer.cfg and drifted from the repo once already, keeping an obsolete 'needs CSV=' guard after CSV had become optional. Symlink the cfg rather than copying it. GRIPPER_TRIAL* front host/trial_session.py, which runs offset_trials.py's procedure one step per macro and writes its two files, <stem>_plate.csv and <stem>_pcb.csv. trial_home REFUSES while the board reports holding, trial_grip records the board's reply as grip_status, and trial_burst skips the raised and lowered captures of a refused grip - the three places a G-code program, which cannot branch, would otherwise differ from the script.",
     "do_not_use": [
       "GRIPPER_PICK",
       "GRIPPER_PLACE"
@@ -51,7 +54,15 @@
     "do_not_use_note": "DANGEROUS ON THIS MACHINE. Both do relative Z moves with the sign convention of a normal printer - GRIPPER_PICK emits G1 Z+40 and calls it a lift. Here +Z is DOWN, so that command drives the gripper 40 mm INTO the plate. This library emits absolute Z through Machine, which knows the convention.",
     "version": "GRIPPER_MACROS_VERSION",
     "imu_run_begin": "GRIPPER_IMU_RUN_BEGIN",
-    "imu_run_end": "GRIPPER_IMU_RUN_END"
+    "imu_run_end": "GRIPPER_IMU_RUN_END",
+    "trials_begin": "GRIPPER_TRIALS_BEGIN",
+    "trial": "GRIPPER_TRIAL",
+    "trial_phase": "GRIPPER_TRIAL_PHASE",
+    "trial_home": "GRIPPER_TRIAL_HOME",
+    "trial_grip": "GRIPPER_TRIAL_GRIP",
+    "trial_burst": "GRIPPER_TRIAL_BURST",
+    "trial_release": "GRIPPER_TRIAL_RELEASE",
+    "trials_end": "GRIPPER_TRIALS_END"
   },
   "imu_storage": {
     "capture_dir": "/home/admin/gripper_captures",
@@ -68,7 +79,13 @@
     "blocks": null,
     "guard_dwell_ms": 1500,
     "guard_dwell_grip_ms": 2000,
-    "note": "Whether RUN_SHELL_COMMAND blocks until the process exits is INSTALL-DEPENDENT and has not been tested here. While blocks is null the library emits a G4 guard dwell after every gripper macro, so a following move cannot start while the gripper is still running. Test it once, set blocks true, and the dwells disappear - that is about 3.5 s a cycle."
+    "note": "Whether RUN_SHELL_COMMAND blocks until the process exits is INSTALL-DEPENDENT and has not been tested here. While blocks is null the library emits a G4 guard dwell after every gripper macro, so a following move cannot start while the gripper is still running. Test it once, set blocks true, and the dwells disappear - that is about 3.5 s a cycle.",
+    "unguarded_ops": [
+      "trial",
+      "trial_phase"
+    ],
+    "unguarded_note": "These write a context file and touch neither the gantry nor the board, so a following move cannot collide with them whether or not the shell command blocks. Without a guard, a non-blocking install would at worst stamp a phase change a few hundred ms late. imu_mark is NOT here: a mark still running when imu_stop merges is a lost mark.",
+    "busy_note": "trial_burst holds the host for its settle plus its samples, and the board reads no command queue while it streams. Its guard is guard_dwell_ms PLUS that busy time, so a following GRIPPER_* command is not queued behind it."
   },
   "tips": {
     "required": false,
