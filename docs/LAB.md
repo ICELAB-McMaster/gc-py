@@ -396,6 +396,35 @@ directly". Pipetting depths come from labware; a gripper sequence is a list of
 measured heights that belong to the *part*. It routes through `_move_z`, so
 every envelope, stage-floor and raised-edge check still applies.
 
+### Offset trials
+
+`protocols/gripper_offset_trials.py` is SDL_Gcode `host/offset_trials.py`
+sliced into G-code, at station 9's coordinates and with its sequence. It
+answers how much X misalignment the gripper can still pick a plate at. The two
+parameters it exists to tune:
+
+    --grip-z 107          the pick depth (+Z is DOWN: larger is deeper)
+    --offsets 0,20,40     mm in X from the station centre, signed allowed
+
+Each offset is tried `--trials` times (5), blocked or `--randomise`d. A given
+`--seed` gives the same order as offset_trials does. The data is written the
+same way too: `<name>_<stamp>_plate.csv`, streamed at 50 Hz all run, and
+`<name>_<stamp>_pcb.csv`, the board IMU at before_grip, raised and lowered.
+Both go to `~/gripper_captures` and are copied to the NAS at the end. Join
+them on `wall_clock`.
+
+A G-code program cannot branch, so a refused grip is still lifted and lowered.
+That's harmless with empty jaws, and the Pi skips that trial's raised and
+lowered bursts so the PCB file matches the script's. The gripper is homed
+every trial, as in the station 9 test. The host refuses that home if the
+board still reports holding, because homing would crush the plate. Hold-duty
+pacing (150 s energised per 300 s) is decided at slice time, as cooldown
+dwells in the G-code.
+
+`--release-z` defaults to the station's 100, so deepening `--grip-z` lengthens
+the fall (Z 109 drops 9 mm). It refuses a release below the grip, which would
+push the held plate into the deck.
+
 ## Conventions that read backwards
 
 **+Z is DOWN.** `Z=0` is home, at the top. A *larger* commanded Z is physically

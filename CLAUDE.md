@@ -82,12 +82,14 @@ A Parallax Feedback 360 servo on a rack and pinion, over CAN, driven through the
    `config/effectors/gripper.json`.
 
 Plate geometry is still unmeasured, so `gripper_plate_test.py` refuses; station
-9 is measured and `gripper_station9_test.py` runs.
+9 is measured and `gripper_station9_test.py` runs. `gripper_offset_trials.py`
+is SDL_Gcode's `host/offset_trials.py` sliced at station 9: tune `--grip-z`
+and `--offsets`, and the Pi writes the script's own `_plate.csv` / `_pcb.csv`.
 
 ## Running things
 
 ```bash
-python tests/test_lab.py            # 93 tests
+python tests/test_lab.py            # 105 tests
 python tests/test_review_fixes.py   # 22 tests, one per confirmed past defect
 python tests/smoke_geometry.py      # resolve every placement and coordinate
 

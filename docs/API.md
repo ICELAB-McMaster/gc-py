@@ -57,6 +57,7 @@ protocols/
   centrifuge_test_v2_1.py   location 2 only, two corner wells
   gripper_plate_test.py     pick a plate, lift, read the IMU, put it back
   gripper_station9_test.py  pick at station 9, IMU through the pick
+  gripper_offset_trials.py  offset_trials.py sliced: X misalignment vs pick
 ```
 
 Data flows one way: `config` -> `labware`/`effector` -> `deck` -> `machine`,
@@ -958,7 +959,7 @@ Test volumes as fractions of `nominal_uL`, each rounded to 4 decimals. `fraction
 
 **Nothing about it is positional.** The servo's feedback output has failed, so the firmware runs open loop and every motion is **timed** - "open for 400 ms", never "open to 30 degrees". The config has no `*_pos` field and `test_gripper_models_timed_motion_not_position` asserts none comes back. A number that cannot be measured or commanded is worse than an absent one.
 
-Attributes, all from `spec`: `open_ms_max` (850), `grip_ma_default` / `grip_ma_min` / `grip_ma_max` (300 / 100 / 500), `hold_expires_s` (140.0) and `hold_tier1_s` (20.0), `requires_home` (True), `carries_labware` (True), `held` (`Optional[str]`).
+Attributes, all from `spec`: `open_ms_max` (765), `grip_ma_default` / `grip_ma_min` / `grip_ma_max` (300 / 100 / 500), `hold_expires_s` (140.0) and `hold_tier1_s` (20.0), `hold_duty_window_s` / `hold_duty_max_s` (300 / 150 - energised hold permitted per rolling window, enforced by the board), `requires_home` (True), `carries_labware` (True), `held` (`Optional[str]`).
 
 #### `Gripper.macro(name) -> str`
 
@@ -970,15 +971,15 @@ The `GRIPPER_*` macro for an operation - `home`, `open`, `close`, `grip`, `relea
 
 #### `Gripper.check_open_ms(ms)`
 
-Raises `EffectorError` for `ms <= 0` or `ms > open_ms_max` (850). **Closing self-references, opening does not:** closing ends at a hard stop, which is what makes `HOME` meaningful, but opening ends at *nothing* - past full travel the racks leave the pinion and the mechanism is a hand rebuild. The firmware would clamp an over-long request silently; refusing keeps the gcode an honest record, and an assumption that asks for more than the clamp is already wrong.
+Raises `EffectorError` for `ms <= 0` or `ms > open_ms_max` (765, the firmware's `OPEN_LIMIT_MS` - it was 850 here until 2026-10-16, after the firmware had already dropped it because 850 "still ran slightly long and the jaws came off the racks"). **Closing self-references, opening does not:** closing ends at a hard stop, which is what makes `HOME` meaningful, but opening ends at *nothing* - past full travel the racks leave the pinion and the mechanism is a hand rebuild. The firmware would clamp an over-long request silently; refusing keeps the gcode an honest record, and an assumption that asks for more than the clamp is already wrong.
 
 #### `Gripper.check_grip_ma(ma)`
 
 Raises `EffectorError` outside 100-500 mA. 500 is the firmware clamp and ~570 mA the hardware ceiling; a setpoint above the clamp is **silently reduced**, which is why this refuses rather than passing it on. `--ma` is repeatable but uncalibrated against force - it is not newtons.
 
-#### `Gripper.guard_dwell_ms(op) -> int | None`
+#### `Gripper.guard_dwell_ms(op, busy_ms=0) -> int | None`
 
-How long to stall after a macro while `shell_command.blocks` is unproven: 2000 ms after a grip, 1500 otherwise, `None` once blocking is confirmed. Whether `RUN_SHELL_COMMAND` blocks until the process exits is install-dependent and untested here, and without the stall a move following a gripper macro can start while the gripper is still running - during a grip, that means lifting before the jaws have closed.
+How long to stall after a macro while `shell_command.blocks` is unproven: 2000 ms after a grip (`grip` or `trial_grip`), 1500 otherwise, `None` once blocking is confirmed. `busy_ms` is added for a command the host is known to stay busy in - a board-IMU burst, during which the board reads no command queue, so a shorter guard would queue the next `GRIPPER_*` behind it. Ops listed in `shell_command.unguarded_ops` (`trial`, `trial_phase`) get `None`: they write a context file and touch neither gantry nor board. `imu_mark` is deliberately *not* unguarded - a mark still running when `imu_stop` merges is a lost mark. Whether `RUN_SHELL_COMMAND` blocks until the process exits is install-dependent and untested here, and without the stall a move following a gripper macro can start while the gripper is still running - during a grip, that means lifting before the jaws have closed.
 
 #### `Gripper.station_z(station, key) -> float`
 
@@ -2141,7 +2142,7 @@ generation time.
 reference a timed open-loop mechanism has. It refuses while something is held -
 homing drives into the stop and the part is in the way.
 
-`gripper_open` refuses past the 850 ms clamp (`Gripper.check_open_ms`). Both
+`gripper_open` refuses past the 765 ms clamp (`Gripper.check_open_ms`). Both
 open and close refuse until homed, as the firmware does.
 
 ### `grip(ma=None, what="part", log_csv=None)`
@@ -2226,6 +2227,33 @@ so `plate_only=True` yields a capture that *can* span a grip and a release.
 (false - the board blocks) or `plate_only_spans_commands` (true). Only
 `imu_mark`, `imu_stop`, `stop` and `abort` are ever exempt, because only
 `ESTOP`/`ABORT`/`STOP` set the board's abort flag immediately.
+
+### Trial session
+
+`trials_begin(name, rate=None, dest=None, banner=None)`, `trial(trial,
+run_order, offset_mm, x, randomised, seed)`, `trial_phase(phase, x=None,
+z=None)`, `trial_burst(instant, samples, interval_ms, settle_s=0.0,
+phase=None)`, `trials_end()` - plus `gripper_home(op="trial_home")`,
+`grip(..., op="trial_grip")` and `release(..., op="trial_release")`, which
+send the same bookkeeping through the trial session's macros.
+
+SDL_Gcode `host/offset_trials.py` as a G-code program. The plate IMU streams
+for the whole run; the board IMU is captured in blocking bursts at stationary
+instants; every row is tagged with the trial context in force when it was
+taken. The Pi writes `<name>_<stamp>_plate.csv` and `<name>_<stamp>_pcb.csv`
+with offset_trials' own columns - `host/trial_session.py` imports them rather
+than restating them.
+
+Three refusals: a trial run while an IMU capture or run is open, and the
+reverse (both read the plate IMU over I2C), and `trials_end` while holding.
+`trials_begin` refuses a banner value containing whitespace, because a G-code
+parameter ends at the first space.
+
+The three `op` overrides exist because a G-code program cannot branch. The
+trial session does on the Pi what the program cannot: `trial_home` refuses
+while the BOARD reports holding (homing drives the jaws closed through the
+plate), `trial_grip` records the board's reply as `grip_status`, and
+`trial_burst` skips the raised and lowered captures after a refused grip.
 
 ## Finalize
 
