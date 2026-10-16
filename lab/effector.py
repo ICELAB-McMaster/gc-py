@@ -289,7 +289,10 @@ class Gripper(Effector):
     def __init__(self, cfg: config.ConfigFile) -> None:
         super().__init__(cfg)
         a = self.spec.get("actuator", {})
-        self.open_ms_max: int = int(a.get("open_ms_max", 850))
+        # The fallback is the SAFE value, not the historic one: a config that
+        # lost this key must not quietly get back the 850 that ran the jaws
+        # off the racks.
+        self.open_ms_max: int = int(a.get("open_ms_max", 765))
         self.grip_ma_default: int = int(a.get("grip_ma_default", 300))
         self.grip_ma_min: int = int(a.get("grip_ma_min", 100))
         self.grip_ma_max: int = int(a.get("grip_ma_max", 500))
@@ -297,6 +300,9 @@ class Gripper(Effector):
         h = self.spec.get("hold", {})
         self.hold_expires_s: float = float(h.get("expires_s", 140.0))
         self.hold_tier1_s: float = float(h.get("tier1_s", 20.0))
+        # Energised-hold budget over a rolling window, enforced by the board.
+        self.hold_duty_window_s: float = float(h.get("duty_window_s", 300.0))
+        self.hold_duty_max_s: float = float(h.get("duty_max_s", 150.0))
 
         self.requires_home: bool = bool(self.spec.get("requires_home", True))
         self.carries_labware: bool = bool(self.spec.get("carries_labware", True))
@@ -360,19 +366,32 @@ class Gripper(Effector):
                 f"this refuses rather than passing it on."
             )
 
-    def guard_dwell_ms(self, op: str) -> Optional[int]:
+    # Ops that grip, for guard purposes: the move after them is a lift.
+    _GRIP_OPS = frozenset({"grip", "trial_grip"})
+
+    def guard_dwell_ms(self, op: str, busy_ms: int = 0) -> Optional[int]:
         """How long to stall after a macro, while shell blocking is unproven.
 
         Returns None once `shell_command.blocks` is true. Until then a move
         following a gripper macro could start while the gripper is still
         running, which during a grip means lifting before the jaws have closed.
+
+        `busy_ms` is how long the host is known to be occupied by this command
+        beyond starting it - a board-IMU burst's settle plus its samples. The
+        board reads no command queue while it streams, so a guard shorter than
+        that would let the next GRIPPER_* command be queued behind the burst.
+
+        Ops in `shell_command.unguarded_ops` get no guard at all: they write a
+        context file and touch neither the gantry nor the board.
         """
         sc = self.spec.get("shell_command", {})
         if sc.get("blocks"):
             return None
-        if op == "grip":
-            return int(sc.get("guard_dwell_grip_ms", 2000))
-        return int(sc.get("guard_dwell_ms", 1500))
+        if op in sc.get("unguarded_ops", ()):
+            return None
+        if op in self._GRIP_OPS:
+            return int(sc.get("guard_dwell_grip_ms", 2000)) + int(busy_ms)
+        return int(sc.get("guard_dwell_ms", 1500)) + int(busy_ms)
 
     def station_z(self, station: str, key: str) -> float:
         """Commanded Z for this effector at a named deck station.

@@ -2150,6 +2150,157 @@ def test_imu_rate_is_set_and_is_one_rate_for_both_sensors():
               f"and must emit it, got {s.detail['line']!r}")
 
 
+def _pos_at(m, i):
+    """Where the gantry is at step i - macro steps carry no position, so it
+    is the target (`to`) of the last move before them."""
+    for s in reversed(m.steps[:i]):
+        if s.kind == "move" and s.to is not None:
+            return s.to
+    return None
+
+
+def _macro_ops(m):
+    """The gripper macro ops in emission order, without their guard dwells."""
+    return [s.op.split(":")[-1] for s in m.steps if s.kind == "macro"
+            and s.op.startswith("gripper:")]
+
+
+def test_trial_guard_policy():
+    """Context writes get no guard; a burst's guard covers the burst."""
+    g = eff_mod.load("gripper")
+    check(g.guard_dwell_ms("trial") is None, "trial writes a file - no guard")
+    check(g.guard_dwell_ms("trial_phase") is None, "phase - no guard")
+    check(g.guard_dwell_ms("imu_mark") == 1500,
+          "imu_mark keeps its guard: a mark still running when imu_stop "
+          "merges is a lost mark")
+    check(g.guard_dwell_ms("trial_grip") == g.guard_dwell_ms("grip"),
+          "a trial grip is followed by a lift exactly like a grip")
+    check(g.guard_dwell_ms("trial_burst", busy_ms=800) == 1500 + 800,
+          "the board reads no queue while it streams, so the guard must "
+          "cover the burst itself")
+
+
+def test_offset_trials_sequence_per_trial():
+    """Every trial: home, open, before_grip, GRIP, raised, lowered, RELEASE."""
+    import protocols.gripper_offset_trials as prot
+    m, _ = prot.build(trials=2, layout=TEST_LAYOUT, outdir=tempfile.mkdtemp(),
+                      plot=False)
+    ops = _macro_ops(m)
+    check(ops.count("trials_begin") == 1 and ops.count("trials_end") == 1,
+          f"one trial run per program, got {ops}")
+    check("home" not in ops and "grip" not in ops and "release" not in ops,
+          "every home, grip and release must go through the trial session - "
+          "the plain macros skip the holding check and the grip_status")
+    n = len(m.toggles["offsets_mm"]) * 2
+    check(ops.count("trial") == n, f"{n} trials, got {ops.count('trial')}")
+    # Cut the run into trials and check each one's order.
+    cuts = [i for i, op in enumerate(ops) if op == "trial"] + [len(ops)]
+    want = ["trial_home", "open", "trial_burst", "trial_grip",
+            "trial_burst", "trial_burst", "trial_release"]
+    for a, b in zip(cuts, cuts[1:]):
+        seq = [op for op in ops[a:b] if op in set(want)]
+        check(seq == want, f"trial order is {seq}, expected {want}")
+    bursts = [s.detail["instant"] for s in m.steps
+              if s.kind == "macro" and s.op == "gripper:trial_burst"]
+    check(bursts[:3] == ["before_grip", "raised", "lowered"],
+          f"bursts are before_grip, raised, lowered; got {bursts[:3]}")
+
+
+def test_offset_trials_releases_at_the_release_height_with_a_declared_drop():
+    import protocols.gripper_offset_trials as prot
+    m, _ = prot.build(trials=1, offsets="0", layout=TEST_LAYOUT,
+                      outdir=tempfile.mkdtemp(), plot=False)
+    rel = [i for i, s in enumerate(m.steps)
+           if s.kind == "macro" and s.op == "gripper:trial_release"]
+    check(rel, "the trial must release")
+    z = _pos_at(m, rel[0])[2]
+    check(abs(z - 100.0) < 1e-6,
+          f"release at the station's Z 100, got Z {z} - releasing at the "
+          f"approach would drop the plate the whole lift")
+    check(m.toggles["release_drop_mm"] == 7.0,
+          "grip 107 to release 100 is a declared 7 mm fall")
+
+
+def test_offset_trials_grip_depth_and_offsets_are_tunable():
+    """The two parameters this protocol exists to tune."""
+    import protocols.gripper_offset_trials as prot
+    m, _ = prot.build(grip_z=109.0, offsets="-10,0,15", trials=1,
+                      layout=TEST_LAYOUT, outdir=tempfile.mkdtemp(), plot=False)
+    grips = [_pos_at(m, i) for i, s in enumerate(m.steps)
+             if s.kind == "macro" and s.op == "gripper:trial_grip"]
+    xs = sorted(round(pos[0], 3) for pos in grips)
+    zs = {round(pos[2], 3) for pos in grips}
+    x0 = m.toggles["station_xy"][0]
+    check(xs == sorted(round(x0 + o, 3) for o in (-10, 0, 15)),
+          f"grips at centre + offset, got X {xs}")
+    check(zs == {109.0}, f"every grip at the tuned depth Z 109, got {zs}")
+
+
+def test_offset_trials_refuses_geometry_that_reads_backwards():
+    """+Z is DOWN. Each of these is the natural-looking mistake."""
+    import protocols.gripper_offset_trials as prot
+    kw = dict(layout=TEST_LAYOUT, outdir=tempfile.mkdtemp(), plot=False)
+    raises(ProtocolError, lambda: prot.build(grip_z=88.0, **kw),
+           "a grip ABOVE the approach (smaller Z) must refuse")
+    raises(ProtocolError, lambda: prot.build(release_z=108.0, **kw),
+           "a release BELOW the grip (larger Z) drives the plate into the "
+           "deck and must refuse")
+    raises(EffectorError, lambda: prot.build(open_ms=800, **kw),
+           "an open past the 765 ms firmware clamp must refuse")
+    raises(ProtocolError, lambda: prot.build(hold_s=6.0, **kw),
+           "a grip held past 80% of tier 1 must refuse")
+
+
+def test_offset_trials_order_is_offset_trials_order():
+    """Same seed, same order as host/offset_trials.py's build_plan.
+
+    The algorithm is restated here because the two files live in different
+    repos; this pins that the restatement still shuffles identically.
+    """
+    import random
+    import protocols.gripper_offset_trials as prot
+    plan = prot.build_plan([0, 20, 40], 5, True, 7)
+    ref = [{"offset_mm": o, "rep": r} for o in (0, 20, 40) for r in range(5)]
+    random.Random(7).shuffle(ref)
+    check([i["offset_mm"] for i in plan] == [i["offset_mm"] for i in ref],
+          "the shuffle must match offset_trials for the same seed")
+    check([i["trial"] for i in plan] == list(range(15)),
+          "trial numbers follow run order after the shuffle, as the script")
+    blocked = prot.build_plan([0, 20], 2, False, None)
+    check([i["offset_mm"] for i in blocked] == [0, 0, 20, 20],
+          "blocked order groups each offset")
+
+
+def test_offset_trials_paces_the_hold_duty():
+    """15 grips do not fit 120 s of hold per 300 s without waiting."""
+    import protocols.gripper_offset_trials as prot
+    m, _ = prot.build(layout=TEST_LAYOUT, outdir=tempfile.mkdtemp(), plot=False)
+    cool = [s for s in m.steps if s.op == "duty_cooldown"]
+    check(cool, "15 trials at the default settings need a duty cooldown")
+    span = m.toggles["energised_span_hi_s"]
+    budget = m.toggles["duty_budget_s"]
+    check(span * 15 > budget,
+          "the premise: 15 spans exceed one window's budget")
+    tight, _ = prot.build(duty_margin=0.4, layout=TEST_LAYOUT,
+                          outdir=tempfile.mkdtemp(), plot=False)
+    check(sum(tight.toggles["duty_cooldowns_s"])
+          > sum(m.toggles["duty_cooldowns_s"]),
+          "a smaller budget must wait longer")
+
+
+def test_trial_run_and_imu_capture_are_exclusive():
+    """Both read the plate IMU over I2C; two readers would interleave."""
+    m = _gripper_machine()
+    m.startup()
+    m.trials_begin("t")
+    raises(ProtocolError, lambda: m.gripper_imu_start(label="x"),
+           "an IMU capture during a trial run must refuse")
+    m.trials_end()
+    m.gripper_imu_start(label="x")
+    raises(ProtocolError, lambda: m.trials_begin("t2"),
+           "a trial run during an IMU capture must refuse")
+
+
 # ==========================================================================
 
 def main() -> int:

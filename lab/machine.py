@@ -80,6 +80,7 @@ class Machine:
         self._grip_dwell_s = 0.0
         self._imu_session: Optional[str] = None
         self._imu_run: Optional[str] = None
+        self._trials: Optional[str] = None
         self._imu_plate_only = False
 
         # ---- records -------------------------------------------------------
@@ -442,8 +443,13 @@ class Machine:
     # else is queued until the capture ends - see _gripper_macro.
     _DURING_CAPTURE = frozenset({"imu_mark", "imu_stop", "stop", "abort"})
 
-    def _gripper_macro(self, op: str, args: str = "", **detail: Any) -> None:
-        """Emit one GRIPPER_* macro, fenced by M400 and a guard dwell."""
+    def _gripper_macro(self, op: str, args: str = "", busy_ms: int = 0,
+                       **detail: Any) -> None:
+        """Emit one GRIPPER_* macro, fenced by M400 and a guard dwell.
+
+        `busy_ms` lengthens the guard by time the host is known to spend after
+        starting - see Gripper.guard_dwell_ms.
+        """
         eff = self._gripper()
         name = eff.macro(op)
         cc = eff.spec.get("capture_concurrency") or {}
@@ -475,7 +481,7 @@ class Machine:
             )
         self.wait()                                   # the gantry must arrive
         self._raw(f"{name} {args}".strip(), f"gripper:{op}", **detail)
-        ms = eff.guard_dwell_ms(op)
+        ms = eff.guard_dwell_ms(op, busy_ms=busy_ms)
         if ms:
             # Whether RUN_SHELL_COMMAND blocks is install-dependent and
             # untested here. Until it is, stall long enough that the next move
@@ -484,11 +490,15 @@ class Machine:
             # command was never in it, so an M400 here would wait for nothing.
             self.dwell(ms / 1000.0, op=f"gripper:{op}")
 
-    def gripper_home(self) -> None:
+    def gripper_home(self, op: str = "home") -> None:
         """Drive into the closed stop and call it zero. Required before motion.
 
         Cheap, about a second, and the only reference a timed open-loop
         mechanism has. Home again after any limit, abort or power cycle.
+
+        `op="trial_home"` sends it through the trial session, which refuses
+        to home while the BOARD reports holding - the check this method makes
+        from the program's own state, made again against the hardware's.
         """
         self._gripper()
         if self.gripper_holding is not None:
@@ -497,7 +507,7 @@ class Machine:
                 f"drives into the closed stop and the part is in the way. "
                 f"Lower and release first."
             )
-        self._gripper_macro("home")
+        self._gripper_macro(op)
         self.gripper_homed = True
 
     def _require_gripper_homed(self, what: str) -> Gripper:
@@ -534,7 +544,7 @@ class Machine:
             self._gripper_macro("close", f"MS={int(ms)}", ms=int(ms))
 
     def grip(self, ma: Optional[int] = None, what: str = "part",
-             log_csv: Optional[str] = None) -> None:
+             log_csv: Optional[str] = None, op: str = "grip") -> None:
         """Close onto a part and hold at `ma` milliamps.
 
         A grip is a controlled stall, not a clamp: there is no holding torque
@@ -553,7 +563,7 @@ class Machine:
         # at once - so the board's OWN current trace is how that transient is
         # captured instead.
         args = f"MA={ma}" + (f" LOG={log_csv}" if log_csv else "")
-        self._gripper_macro("grip", args, ma=ma, what=what, log_csv=log_csv)
+        self._gripper_macro(op, args, ma=ma, what=what, log_csv=log_csv)
         self.gripper_holding = what
         self._grip_z = self.g.get_z()
         self._grip_dwell_s = 0.0
@@ -561,7 +571,7 @@ class Machine:
         self.toggles["grips"] = self.toggles.get("grips", 0) + 1
 
     def release(self, max_drop_mm: float = 0.0,
-                log_csv: Optional[str] = None) -> None:
+                log_csv: Optional[str] = None, op: str = "release") -> None:
         """Stop holding and open enough to let go.
 
         "Never release at height" is the first rule in the gripper's API, and
@@ -604,7 +614,7 @@ class Machine:
                 f"lands on.",
             )
             self.toggles["release_drop_mm"] = drop
-        self._gripper_macro("release",
+        self._gripper_macro(op,
                             f"LOG={log_csv}" if log_csv else "",
                             what=self.gripper_holding, log_csv=log_csv)
         self.gripper_holding = None
@@ -626,6 +636,107 @@ class Machine:
         """
         self._require_homed("move_to_z()")
         self._move_z(z, feedrate or self.deck.feedrate("travel"), op)
+
+    # ---- trial session ---------------------------------------------------
+    #
+    # host/offset_trials.py's procedure and output, one step per macro: the
+    # plate IMU streams for the whole run, the board IMU is captured in bursts
+    # at stationary instants, and every row is tagged with the trial context
+    # in force when it was taken. Two files - <stem>_plate.csv and
+    # <stem>_pcb.csv - written exactly as offset_trials writes them.
+
+    def trials_begin(self, name: str, rate: Optional[int] = None,
+                     dest: Optional[str] = None,
+                     banner: Optional[Dict[str, Any]] = None) -> None:
+        """Open a trial run and start the plate IMU streaming.
+
+        `banner` goes to the run's log and changes nothing. Values must have
+        no spaces - they travel as G-code parameters.
+        """
+        self._gripper()
+        if self._trials is not None:
+            raise ProtocolError(f"a trial run is already open ({self._trials!r})")
+        if self._imu_session is not None or self._imu_run is not None:
+            raise ProtocolError(
+                "an IMU capture or run is open; the trial run streams the same "
+                "plate IMU and would be a second reader on its I2C bus"
+            )
+        parts = [f"NAME={name}"]
+        if rate:
+            parts.append(f"RATE={int(rate)}")
+        if dest:
+            parts.append(f"DEST={dest}")
+        for k, v in (banner or {}).items():
+            v = str(v)
+            if not v or any(c.isspace() for c in v):
+                raise ProtocolError(
+                    f"banner value {k}={v!r} is empty or has whitespace; a "
+                    f"G-code parameter ends at the first space"
+                )
+            parts.append(f"{k.upper()}={v}")
+        self._gripper_macro("trials_begin", " ".join(parts), name=name,
+                            rate=rate, dest=dest)
+        self._trials = name
+
+    def _require_trials(self, what: str) -> None:
+        if self._trials is None:
+            raise ProtocolError(f"{what} with no trial run open - trials_begin()")
+
+    def trial(self, trial: int, run_order: int, offset_mm: float, x: float,
+              randomised: bool, seed: Optional[int]) -> None:
+        """Set the trial context every following row is tagged with."""
+        self._gripper()
+        self._require_trials("trial()")
+        args = (f"TRIAL={int(trial)} RUN_ORDER={int(run_order)} "
+                f"OFFSET={offset_mm:g} X={x:g} "
+                f"RANDOMISED={1 if randomised else 0}"
+                + (f" SEED={seed}" if seed is not None else ""))
+        self._gripper_macro("trial", args, trial=trial, run_order=run_order,
+                            offset_mm=offset_mm, x=x)
+
+    def trial_phase(self, phase: str, x: Optional[float] = None,
+                    z: Optional[float] = None) -> None:
+        """Set the phase the plate rows are tagged with. Moves nothing."""
+        self._gripper()
+        self._require_trials("trial_phase()")
+        args = (f"PHASE={phase}" + (f" X={x:g}" if x is not None else "")
+                + (f" Z={z:g}" if z is not None else ""))
+        self._gripper_macro("trial_phase", args, phase=phase, x=x, z=z)
+
+    def trial_burst(self, instant: str, samples: int, interval_ms: int,
+                    settle_s: float = 0.0, phase: Optional[str] = None) -> None:
+        """A blocking board-IMU capture at a stationary instant.
+
+        The board runs this as a blocking loop and reads no command queue
+        until it ends, so the guard after it covers its whole duration.
+        """
+        self._gripper()
+        self._require_trials("trial_burst()")
+        if samples <= 0 or interval_ms <= 0:
+            raise ProtocolError(
+                f"a burst needs samples > 0 and interval_ms > 0, got "
+                f"{samples} x {interval_ms} ms"
+            )
+        busy = int(round(settle_s * 1000)) + int(samples) * int(interval_ms)
+        args = (f"INSTANT={instant} SAMPLES={int(samples)} "
+                f"INTERVAL_MS={int(interval_ms)} SETTLE={settle_s:g}"
+                + (f" PHASE={phase}" if phase else ""))
+        self._gripper_macro("trial_burst", args, busy_ms=busy, instant=instant,
+                            samples=samples, interval_ms=interval_ms,
+                            settle_s=settle_s, phase=phase)
+        self.toggles["trial_bursts"] = self.toggles.get("trial_bursts", 0) + 1
+
+    def trials_end(self) -> None:
+        """Stop streaming, write the counts, copy both files to the share."""
+        self._gripper()
+        self._require_trials("trials_end()")
+        if self.gripper_holding is not None:
+            raise ProtocolError(
+                f"trials_end() while holding {self.gripper_holding!r} - put "
+                f"it down first"
+            )
+        self._gripper_macro("trials_end")
+        self._trials = None
 
     def gripper_imu_run_begin(self, name: str,
                               dest: Optional[str] = None) -> None:
@@ -701,6 +812,12 @@ class Machine:
         mean.
         """
         self._gripper()
+        if self._trials is not None:
+            raise ProtocolError(
+                f"a trial run ({self._trials!r}) is streaming the plate IMU; "
+                f"an IMU capture would be a second reader on the same I2C "
+                f"sensor. The trial run records both IMUs already."
+            )
         if self._imu_session is not None:
             raise ProtocolError(
                 f"an IMU capture is already open ({self._imu_session!r}); "
