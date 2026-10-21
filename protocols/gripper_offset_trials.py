@@ -218,9 +218,13 @@ def build(
         )
     drop_mm = z_grip - z_release
 
-    if randomise and seed is None:
-        # Generated and recorded, as the script does. It makes this slice
-        # unrepeatable unless the printed seed is passed back in.
+    if seed is None:
+        # ALWAYS generated and recorded, as offset_trials does - including for
+        # a blocked run, where it changes nothing but still lands in the seed
+        # column. It also keeps every GRIPPER_TRIAL carrying a SEED: the
+        # macro installed before 2026-10-21 rendered a bare "--seed" without
+        # one, which failed every trial and left the whole run's rows
+        # untagged. Pass --seed back in to slice the identical program.
         seed = random.randrange(2 ** 32)
     plan = build_plan(offs, trials, randomise, seed)
 
@@ -308,7 +312,7 @@ def build(
     })
 
     m.note(f"{m_name}: {len(offs)} offsets x {trials} = {len(plan)} trials, "
-           f"{'randomised, seed ' + str(seed) if randomise else 'blocked order'}")
+           f"{'randomised' if randomise else 'blocked order'}, seed {seed}")
     m.note(f"centre X {st.xy[0]:g}, Y {st.xy[1]:g}; offsets {offs} -> X "
            + ", ".join(f"{st.xy[0] + o:g}" for o in offs))
     m.note(f"Z approach {z_approach:g}, grip {z_grip:g}, release "
@@ -330,7 +334,7 @@ def build(
         "release_z": f"{z_release:g}", "ma": int(grip_ma),
         "hold": f"{hold_s:g}", "randomise": 1 if randomise else 0,
         "board_interval_ms": board_interval_ms,
-        **({"seed": seed} if seed is not None else {}),
+        "seed": seed,
     })
 
     clock = 0.0
@@ -413,8 +417,8 @@ def summarise(m: Machine, result) -> None:
     print()
     print(f"  {t['trial_count']} trials: offsets {t['offsets_mm']} x "
           f"{t['trials_per_offset']}, "
-          + (f"randomised, seed {t['seed']}" if t["randomise"]
-             else "blocked order"))
+          + ("randomised" if t["randomise"] else "blocked order")
+          + f", seed {t['seed']}")
     x0 = t["station_xy"][0]
     print(f"  X {', '.join(f'{x0 + o:g}' for o in t['offsets_mm'])} at "
           f"Y {t['station_xy'][1]:g}")
@@ -477,7 +481,9 @@ def main(argv=None) -> int:
     order = ap.add_argument_group("order")
     order.add_argument("--randomise", action="store_true")
     order.add_argument("--seed", type=int, default=None,
-                       help="generated and printed if --randomise and not given")
+                       help="generated and printed if not given, randomised "
+                            "or not, as offset_trials. Pass it back to slice "
+                            "the identical program")
 
     smp = ap.add_argument_group("sampling and pacing")
     smp.add_argument("--rate", type=int, default=RATE_HZ, dest="rate_hz",

@@ -2288,6 +2288,30 @@ def test_offset_trials_paces_the_hold_duty():
           "a smaller budget must wait longer")
 
 
+def test_offset_trials_every_trial_carries_a_seed():
+    """Blocked order included - as offset_trials records one.
+
+    The GRIPPER_TRIAL macro installed before 2026-10-21 rendered a bare
+    "--seed" when SEED was missing; argparse rejected it, every trial
+    failed, and the whole run's rows lost their trial tags. A SEED on every
+    call is what offset_trials writes anyway, and it works on both macros.
+    """
+    import protocols.gripper_offset_trials as prot
+    m, _ = prot.build(trials=1, layout=TEST_LAYOUT,
+                      outdir=tempfile.mkdtemp(), plot=False)
+    check(m.toggles["seed"] is not None, "a blocked run must still get a seed")
+    lines = [s.detail["line"] for s in m.steps if s.kind == "macro"
+             and s.op in ("gripper:trial", "gripper:trials_begin")]
+    check(lines, "the program must open a run and start trials")
+    for ln in lines:
+        check(f"SEED={m.toggles['seed']}" in ln,
+              f"every trial and the run banner carry the seed: {ln}")
+    again, _ = prot.build(trials=1, seed=m.toggles["seed"], layout=TEST_LAYOUT,
+                          outdir=tempfile.mkdtemp(), plot=False)
+    check(again.toggles["seed"] == m.toggles["seed"],
+          "passing the printed seed back reproduces it")
+
+
 def test_trial_run_and_imu_capture_are_exclusive():
     """Both read the plate IMU over I2C; two readers would interleave."""
     m = _gripper_machine()
