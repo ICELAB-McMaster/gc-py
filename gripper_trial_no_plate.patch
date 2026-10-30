@@ -1,0 +1,102 @@
+diff --git a/Gripper/host/trial_session.py b/Gripper/host/trial_session.py
+index babc202..3cefd6a 100644
+--- a/Gripper/host/trial_session.py
++++ b/Gripper/host/trial_session.py
+@@ -72,7 +72,7 @@ import protocol as p         # noqa: E402
+ 
+ # Bump whenever this file changes; every command prints it, so a stale copy on
+ # the Pi shows up as a wrong version rather than as a confusing failure.
+-VERSION = "2026-10-21.1"
++VERSION = "2026-10-26.1"
+ 
+ STATE = os.environ.get("GRIPPER_TRIAL_STATE", "/tmp/gripper_trials.json")
+ CTX = os.environ.get("GRIPPER_TRIAL_CTX", "/tmp/gripper_trials_ctx.json")
+@@ -337,9 +337,14 @@ def cmd_begin(args):
+                 "%.1f mm" % (drop, drop))
+     if args.ma:
+         log("  grip %d mA, hold %.1f s" % (args.ma, args.hold or 0.0))
+-    log("  plate IMU %d Hz throughout; board IMU in bursts at before_grip, "
+-        "raised, lowered" % args.rate)
+-    log("  -> %s_plate.csv, %s_pcb.csv" % (stem, stem))
++    if args.no_plate:
++        log("  plate IMU NOT recorded (--no-plate); board IMU in bursts at "
++            "before_grip, raised, lowered")
++        log("  -> %s_pcb.csv" % stem)
++    else:
++        log("  plate IMU %d Hz throughout; board IMU in bursts at "
++            "before_grip, raised, lowered" % args.rate)
++        log("  -> %s_plate.csv, %s_pcb.csv" % (stem, stem))
+ 
+     # The PCB file gets its header once; every burst appends.
+     with open(stem + "_pcb.csv", "w", newline="", encoding="utf-8") as fh:
+@@ -350,7 +355,7 @@ def cmd_begin(args):
+     # commits the gantry - except here the gantry is NOT stopped by a failure,
+     # because a shell command cannot stop the program that called it. So it
+     # says so as loudly as it can.
+-    if not FAKE:
++    if not FAKE and not args.no_plate:
+         try:
+             from grip_imu import PiIMU
+             imu = PiIMU(args.i2c_bus)
+@@ -395,6 +400,15 @@ def cmd_begin(args):
+             "grips will fail." % exc)
+         ok = False
+ 
++    if args.no_plate:
++        # No sampler at all: st["pid"] stays None, and end then skips the stop
++        # handshake and reports the plate as not recorded.
++        if not ok:
++            log("!! PREFLIGHT FAILED - the program will continue, because "
++                "nothing here can stop it. Cancel the print if this run "
++                "matters.")
++        return 0 if ok else 1
++
+     # The sampler, in its own session so end's signal reaches only it.
+     cmd = [sys.executable, os.path.abspath(__file__), "_stream",
+            "--csv", stem + "_plate.csv", "--rate", str(args.rate),
+@@ -590,7 +604,10 @@ def cmd_end(args):
+         pass
+ 
+     log("")
+-    log("plate: %s rows -> %s" % (count.get("rows", "?"), plate))
++    if st.get("pid") or os.path.exists(plate):
++        log("plate: %s rows -> %s" % (count.get("rows", "?"), plate))
++    else:
++        log("plate: not recorded (--no-plate)")
+     log("pcb:   %d rows -> %s" % (pcb_rows, pcb))
+     if count.get("errors"):
+         log("!! %d I2C read error(s) during the run" % count["errors"])
+@@ -636,6 +653,9 @@ def main(argv=None):
+     b.add_argument("--hold", type=float, default=None)
+     b.add_argument("--seed", nargs="?", const="", default="")
+     b.add_argument("--randomise", type=int, default=0)
++    b.add_argument("--no-plate", action="store_true",
++                   help="record the board (PCB) IMU only; no plate stream, "
++                        "no plate IMU check, no _plate.csv")
+     b.set_defaults(func=cmd_begin)
+ 
+     s = sub.add_parser("_stream")
+diff --git a/Gripper/klipper/gripper_macros.cfg b/Gripper/klipper/gripper_macros.cfg
+index 952c236..7758d85 100644
+--- a/Gripper/klipper/gripper_macros.cfg
++++ b/Gripper/klipper/gripper_macros.cfg
+@@ -89,7 +89,7 @@ description: Print which copy of this file Klipper actually loaded. Moves
+              easy to leave behind when the repo moves - symlink it instead of
+              copying and this can never disagree.
+ gcode:
+-    { action_respond_info("gripper_macros 2026-10-21.1") }
++    { action_respond_info("gripper_macros 2026-10-26.1") }
+ 
+ 
+ [gcode_macro GRIPPER_PING]
+@@ -205,6 +205,10 @@ gcode:
+             {% set ns.args = ns.args ~ " --" ~ key|lower|replace("_", "-") ~ " " ~ params[key] %}
+         {% endif %}
+     {% endfor %}
++    # PLATE=0 records the board IMU only: no plate stream, no _plate.csv.
++    {% if "PLATE" in params and not params.PLATE|int %}
++        {% set ns.args = ns.args ~ " --no-plate" %}
++    {% endif %}
+     RUN_SHELL_COMMAND CMD=gripper_trials PARAMS="{ns.args}"
+ 
+ 

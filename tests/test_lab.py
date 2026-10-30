@@ -2312,6 +2312,19 @@ def test_offset_trials_every_trial_carries_a_seed():
           "passing the printed seed back reproduces it")
 
 
+def test_offset_trials_no_plate_sends_plate_0():
+    """--no-plate must reach the Pi; the default must not send it."""
+    import protocols.gripper_offset_trials as prot
+    kw = dict(trials=1, offsets="0", layout=TEST_LAYOUT, plot=False)
+    for plate, want in ((False, True), (True, False)):
+        m, _ = prot.build(plate_imu=plate, outdir=tempfile.mkdtemp(), **kw)
+        begin = [s.detail["line"] for s in m.steps if s.kind == "macro"
+                 and s.op == "gripper:trials_begin"]
+        check(("PLATE=0" in begin[0]) == want,
+              f"plate_imu={plate}: PLATE=0 {'missing' if want else 'sent'} "
+              f"in {begin[0]}")
+
+
 def test_trial_run_and_imu_capture_are_exclusive():
     """Both read the plate IMU over I2C; two readers would interleave."""
     m = _gripper_machine()

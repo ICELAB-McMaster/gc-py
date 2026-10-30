@@ -1,0 +1,92 @@
+From 8a6a92314fded5be7233ed864d38b6a027317559 Mon Sep 17 00:00:00 2001
+From: NicholasGrzelak <113268413+NicholasGrzelak@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 15:48:19 -0400
+Subject: [PATCH] gripper: GRIPPER_TRIAL no longer drops the trial context
+ without a seed
+
+A blocked (not randomised) offset-trials run has no seed, and GRIPPER_TRIAL
+rendered "--seed" followed by nothing. argparse rejected it - "argument
+--seed: expected one argument" - so the trial command failed on EVERY trial
+and no row of that run was tagged with its trial, run_order, offset_mm or
+condition. Phase, x_mm and z_mm were still written, by the phase command.
+
+Seen on the bench 2026-10-21. The render check before release only ever
+supplied SEED, which is why it passed.
+
+Fixed at both ends: the macro appends --seed only when SEED is given, and
+trial_session accepts a bare --seed as "no seed", because an argument error
+here costs a whole trial's context and a blank costs nothing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Gripper/host/trial_session.py      |  8 +++++---
+ Gripper/klipper/gripper_macros.cfg | 13 +++++++++++--
+ 2 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/Gripper/host/trial_session.py b/Gripper/host/trial_session.py
+index 12b637a..babc202 100644
+--- a/Gripper/host/trial_session.py
++++ b/Gripper/host/trial_session.py
+@@ -72,7 +72,7 @@ import protocol as p         # noqa: E402
+ 
+ # Bump whenever this file changes; every command prints it, so a stale copy on
+ # the Pi shows up as a wrong version rather than as a confusing failure.
+-VERSION = "2026-10-16.1"
++VERSION = "2026-10-21.1"
+ 
+ STATE = os.environ.get("GRIPPER_TRIAL_STATE", "/tmp/gripper_trials.json")
+ CTX = os.environ.get("GRIPPER_TRIAL_CTX", "/tmp/gripper_trials_ctx.json")
+@@ -634,7 +634,7 @@ def main(argv=None):
+     b.add_argument("--release-z", type=float, default=None)
+     b.add_argument("--ma", type=int, default=None)
+     b.add_argument("--hold", type=float, default=None)
+-    b.add_argument("--seed", default="")
++    b.add_argument("--seed", nargs="?", const="", default="")
+     b.add_argument("--randomise", type=int, default=0)
+     b.set_defaults(func=cmd_begin)
+ 
+@@ -651,7 +651,9 @@ def main(argv=None):
+     t.add_argument("--offset", type=float, required=True)
+     t.add_argument("--x", type=float, default=None)
+     t.add_argument("--randomised", type=int, default=0)
+-    t.add_argument("--seed", default="")
++    # nargs="?": a bare --seed means no seed, not an error. An error here
++    # loses the context of a whole trial, which is far worse than a blank.
++    t.add_argument("--seed", nargs="?", const="", default="")
+     t.set_defaults(func=cmd_trial)
+ 
+     ph = sub.add_parser("phase")
+diff --git a/Gripper/klipper/gripper_macros.cfg b/Gripper/klipper/gripper_macros.cfg
+index 7098534..952c236 100644
+--- a/Gripper/klipper/gripper_macros.cfg
++++ b/Gripper/klipper/gripper_macros.cfg
+@@ -89,7 +89,7 @@ description: Print which copy of this file Klipper actually loaded. Moves
+              easy to leave behind when the repo moves - symlink it instead of
+              copying and this can never disagree.
+ gcode:
+-    { action_respond_info("gripper_macros 2026-10-16.1") }
++    { action_respond_info("gripper_macros 2026-10-21.1") }
+ 
+ 
+ [gcode_macro GRIPPER_PING]
+@@ -212,7 +212,16 @@ gcode:
+ description: Start a trial: set the trial number, run order, X offset and
+              seed every row is tagged with until the next GRIPPER_TRIAL.
+ gcode:
+-    RUN_SHELL_COMMAND CMD=gripper_trials PARAMS="trial --trial {params.TRIAL|int} --run-order {params.RUN_ORDER|int} --offset {params.OFFSET} --x {params.X} --randomised {params.RANDOMISED|default(0)|int} --seed {params.SEED|default('')}"
++    # SEED only when given: a blocked run has none, and "--seed" followed by
++    # nothing is an argparse error that dropped the context of EVERY trial
++    # (2026-10-21).
++    {% set args = "trial --trial %d --run-order %d --offset %s --x %s --randomised %d"
++        % (params.TRIAL|int, params.RUN_ORDER|int, params.OFFSET, params.X,
++           params.RANDOMISED|default(0)|int) %}
++    {% if "SEED" in params and params.SEED %}
++        {% set args = args ~ " --seed " ~ params.SEED %}
++    {% endif %}
++    RUN_SHELL_COMMAND CMD=gripper_trials PARAMS="{args}"
+ 
+ 
+ [gcode_macro GRIPPER_TRIAL_PHASE]
+-- 
+2.54.0.windows.1
+

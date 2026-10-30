@@ -2,7 +2,8 @@
 
     python protocols/gripper_offset_trials.py                         # 0,20,40 x 5
     python protocols/gripper_offset_trials.py --grip-z 108 --offsets 0,10,20,30
-    python protocols/gripper_offset_trials.py --trials 3 --randomise --seed 7
+    python protocols/gripper_offset_trials.py --trials 3 --seed 7   # same order again
+    python protocols/gripper_offset_trials.py --blocked              # all of each offset together
 
 The sliced form of SDL_Gcode `Gripper/host/offset_trials.py`. The procedure
 and the data are that script's; the coordinates, heights and sequence are
@@ -75,12 +76,13 @@ from lab.machine import Machine, ProtocolError
 
 # ---- design constants ---------------------------------------------------
 STATION = "gripper_pick_9"
-OFFSETS = "0,20,40"       # mm in X from the station centre, signed allowed
-TRIALS = 5                # per offset, as offset_trials
+#OFFSETS = "0,-20,-40"       # mm in X from the station centre, signed allowed
+OFFSETS = "0"       # mm in X from the station centre, signed allowed
+TRIALS = 30                # per offset, as offset_trials
 GRIP_MA = 500
-HOLD_S = 1.0              # gripper_station9_test's hold, not the script's 3
+HOLD_S = 0.6              # gripper_station9_test's hold, not the script's 3
 POST_RELEASE_S = 1.0
-SETTLE_S = 0.4            # before the before_grip burst
+SETTLE_S = 0.3            # before the before_grip burst
 SETTLE_RAISED_S = 0.3     # before the raised and lowered bursts
 RATE_HZ = 50              # plate stream; orientation work
 BOARD_SAMPLES = 25        # x 20 ms = 0.5 s, the same span as the script's
@@ -146,7 +148,7 @@ def build(
     settle_s: float = SETTLE_S,
     settle_raised_s: float = SETTLE_RAISED_S,
     open_ms: int | None = None,
-    randomise: bool = False,
+    randomise: bool = True,
     seed: int | None = None,
     rate_hz: int = RATE_HZ,
     board_samples: int = BOARD_SAMPLES,
@@ -154,6 +156,7 @@ def build(
     z_feed: int | None = None,
     duty_margin: float = DUTY_MARGIN,
     dest_dir: str | None = None,
+    plate_imu: bool = True,
     layout: str = "layout.json",
     outdir: str = ".",
     plot: bool = True,
@@ -308,7 +311,7 @@ def build(
         "board_interval_ms": board_interval_ms,
         "energised_span_hi_s": round(span_hi, 2),
         "duty_budget_s": budget, "duty_window_s": window,
-        "data_name": data_name,
+        "data_name": data_name, "plate_imu": plate_imu,
     })
 
     m.note(f"{m_name}: {len(offs)} offsets x {trials} = {len(plan)} trials, "
@@ -326,7 +329,8 @@ def build(
     # ---- generate --------------------------------------------------------
     m.gripper_preflight()                 # before G28, see that method
     m.startup()
-    m.trials_begin(data_name, rate=rate_hz, dest=dest_dir, banner={
+    m.trials_begin(data_name, rate=rate_hz, dest=dest_dir,
+                   plate=plate_imu, banner={
         "centre_x": f"{st.xy[0]:g}",
         "offsets": ",".join(f"{o:g}" for o in offs),
         "trials": trials, "trials_total": len(plan),
@@ -434,10 +438,15 @@ def summarise(m: Machine, result) -> None:
               f"inside {t['duty_budget_s']:g} s of hold per "
               f"{t['duty_window_s']:g} s")
     print(f"  at least ~{t['estimated_minutes_lo']:g} min (a lower bound)")
-    print(f"  plate IMU {t['rate_hz']} Hz throughout; board IMU "
-          f"{t['board_samples']} x {t['board_interval_ms']} ms at before_grip, "
-          f"raised, lowered")
-    print(f"  -> {t['data_name']}_<stamp>_plate.csv, _pcb.csv, .log on the Pi")
+    board = (f"board IMU {t['board_samples']} x {t['board_interval_ms']} ms "
+             f"at before_grip, raised, lowered")
+    if t.get("plate_imu", True):
+        print(f"  plate IMU {t['rate_hz']} Hz throughout; {board}")
+        print(f"  -> {t['data_name']}_<stamp>_plate.csv, _pcb.csv, .log "
+              f"on the Pi")
+    else:
+        print(f"  plate IMU NOT recorded (--no-plate); {board}")
+        print(f"  -> {t['data_name']}_<stamp>_pcb.csv, .log on the Pi")
 
     report = result["report"]
     if report.warnings:
@@ -479,7 +488,15 @@ def main(argv=None) -> int:
                            "board's own. Refused past 765 ms")
 
     order = ap.add_argument_group("order")
-    order.add_argument("--randomise", action="store_true")
+    # Randomised by DEFAULT, in the slicer: the shuffled order is fixed in the
+    # G-code, so the run order is known before anything moves. Blocked order
+    # confounds the offset with time - drift, warm-up, plate wear - which is
+    # the one thing an offset comparison must not do.
+    order.add_argument("--blocked", dest="randomise", action="store_false",
+                       help="run each offset's trials together instead of "
+                            "shuffling them (shuffled is the default)")
+    order.add_argument("--randomise", dest="randomise", action="store_true",
+                       default=True, help=argparse.SUPPRESS)
     order.add_argument("--seed", type=int, default=None,
                        help="generated and printed if not given, randomised "
                             "or not, as offset_trials. Pass it back to slice "
@@ -504,6 +521,10 @@ def main(argv=None) -> int:
     io.add_argument("--dest-dir", default=None, dest="dest_dir",
                     help="where the Pi copies the data (default the NAS, "
                          "/mnt/nas/GC_ARCCS/GripperIMU). Forward slashes")
+    io.add_argument("--no-plate", dest="plate_imu", action="store_false",
+                    help="record the board (PCB) IMU only - no plate stream "
+                         "and no _plate.csv. Needs trial_session 2026-10-26.1 "
+                         "on the Pi")
     io.add_argument("--layout", default="layout.json")
     io.add_argument("--outdir", default=".")
     io.add_argument("--no-plot", dest="plot", action="store_false")
@@ -522,6 +543,7 @@ def main(argv=None) -> int:
             board_samples=a.board_samples,
             board_interval_ms=a.board_interval_ms, z_feed=a.z_feed,
             duty_margin=a.duty_margin, dest_dir=a.dest_dir,
+            plate_imu=a.plate_imu,
             layout=a.layout, outdir=a.outdir, plot=a.plot, strict=a.strict,
         )
     except LabError as exc:

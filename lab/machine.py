@@ -647,11 +647,16 @@ class Machine:
 
     def trials_begin(self, name: str, rate: Optional[int] = None,
                      dest: Optional[str] = None,
-                     banner: Optional[Dict[str, Any]] = None) -> None:
+                     banner: Optional[Dict[str, Any]] = None,
+                     plate: bool = True) -> None:
         """Open a trial run and start the plate IMU streaming.
 
         `banner` goes to the run's log and changes nothing. Values must have
         no spaces - they travel as G-code parameters.
+
+        `plate=False` records the board (PCB) IMU only: PLATE=0, which needs
+        trial_session 2026-10-26.1 or later on the Pi. An older Pi ignores
+        the parameter and streams the plate anyway - wasteful, not unsafe.
         """
         self._gripper()
         if self._trials is not None:
@@ -666,6 +671,8 @@ class Machine:
             parts.append(f"RATE={int(rate)}")
         if dest:
             parts.append(f"DEST={dest}")
+        if not plate:
+            parts.append("PLATE=0")
         for k, v in (banner or {}).items():
             v = str(v)
             if not v or any(c.isspace() for c in v):
@@ -675,7 +682,7 @@ class Machine:
                 )
             parts.append(f"{k.upper()}={v}")
         self._gripper_macro("trials_begin", " ".join(parts), name=name,
-                            rate=rate, dest=dest)
+                            rate=rate, dest=dest, plate=plate)
         self._trials = name
 
     def _require_trials(self, what: str) -> None:

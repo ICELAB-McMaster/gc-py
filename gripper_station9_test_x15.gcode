@@ -1,0 +1,591 @@
+; gripper_station9_test_x15: gripper pick at gripper_pick_9, 15 cycle(s)
+; XY (69.5, 178.2); approach Z 90, grip Z 107, release Z 100 (+Z is DOWN)
+; grip at 500 mA, hold 1 s at Z 90
+; WARNING the release is 7 mm ABOVE the grip, so the part FALLS 7 mm. Declared deliberately.
+; IMU -> ONE csv for the whole run, ~/gripper_captures/gripper_station9_test_x15_<stamp>.csv, at 50 Hz on both sensors. Long format: every row has source=PCB (board IMU, over CAN), source=plate (the Pi's I2C IMU on the plate carrier) or source=mark (a phase label). There is no separate marks file
+; the 15 cycles are 15 separate captures - the board cannot be commanded while it streams, so each one ends before its grip - appended into that one file. The `capture` column names the cycle and t_s restarts within each; order the run by wall_clock
+; both IMUs, spanning the GANTRY motion only - the grip and release sit outside the capture and their transients come from their own --log CSVs. --imu-mode spanning trades the board IMU for a capture that covers them
+; IMU start/stop needs host/imu_session.py, which is NEW and has never been run on hardware
+; PREFLIGHT - if any line below reports 'Unknown command', STOP: gripper_macros.cfg is not included from printer.cfg and nothing in this file will actually grip. If the version printed is older than you expect, the INSTALLED copy has drifted from the repo. See docs/LAB.md.
+M400 
+GRIPPER_MACROS_VERSION
+G4 P1500
+M400 
+GRIPPER_PING
+G4 P1500
+M400 
+GRIPPER_STATUS
+G4 P1500
+G28 Z
+G28 X Y
+G0 F6000 Z5
+M400 
+M400 
+GRIPPER_IMU_RUN_BEGIN NAME=gripper_station9_test_x15
+G4 P1500
+G0 F6000 X69.5 Y0 Z5
+G0 F6000 X69.5 Y178.2 Z5
+; --- pick 1 of 15 ---
+G0 F6000 Z90
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_01_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_01 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick01_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick01_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick01_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick01_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_01_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 2 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_02_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_02 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick02_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick02_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick02_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick02_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_02_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 3 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_03_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_03 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick03_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick03_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick03_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick03_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_03_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 4 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_04_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_04 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick04_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick04_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick04_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick04_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_04_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 5 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_05_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_05 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick05_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick05_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick05_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick05_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_05_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 6 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_06_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_06 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick06_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick06_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick06_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick06_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_06_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 7 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_07_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_07 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick07_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick07_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick07_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick07_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_07_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 8 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_08_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_08 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick08_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick08_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick08_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick08_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_08_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 9 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_09_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_09 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick09_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick09_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick09_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick09_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_09_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 10 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_10_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_10 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick10_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick10_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick10_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick10_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_10_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 11 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_11_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_11 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick11_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick11_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick11_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick11_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_11_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 12 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_12_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_12 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick12_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick12_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick12_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick12_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_12_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 13 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_13_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_13 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick13_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick13_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick13_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick13_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_13_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 14 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_14_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_14 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick14_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick14_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick14_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick14_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_14_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+; --- pick 15 of 15 ---
+M400 
+GRIPPER_HOME
+G4 P1500
+M400 
+GRIPPER_OPEN
+G4 P1500
+G0 F6000 Z107
+M400 
+GRIPPER_GRIP MA=500 LOG=~/gripper_captures/gripper_station9_test_x15_15_grip.csv
+G4 P2000
+M400 
+GRIPPER_IMU_START LABEL=gripper_station9_test_x15_15 RATE=50
+G4 P1500
+M400 
+GRIPPER_IMU_MARK LABEL=pick15_gripped_500ma_z107
+G4 P1500
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_MARK LABEL=pick15_lifted_z90
+G4 P1500
+G4 P1000
+M400 
+GRIPPER_IMU_MARK LABEL=pick15_held_1s
+G4 P1500
+G0 F6000 Z100
+M400 
+GRIPPER_IMU_MARK LABEL=pick15_at_release_z100
+G4 P1500
+M400 
+GRIPPER_IMU_STOP
+G4 P1500
+M400 
+GRIPPER_RELEASE LOG=~/gripper_captures/gripper_station9_test_x15_15_release.csv
+G4 P1500
+G4 P1000
+G0 F6000 Z90
+M400 
+GRIPPER_IMU_RUN_END
+G4 P1500
+G0 F6000 Z5
+G0 F6000 X420 Y178.2 Z5
+G0 F6000 X420 Y0 Z5
+G0 F6000 Z0
+M400 

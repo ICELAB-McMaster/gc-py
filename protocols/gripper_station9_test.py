@@ -91,7 +91,7 @@ DEST_DIR = None
 #          cost of the board IMU, since only the plate IMU can record
 #          through a command.
 IMU_MODE = "gantry"
-CYCLES = 1
+CYCLES = 5
 
 
 def build(
