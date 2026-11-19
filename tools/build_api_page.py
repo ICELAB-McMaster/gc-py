@@ -5,7 +5,9 @@ import re
 import tempfile
 from pathlib import Path
 
-REPO = Path(r"C:\Users\Nicholas\Documents\gc-py")
+# The repo this script lives in, not a fixed path: a fixed path built the
+# page from whichever branch the main checkout happened to have out.
+REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "docs/API.md"
 OUT = Path(__file__).resolve().parent / "lab_api_reference.html"
 
