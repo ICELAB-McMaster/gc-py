@@ -3,7 +3,7 @@
 Every public function in the library: what it does, what it raises, and - the
 part worth reading - what mistake it exists to prevent.
 
-Regenerated from the source on 2026-09-08, with the gripper layer added 2026-10-06. If the code and this file disagree,
+Regenerated from the source on 2026-09-08, with the gripper layer added 2026-10-06 and the protocols section added 2026-11-19. If the code and this file disagree,
 the code is right and this file is stale; `tests/test_lab.py` and
 `tests/test_review_fixes.py` are the executable version of the same claims.
 
@@ -58,7 +58,11 @@ protocols/
   gripper_plate_test.py     pick a plate, lift, read the IMU, put it back
   gripper_station9_test.py  pick at station 9, IMU through the pick
   gripper_offset_trials.py  offset_trials.py sliced: X misalignment vs pick
+  plate_two_rows.py         fill rows A and B of a plate: 100 / 200 uL
 ```
+
+Every protocol is described, with its defaults and flags, under
+[Protocols](#protocols) below.
 
 Data flows one way: `config` -> `labware`/`effector` -> `deck` -> `machine`,
 with `simulate` observing every step `machine` produces and `logbook` recording
@@ -130,6 +134,175 @@ protocol catches one class:
 | `SimulationError` | a hard safety check failed; the gcode is not written |
 
 ---
+
+## Protocols
+
+A protocol is a procedure and nothing else: no coordinates, no millimetres.
+Each one has the same shape - module constants for its design defaults, a
+keyword-only `build(...)` that returns `(machine, result)`, a `summarise()`
+that prints the run, and a `main()` that prints `REFUSED: <reason>` and exits
+1 on any `LabError`.
+
+Every run writes, to `--outdir` (default the current folder), and **only if
+simulation passes**:
+
+| file | what |
+|---|---|
+| `<name>.gcode` | the program |
+| `<name>.manifest.json` | every toggle, warning and config hash - the run's record |
+| `<name>.toolpath.png` | the path drawn over the deck, unless `--no-plot` |
+
+Flags common to all of them: `--effector`, `--name`, `--layout`
+(default `layout.json`, the bench as it stands), `--outdir`, `--no-plot`, and
+`--lenient` (collect every simulation error instead of stopping at the first -
+it still refuses to write the gcode).
+
+### `accuracy_test.py` - ISO 8655 accuracy and repeatability
+
+Gravimetric test of any pipette: 4 volumes (10, 50, 75 and 100 % of the
+effector's maximum) x `--replicates` (5), dispensed into tubes on a balance.
+
+| flag | default | |
+|---|---|---|
+| `--effector` | *required* | `p300`, `p125` |
+| `--tubes` | `tubes` | placement holding the tube rack |
+| `--replicates` | 5 | per volume |
+| `--col-offset` | 0 | column the replicate block starts at |
+| `--shuffle`, `--seed` | off | shuffles the visiting order only |
+| `--no-tip`, `--no-prewet`, `--no-wipe`, `--no-temp-log` | | |
+| `--eject-tip` | **off** | the ejector is unvalidated; fit a fresh tip by hand |
+
+Needs a `tubes` placement (the 0.65 mL rack). The bench layout has not had
+one since the centrifuge tests, so today it refuses with
+`no placement named 'tubes'`; `--layout layout_test.json` slices it against
+the test fixture.
+
+### `centrifuge_test.py` - two plates, one source each, equal mass
+
+Builds a diluted stock in the 1.5 mL tube and loads two plates to equal mass.
+**Preload the tube by hand with 50 uL** first.
+
+| stage | action | uL | tube after |
+|---|---|---|---|
+| 1-2 | water -> plate 1, D6 and E7 | 150 each | 50 |
+| 3 | water -> tube (`big_tubes` A1) | 300 | 350 |
+| 4 | mix at the tube bottom, 5 x 200 uL | - | 350 |
+| 5-6 | tube -> plate 2, D6 and E7 | 150 each | 50 |
+
+Each plate ends with 300 uL. D6 and E7 are diagonal about the plate centre.
+Every dose is its own aspirate and full blowout. `build()` refuses a design
+that would draw the tube to zero.
+
+| flag | default |
+|---|---|
+| `--water-plate` / `--stock-plate` / `--tube` | `plate1` / `plate2` / `big_tubes` |
+| `--dose` | 150 uL |
+| `--stock` | 300 uL |
+| `--preload` | 50 uL |
+| `--mix-cycles` / `--mix-volume` | 5 / 200 uL |
+| `--prewet-cycles` | 3 |
+| `--no-eject-tip` | ejects by default, then `G28` |
+
+The tube is drawn and mixed at **Z 54** (`p300.z_for_labware.tube_rack_1p5`
+`aspirate`/`mix`); plates are dispensed at Z 53.5.
+
+### `centrifuge_test_v2_1.py` - location 2 only, two corners
+
+**Preload the tube by hand with 150 uL** first.
+
+| stage | action | uL | tube after |
+|---|---|---|---|
+| 1 | water -> tube | 200 | 350 |
+| 2 | mix at the tube bottom, 5 x 250 uL | - | 350 |
+| 3-4 | tube -> plate 2, H1 and A12 | 140 each | 70 |
+
+Nothing goes into location 1, so this is not a balanced pair on its own -
+deliberately, because the two plates have different tare weights. Balance
+by weighing. H1 (251, 336) is highest X / lowest Y; A12 (152, 399) is lowest
+X / highest Y and sits inside the tip-ejector keep-out band, so the router
+takes its Y leg elsewhere. Same flags as `centrifuge_test.py`; defaults
+`--dose 140 --stock 200 --preload 150 --mix-volume 250`.
+
+### `plate_two_rows.py` - rows A and B, 100 and 200 uL
+
+Home, take a tip, prewet, then **row A (A1-A12) 100 uL each** and
+**row B (B1-B12) 200 uL each** from the water - 24 independent aspirates,
+3.6 mL in all - then eject and park.
+
+| flag | default | |
+|---|---|---|
+| `--plate` | `plate1` | its A1 is measured; plate2's is inferred |
+| `--no-prewet` | prewet on, 3 cycles | |
+| `--no-eject` | ejects | leaves the tip on and parks |
+
+### `gripper_station9_test.py` - pick at station 9, IMU through the pick
+
+Station 9 is X 69.50, **Y 178.40** (`deck.stations.gripper_pick_9`, changed
+from 178.20 on 2026-10-26). Per cycle: approach Z 90, `GRIPPER_HOME`, `GRIPPER_OPEN`,
+descend to Z 107, grip, lift to Z 90, hold, lower to Z 100, release (a
+declared **7 mm drop**), back to Z 90.
+
+| flag | default | |
+|---|---|---|
+| `--cycles` | 5 | |
+| `--grip-ma` | 500 | 100-500 |
+| `--hold` | 1.0 s | |
+| `--post-release` | 1.0 s | records the fall |
+| `--imu-rate` | 50 | both sensors |
+| `--imu-mode` | `gantry` | `gantry`: both IMUs, gripper commands outside the capture. `spanning`: the capture covers grip and release, plate IMU only |
+| `--csv-dir`, `--dest-dir`, `--no-dest`, `--no-imu` | | |
+
+Data: ONE csv per run, `~/gripper_captures/<name>_<stamp>.csv` on the Pi,
+long format with `source` = `PCB` / `plate` / `mark`, copied to
+`/mnt/nas/GC_ARCCS/GripperIMU`.
+
+### `gripper_offset_trials.py` - offset_trials.py, sliced
+
+SDL_Gcode `host/offset_trials.py`'s procedure and data, at station 9. Per
+trial: context, (duty cooldown if due), traverse to X = 69.50 + offset,
+approach, `GRIPPER_TRIAL_HOME` (refused while holding), open, descend,
+`before_grip` burst, `GRIPPER_TRIAL_GRIP`, lift, `raised` burst, hold, lower,
+`lowered` burst, `GRIPPER_TRIAL_RELEASE`, retract.
+
+| flag | default | |
+|---|---|---|
+| `--grip-z` | station's 107 | pick depth; +Z is DOWN |
+| `--offsets` | `0` | comma separated, signed |
+| `--trials` | 30 | per offset |
+| `--approach-z` / `--release-z` | station's 90 / 100 | release must lie between them |
+| `--ma` | 500 | |
+| `--hold` | 0.6 s | |
+| `--post-release` | 1.0 s | |
+| `--open-ms` | board default | refused past 765 |
+| `--blocked` | **shuffled** | order is shuffled by default, fixed in the gcode |
+| `--seed` | generated, printed | always recorded; pass back to reproduce |
+| `--rate` | 50 Hz | plate IMU |
+| `--board-samples` / `--board-interval-ms` | 25 / 20 | 0.5 s bursts |
+| `--settle` / `--settle-raised` | 0.3 / 0.3 s | |
+| `--z-feed` | travel feed | **not** a Z height - `--z` abbreviates to this |
+| `--duty-margin` | 0.8 | of the board's 150 s per 300 s |
+| `--no-plate` | plate recorded | PCB IMU only |
+
+Data: `<name>_<stamp>_plate.csv`, `<name>_<stamp>_pcb.csv` and `.log` in
+`~/gripper_captures`, copied to the NAS by `GRIPPER_TRIALS_END`. `name`
+is `offsets_z<grip-z>`. Join on `wall_clock`.
+
+Refuses: grip above the approach, release below the grip, an open past
+765 ms, and a grip estimated past 80 % of the 20 s tier-1 hold.
+**Long stops are duty cooldowns** - `G4` dwells of up to a few minutes
+inserted when the next grip would overrun the hold budget.
+
+The run the bench used, 30 picks at a new height, PCB only:
+
+```bash
+python protocols/gripper_offset_trials.py --offsets 0 --trials 30 \
+    --approach-z 65 --grip-z 85 --release-z 83 --ma 500 --no-plate
+```
+
+### `gripper_plate_test.py` - pick a plate from a slot
+
+Refuses today: `sbs_96_wellplate` has no measured gripper `grip` / `lift` Z.
+Defaults `--plate plate1 --grip-ma 300 --cycles 1 --imu-seconds 3`.
 
 ## `lab/config.py`
 
@@ -2230,7 +2403,7 @@ so `plate_only=True` yields a capture that *can* span a grip and a release.
 
 ### Trial session
 
-`trials_begin(name, rate=None, dest=None, banner=None)`, `trial(trial,
+`trials_begin(name, rate=None, dest=None, banner=None, plate=True)`, `trial(trial,
 run_order, offset_mm, x, randomised, seed)`, `trial_phase(phase, x=None,
 z=None)`, `trial_burst(instant, samples, interval_ms, settle_s=0.0,
 phase=None)`, `trials_end()` - plus `gripper_home(op="trial_home")`,
@@ -2248,6 +2421,28 @@ Three refusals: a trial run while an IMU capture or run is open, and the
 reverse (both read the plate IMU over I2C), and `trials_end` while holding.
 `trials_begin` refuses a banner value containing whitespace, because a G-code
 parameter ends at the first space.
+
+`plate=False` sends `PLATE=0`: the board (PCB) IMU is recorded and the plate
+IMU is not - no sampler, no plate check, no `_plate.csv`. It needs
+`trial_session.py` 2026-10-26.1 or later on the Pi. An older Pi ignores the
+parameter and streams the plate anyway, which wastes nothing but disk.
+
+`trial()` must be given a seed. The `GRIPPER_TRIAL` macro installed before
+2026-10-21 rendered a missing seed as a bare `--seed`, argparse rejected it,
+and every trial command failed - the whole run's rows lost their `trial`,
+`run_order`, `offset_mm` and `condition` tags. `gripper_offset_trials` now
+always generates one, so the program works on the old macro and the new.
+
+**What the bench measured, late October 2026.** A 30-trial run at Z 85 logged
+`held 19.9 s` and `held 20.0 s` from grip to release, against the slicer's
+estimate of ~13.7 s. The difference is Pi start-up per shell command: about
+**1.9 s each**, where the timing model allows 0.6 s
+(`SHELL_OVERHEAD_HI_S`). Twenty seconds is the end of the board's tier-1 hold,
+so those grips end right where the current drops from 500 to 300 mA. The same
+console showed every `RUN_SHELL_COMMAND` printing `finished` before the next
+began - Klipper waits for them - which is the evidence `shell_command.blocks`
+needs. It is still `null` in `config/effectors/gripper.json`, so the 6.6 s of
+guard dwells per grip are still emitted.
 
 The three `op` overrides exist because a G-code program cannot branch. The
 trial session does on the Pi what the program cannot: `trial_home` refuses
